@@ -78,18 +78,43 @@ def _find_article_header(rows):
     return None
 
 
+def _find_marker_kind(sheet):
+    """Stream the ENTIRE worksheet for pivot/summary markers (B1-R2-01).
+
+    Markers may sit below the header probe window (row 13+); a bounded scan
+    would miss them and misclassify a pivot sheet as article data. Any
+    marker anywhere vetoes ARTICLE_DATA (fail-closed). Returns PIVOT,
+    SUMMARY, or None. Pivot takes precedence, matching _classify_sheet.
+    Streams row-by-row on the read-only sheet; early-exits on a pivot hit.
+    """
+    found_summary = False
+    for row in sheet.iter_rows(values_only=True):
+        for value in row:
+            cell = _cell_text(value)
+            if not cell:
+                continue
+            if any(marker in cell for marker in PIVOT_MARKERS):
+                return PIVOT
+            if any(marker in cell for marker in SUMMARY_MARKERS):
+                found_summary = True
+    return SUMMARY if found_summary else None
+
+
 def _classify_sheet(sheet):
+    # B1-R2-01: the marker scan covers the whole sheet (streaming); the
+    # article-header probe stays bounded to rows 1-12 (headers live at top).
+    marker = _find_marker_kind(sheet)
     probe = [[_cell_text(value) for value in row]
              for row in sheet.iter_rows(min_row=1, max_row=12, values_only=True)]
     flat = [cell for row in probe for cell in row if cell]
-    if not flat:
+    if not flat and marker is None:
         return SHEET_UNKNOWN
     header = _find_article_header(probe)
     # B1: pivot/summary markers take precedence, fail-closed. A sheet carrying
     # markers is NEVER article data; markers + article-like header coexisting
     # is ambiguous -> unknown (never emitted as facts).
-    has_pivot = any(any(marker in cell for marker in PIVOT_MARKERS) for cell in flat)
-    has_summary = any(any(marker in cell for marker in SUMMARY_MARKERS) for cell in flat)
+    has_pivot = marker == PIVOT
+    has_summary = marker == SUMMARY
     if (has_pivot or has_summary) and header is not None:
         return SHEET_UNKNOWN
     if has_pivot:

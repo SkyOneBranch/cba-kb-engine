@@ -211,3 +211,65 @@ def test_article_sheet_with_title_row_above_header(tmp_path):
     auto_name, auto_articles = foreign_xlsx.article_rows(path)
     assert auto_name == '工作表1'
     assert len(auto_articles) == 2
+
+
+def _row13_marker_workbook(tmp_path):
+    """B1-R2-01: pivot marker BELOW the header probe window (row 13)."""
+    book = Workbook()
+    sheet = book.active
+    sheet.title = '工作表1'
+    sheet.append(['文章编号', '标题', '日期'])          # row 1: article-like header
+    sheet.append(['A0001', '文章标题01', '2025/03/01'])   # row 2: article row
+    for i in range(3, 13):
+        sheet.append([f'A{i:04d}', f' filler {i}', '2025/03/01'])  # rows 3-12
+    sheet.append(['数据透视表：按标题计数'])  # row 13: pivot marker (probe-invisible)
+    sheet.append(['文章标题01', 2])           # row 14: pivot row
+    path = tmp_path / 'row13_marker.xlsx'
+    book.save(path)
+    return path
+
+
+def test_pivot_marker_on_row13_is_fail_closed(tmp_path):
+    """B1-R2-01: a marker below rows 1-12 must still veto ARTICLE_DATA."""
+    path = _row13_marker_workbook(tmp_path)
+    roles = foreign_xlsx.classify_sheets(path)
+    assert roles['工作表1'] != foreign_xlsx.ARTICLE_DATA
+    with pytest.raises(ValueError):
+        foreign_xlsx.article_rows(path)
+    with pytest.raises(ValueError):
+        foreign_xlsx.article_rows(path, sheet='工作表1')
+
+
+def test_summary_marker_on_row20_is_fail_closed(tmp_path):
+    """B1-R2-01 companion: summary marker below the probe window."""
+    book = Workbook()
+    sheet = book.active
+    sheet.title = 'Sheet3'
+    sheet.append(['文章编号', '标题', '日期'])
+    for i in range(2, 20):
+        sheet.append([f'A{i:04d}', f' filler {i}', '2025/03/01'])
+    sheet.append(['合计', 89])  # row 20: summary marker
+    path = tmp_path / 'row20_summary.xlsx'
+    book.save(path)
+    roles = foreign_xlsx.classify_sheets(path)
+    assert roles['Sheet3'] != foreign_xlsx.ARTICLE_DATA
+    with pytest.raises(ValueError):
+        foreign_xlsx.article_rows(path, sheet='Sheet3')
+
+
+def test_full_sheet_marker_scan_perf(tmp_path):
+    """B1-R2-01: full-sheet scan stays streaming-fast on a 10k-row sheet."""
+    import time
+    book = Workbook()
+    sheet = book.active
+    sheet.title = 'big'
+    sheet.append(['文章编号', '标题', '日期'])
+    for i in range(2, 10001):
+        sheet.append([f'A{i:05d}', f'文章标题{i:05d}', '2025/03/01'])
+    path = tmp_path / 'big.xlsx'
+    book.save(path)
+    start = time.monotonic()
+    roles = foreign_xlsx.classify_sheets(path)
+    elapsed = time.monotonic() - start
+    assert roles['big'] == foreign_xlsx.ARTICLE_DATA
+    assert elapsed < 30, f'full-sheet marker scan took {elapsed:.1f}s'
