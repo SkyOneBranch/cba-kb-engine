@@ -4,7 +4,9 @@
 
 **A headline is not a verified fact.** CBA-KB is an open-source, evidence-first knowledge engine for research on the Chinese Basketball Association (CBA). It helps researchers and developers organize reports, rosters, official notices, and documents without losing their sources, identities, rights, or verification status. The question behind every result is simple: **“Where did this come from?”**
 
-> **v2.0.4-2 released on GitHub** (Engine Release, tag `74f8987`). Note the four distinct states: Python package version is still `2.0.2`; Drive data production release is still `v2.0.1-1`; production Drive has read-only run verification only — full write features are not enabled and Human final acceptance has not passed.
+> **Current release (October 18, 2026):** [v2.0.4-2](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.0.4-2) is the latest published Engine Release. The project owner has **closed this delivery cycle with documented limitations carried forward**. An owner-authorized private deployment completed real Google Drive file organization and an accepted, source-traceable private Document Consumer query. This does **not** enable production writes for other installations, certify every search or security path, or authorize public redistribution of private material.
+>
+> **Version identities are separate:** the Python package metadata remains `2.0.2`; the distinct Drive Data Production release remains `v2.0.1-1`. The `v2.0.4-2` tag is the published Engine snapshot; `main` can contain subsequent changes.
 
 ## Why CBA-KB exists
 
@@ -25,25 +27,31 @@ CBA-KB is designed to keep the pieces separate:
 | Your goal | How CBA-KB helps | Current boundary |
 | --- | --- | --- |
 | Organize research | Link sources, documents, player identity, and provenance | Public Engine includes data models and CLI tools |
-| Examine a report | Separate statements, claims, verified facts, and outstanding checks | AI-generated summaries never become facts automatically |
-| Try a local inbox | Discover `.txt` files, register Source/Document, deduplicate, inspect status, and search | v2.0.4 development capability; requires a rights sidecar |
-| Discover Google Drive material | Read-only discovery, change polling, revision tracking, gated search and index | Development capability, not activated production Drive |
-| Plan archiving | Prepare exact plans, require approval, run guarded operations and verify results | Released in v2.0.4-2; production write features not yet enabled |
-| Serve people and AI | Produce research data with identities, evidence, and rights context | Users remain responsible for validation and copyright compliance |
+| Examine a report | Separate statements, claims, verified facts, and outstanding checks | AI-generated summaries never become verified facts automatically |
+| Work with a local Inbox | Discover `.txt` files, register Source/Document, deduplicate, inspect status, and search | Requires valid provenance and rights metadata; see the synthetic example below |
+| Discover Google Drive material | Discover files, track revisions, build searchable document indexes, and prepare guarded plans | Capabilities require appropriate credentials and permissions; direct Engine search still has a per-principal isolation limitation |
+| Organize and archive Drive files | Prepare exact plans, require approval, perform guarded operations, and inspect readback | Successfully exercised in an authorized private deployment; other deployments need their own authorization |
+| Support evidence-based AI reading | Preserve Source/Document references and original-file provenance for a Consumer | A representative private Document query was accepted; this is not a hosted public Q&A service or a guarantee of every Consumer capability |
 
 **CBA-KB is not a chatbot or a service that automatically crawls the whole web and declares basketball facts.** It is a reusable engine; you choose appropriate data sources, run it in your environment, and define human-review processes.
 
-## Major versions and current status
+## Product progress & roadmap
 
-| Version | Main changes | Status |
-| --- | --- | --- |
-| **v1.5.x** | Registration data model, reproducible Excel output and early Drive publication tools | Historical milestone |
-| **v1.8.x** | Document evidence, stable player identities and consumer checks | Historical milestone |
-| **v1.9.0** | Source intake, Statements, Claims, verification queues and research views | Historical milestone |
-| **v2.0.2** | Public open-source Engine, licensing, sanitized repository, synthetic fixtures and reproducible tooling | Historical milestone |
-| **v2.0.4-2** | Drive discovery/polling, rights-aware indexing, guarded plans, recovery, M4 E2E tooling | **Latest Engine Release** (package `2.0.2`, data `v2.0.1-1`) |
+### Recent milestones
 
-**v2.0.4-2 (released):** Includes local Inbox processing, Drive discovery and polling, rights-aware indexing, guarded plans and recovery. Real isolated Drive E2E (business path) verified; production Drive read-only verification done. Full write features and Human final acceptance are still pending.
+- **Evidence-first basketball research (v1.8.x–v1.9.0):** Source and Document evidence, player identity, Statements, Claims, verification queues, and research views.
+- **Reusable public Engine (v2.0.2):** Open-source code, licensing, a sanitized repository, synthetic fixtures, and reproducible tooling.
+- **Drive-backed Inbox-to-Knowledge workflow (v2.0.4-2):** Local Inbox processing, Drive discovery and polling, guarded file operations and recovery, and document search improvements. The Engine Release is published and the owner has closed this delivery cycle; actual Drive organization and a private Document Consumer query were accepted in an authorized private instance. Known limitations remain documented below.
+
+### What's next
+
+These are **areas under consideration**, not an approved next-release scope or a delivery schedule:
+
+- **Principal-aware search authorization:** Close the Engine-level cross-principal isolation gap tracked in [Issue #169](https://github.com/SkyOneBranch/cba-kb-engine/issues/169).
+- **More dependable Consumer source navigation:** Keep displayed document identities and original-file links aligned with authoritative source mappings.
+- **Incremental knowledge availability:** Make it easier to carry newly ingested, authorized documents through indexing and into Consumer data without rebuilding an entire collection.
+
+See [Releases](https://github.com/SkyOneBranch/cba-kb-engine/releases) for version history and [Issues](https://github.com/SkyOneBranch/cba-kb-engine/issues) for tracked work. Plans may change.
 
 ## 5-minute quick start
 
@@ -68,7 +76,7 @@ make test
 cba-kb --help
 ```
 
-To reproduce the **v2.0.2 source**, explicitly check out the `v2.0.2` tag before installation. A default clone of `main` includes the released v2.0.4-2 code.
+The default clone uses **`main`**, which may include changes made after the published release (including the merged Chinese-search fix in PR #191). To reproduce the exact published **v2.0.4-2 Engine snapshot**, run `git checkout v2.0.4-2` **before installation**. To reproduce the v2.0.2 source instead, check out the `v2.0.2` tag. The package's `2.0.2` metadata does not identify which of these source snapshots is installed.
 
 ### Try 1: an entirely synthetic research workflow
 
@@ -124,7 +132,14 @@ This demo does not move, delete, or publish originals. Actual results depend on 
 
 CBA-KB can discover and track Drive files, then prepare an explicit plan for archiving or retaining them. **A file move requires authorization and a check of the actual result.** If required file or revision evidence is missing, the operation must stop.
 
-The guarded move implementation is released in v2.0.4-2 (M4 business E2E verified), but **full production activation is not complete**. Production writes require separate human authorization. Keep OAuth credentials and private folder information outside this public repository.
+The guarded move implementation was released in v2.0.4-2. The project owner's private production instance has since executed authorized file organization and readback. This does **not** grant other installations permission to write to production Drive: each real operation remains subject to that environment's authorization and safeguards. The owner-selected operating mode is manual/on-demand; an always-running background worker is not a prerequisite. Keep OAuth credentials and private folder information outside this public repository.
+
+## Limitations, privacy, and security
+
+- **Known search authorization gap:** The current public Engine's direct search/index paths do not consistently enforce a trusted caller identity against per-document `allowed_principals`. Do **not** expose those paths as an authorization boundary to untrusted or multi-user clients. Follow [Issue #169](https://github.com/SkyOneBranch/cba-kb-engine/issues/169) for the outstanding fix. Local OS permissions and a private portal can reduce exposure in a particular deployment, but they do not prove Engine-level per-principal isolation.
+- **Private reading is not public export:** Authorized private ingestion, indexing, and AI-assisted reading do not imply permission to publish or redistribute source files. Retain applicable rights and provenance checks.
+- **Scope of acceptance:** A representative, source-traceable private Document Consumer query has been accepted by the project owner. This does not independently certify every document, file format, rights-negative case, or Statement/Claim/Fact/Timeline research capability. Any unresolved evidence stays unresolved.
+- **Version and deployment scope:** An Engine Release tag, installed package metadata, a private runtime commit, a Drive Data Production release, and a Consumer dataset can refer to different valid states. Do not equate a successful private deployment with activation for every installation.
 
 ## Who is it for?
 
