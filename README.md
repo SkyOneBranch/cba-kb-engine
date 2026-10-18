@@ -101,6 +101,6 @@ These are directions for improvement, **not a committed scope or release date**.
 - [Data and licenses](DATA_LICENSE.md) · [Third-party materials](THIRD_PARTY_DATA.md)
 - [Releases](https://github.com/SkyOneBranch/cba-kb-engine/releases) · [Issues](https://github.com/SkyOneBranch/cba-kb-engine/issues)
 
-Code is licensed under [Apache-2.0](LICENSE).
+The repository provides a **Public Engine**. Real private material is operated separately in a user's **Private Instance** under applicable permissions and law. Code uses [Apache-2.0](LICENSE), docs use [CC BY 4.0](DATA_LICENSE.md), and synthetic fixtures use [CC0-1.0](DATA_LICENSE.md). Third-party reporting and photographs retain their owners' rights; see [third-party data](THIRD_PARTY_DATA.md).
 
 **Make basketball research easier to verify—not just more confident-sounding.**
