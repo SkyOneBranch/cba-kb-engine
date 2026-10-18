@@ -132,3 +132,82 @@ def test_rows_single_sheet_guard_unchanged(tmp_path):
     # multi-sheet files; only the new article_* functions handle them.
     with pytest.raises(ValueError, match='single-sheet'):
         foreign_xlsx.rows(birthday_workbook(tmp_path))
+
+
+# --- Q2-FAIL adversarial regression tests (B1/B2) ---
+# Synthetic conflict layouts the original 9 tests did not challenge.
+
+
+def _conflict_pivot_workbook(tmp_path):
+    """Pivot sheet carrying BOTH an article-like header and a pivot marker."""
+    book = Workbook()
+    sheet = book.active
+    sheet.title = '工作表1'
+    sheet.append(['文章编号', '标题', '日期'])
+    sheet.append(['A0001', '文章标题01', '2025/03/01'])
+    sheet.append(['数据透视表：按标题计数'])
+    sheet.append(['文章标题01', 2])
+    path = tmp_path / 'conflict_pivot.xlsx'
+    book.save(path)
+    return path
+
+
+def test_pivot_with_article_like_header_is_fail_closed(tmp_path):
+    """B1: pivot marker + article-like header must NEVER emit article facts."""
+    path = _conflict_pivot_workbook(tmp_path)
+    roles = foreign_xlsx.classify_sheets(path)
+    assert roles['工作表1'] != foreign_xlsx.ARTICLE_DATA
+    with pytest.raises(ValueError):
+        foreign_xlsx.article_rows(path)
+    with pytest.raises(ValueError):
+        foreign_xlsx.article_rows(path, sheet='工作表1')
+
+
+def _conflict_summary_workbook(tmp_path):
+    """Summary sheet carrying BOTH an article-like header and a summary marker."""
+    book = Workbook()
+    sheet = book.active
+    sheet.title = 'Sheet3'
+    sheet.append(['文章编号', '标题', '日期'])
+    sheet.append(['A0001', '文章标题01', '2025/03/01'])
+    sheet.append(['合计', 89])
+    path = tmp_path / 'conflict_summary.xlsx'
+    book.save(path)
+    return path
+
+
+def test_summary_with_article_like_header_is_fail_closed(tmp_path):
+    """B1: summary marker + article-like header must NEVER emit article facts."""
+    path = _conflict_summary_workbook(tmp_path)
+    roles = foreign_xlsx.classify_sheets(path)
+    assert roles['Sheet3'] != foreign_xlsx.ARTICLE_DATA
+    with pytest.raises(ValueError):
+        foreign_xlsx.article_rows(path, sheet='Sheet3')
+
+
+def _titled_article_workbook(tmp_path):
+    """Article sheet with a title row ABOVE the header row (B2 layout)."""
+    book = Workbook()
+    sheet = book.active
+    sheet.title = '工作表1'
+    sheet.append(['球队生日文章清单'])
+    sheet.append(['文章编号', '标题', '日期'])
+    sheet.append(['A0001', '文章标题01', '2025/03/01'])
+    sheet.append(['A0002', '大狙', '2025/03/02'])
+    path = tmp_path / 'titled.xlsx'
+    book.save(path)
+    return path
+
+
+def test_article_sheet_with_title_row_above_header(tmp_path):
+    """B2: header detector is shared — title-above-header works explicitly and auto."""
+    path = _titled_article_workbook(tmp_path)
+    roles = foreign_xlsx.classify_sheets(path)
+    assert roles['工作表1'] == foreign_xlsx.ARTICLE_DATA
+    name, articles = foreign_xlsx.article_rows(path, sheet='工作表1')
+    assert name == '工作表1'
+    assert [a['article_id'] for a in articles] == ['A0001', 'A0002']
+    assert articles[0]['source_row'] == 3
+    auto_name, auto_articles = foreign_xlsx.article_rows(path)
+    assert auto_name == '工作表1'
+    assert len(auto_articles) == 2

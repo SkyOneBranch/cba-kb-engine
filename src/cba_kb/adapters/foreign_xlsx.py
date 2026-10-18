@@ -62,20 +62,42 @@ def _cell_text(value):
     return str(value).strip() if value is not None else ''
 
 
+def _find_article_header(rows):
+    """Shared article-header detector (B2): scan probed text rows 1-12.
+
+    Returns (row_index_0based, id_index, title_index, date_index) or None.
+    Used by both _classify_sheet and _article_columns so the two agree on
+    which row is the header, including when a title row sits above it.
+    """
+    for index, cells in enumerate(rows):
+        id_index = next((i for i, cell in enumerate(cells) if cell in ARTICLE_ID_HEADERS), None)
+        title_index = next((i for i, cell in enumerate(cells) if cell in ARTICLE_TITLE_HEADERS), None)
+        if id_index is not None and title_index is not None:
+            date_index = next((i for i, cell in enumerate(cells) if cell in ARTICLE_DATE_HEADERS), None)
+            return index, id_index, title_index, date_index
+    return None
+
+
 def _classify_sheet(sheet):
     probe = [[_cell_text(value) for value in row]
              for row in sheet.iter_rows(min_row=1, max_row=12, values_only=True)]
     flat = [cell for row in probe for cell in row if cell]
     if not flat:
         return SHEET_UNKNOWN
-    header = next((row for row in probe if any(row)), [])
-    if (any(cell in ARTICLE_ID_HEADERS for cell in header)
-            and any(cell in ARTICLE_TITLE_HEADERS for cell in header)):
-        return ARTICLE_DATA
-    if any(any(marker in cell for marker in PIVOT_MARKERS) for cell in flat):
+    header = _find_article_header(probe)
+    # B1: pivot/summary markers take precedence, fail-closed. A sheet carrying
+    # markers is NEVER article data; markers + article-like header coexisting
+    # is ambiguous -> unknown (never emitted as facts).
+    has_pivot = any(any(marker in cell for marker in PIVOT_MARKERS) for cell in flat)
+    has_summary = any(any(marker in cell for marker in SUMMARY_MARKERS) for cell in flat)
+    if (has_pivot or has_summary) and header is not None:
+        return SHEET_UNKNOWN
+    if has_pivot:
         return PIVOT
-    if any(any(marker in cell for marker in SUMMARY_MARKERS) for cell in flat):
+    if has_summary:
         return SUMMARY
+    if header is not None:
+        return ARTICLE_DATA
     return SHEET_UNKNOWN
 
 
@@ -94,14 +116,13 @@ def classify_sheets(path):
 
 
 def _article_columns(sheet):
-    for number, row in enumerate(sheet.iter_rows(min_row=1, max_row=12, values_only=True), 1):
-        cells = [_cell_text(value) for value in row]
-        id_index = next((i for i, cell in enumerate(cells) if cell in ARTICLE_ID_HEADERS), None)
-        title_index = next((i for i, cell in enumerate(cells) if cell in ARTICLE_TITLE_HEADERS), None)
-        if id_index is not None and title_index is not None:
-            date_index = next((i for i, cell in enumerate(cells) if cell in ARTICLE_DATE_HEADERS), None)
-            return number, id_index, title_index, date_index
-    raise ValueError('Article header row not found (need id-like and title-like columns)')
+    probe = [[_cell_text(value) for value in row]
+             for row in sheet.iter_rows(min_row=1, max_row=12, values_only=True)]
+    found = _find_article_header(probe)
+    if found is None:
+        raise ValueError('Article header row not found (need id-like and title-like columns)')
+    index, id_index, title_index, date_index = found
+    return index + 1, id_index, title_index, date_index
 
 
 def _date_text(value):
