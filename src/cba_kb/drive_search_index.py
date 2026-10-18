@@ -26,9 +26,11 @@ Design notes:
   rights_status, visible). It does NOT store document body text.
   Note: indexed keywords are derived from document text, so term presence
   is inherently visible in the index file (residual risk, documented).
-- ``principal`` is a required query parameter for audit and forward
-  compatibility; current enforcement is document-level approval.
-  Per-reader ACLs are future work when the data model supports them.
+- ``principal`` is a required query parameter, enforced by authorization:
+  the query-time re-check passes it to
+  ``drive_search._rights_approved_for_search``, which requires the grant to
+  name the principal in ``allowed_principals`` (CF-01, fail-closed). A
+  principal that is merely non-empty is NOT sufficient.
 - Persistence is atomic JSON, versioned. A corrupt index fails closed
   (refuses to load); rebuild from the registry is deterministic.
 - Tokenization is simple lowercase word splitting.
@@ -227,9 +229,12 @@ def search_index(
 
     ``registry`` (the CURRENT authoritative registry) is REQUIRED. For
     each candidate hit:
-      visible = index_allows(file) AND registry_grant_valid(file)
+      visible = index_allows(file) AND registry_grant_valid(file, principal)
     where ``registry_grant_valid`` is
-    ``drive_search._rights_approved_for_search`` on the live record.
+    ``drive_search._rights_approved_for_search`` on the live record WITH
+    the querying principal: the grant must name the principal in
+    ``allowed_principals`` (CF-01). A non-empty principal alone grants
+    nothing.
 
     A ``visible=False`` in the index is never overridden by the registry.
     A missing/corrupt registry, a missing record, or a failed re-check
@@ -276,11 +281,13 @@ def search_index(
         # Phase 1: index build-time gate (never overridden upward).
         if not _index_allows(meta):
             continue
-        # Phase 2: current authoritative registry re-check.
+        # Phase 2: current authoritative registry re-check, now WITH the
+        # querying principal (CF-01): the grant must name the principal in
+        # allowed_principals; non-emptiness alone grants nothing.
         record = registry.get(fid)
         if not isinstance(record, dict):
             continue
-        ok, _ = _rights_approved_for_search(fid, record)
+        ok, _ = _rights_approved_for_search(fid, record, principal=principal)
         if not ok:
             continue
         doc_terms = {t for t, fids in terms.items() if fid in fids}

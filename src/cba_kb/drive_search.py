@@ -95,7 +95,7 @@ def classify_content_duplicate(
 
 
 def _rights_approved_for_search(
-    file_id: str, record: Dict[str, Any]
+    file_id: str, record: Dict[str, Any], principal: Optional[str] = None
 ) -> Tuple[bool, str]:
     """Strict rights check for the search path: the registry status string
     AND a strictly-valid grant must agree.
@@ -105,12 +105,17 @@ def _rights_approved_for_search(
     expiry, revocation). Any inconsistency — missing grant, invalid grant,
     or status/grant disagreement — fails closed to (False, reason) and the
     object is excluded from results. Never trusts ``rights_status`` alone.
+
+    CF-01: when ``principal`` is supplied, the grant must additionally name
+    that principal in ``allowed_principals`` (fail-closed); a principal that
+    is merely non-empty is NOT sufficient.
     """
     if record.get("rights_status") != "approved":
         return False, record.get("rights_reason") or "RIGHTS_NOT_APPROVED"
     grant = record.get("rights_grant")
     grants = {file_id: grant} if isinstance(grant, dict) else {}
-    status, reason = decide_drive_rights({"file_id": file_id}, grants=grants)
+    status, reason = decide_drive_rights({"file_id": file_id}, grants=grants,
+                                         principal=principal)
     if status != "approved":
         return False, f"RIGHTS_GRANT_INVALID:{reason}"
     return True, "DRIVE_RIGHTS_GRANTED"
@@ -156,6 +161,7 @@ def grant_rights(
     note: str = "",
     actor: str = "muse",
     policy_version: str = "2.0.4-2-slice2",
+    allowed_principals: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Explicitly grant rights for one discovered file (guarded, audited).
 
@@ -163,6 +169,15 @@ def grant_rights(
     ``review`` rights state can transition. The generated grant is a complete
     strict-schema record (``approved``/``approver``/``file_id``/``scope``) so
     it passes the base slice's ``decide_drive_rights``.
+
+    CF-01: ``allowed_principals`` optionally scopes the grant to named
+    principals. When supplied it must be a non-empty collection of non-empty
+    strings (anything else raises ValueError); it is stored as a sorted list
+    on the grant and recorded in the ledger event. The query path
+    (``drive_search_index.search_index``) enforces membership fail-closed:
+    a grant carrying an allowed set is visible ONLY to its members. When
+    omitted, the grant carries no allowed set and is NOT valid for any
+    principal-scoped query — document-level checks only.
 
     Ordering (audit-first): the ledger event is appended BEFORE the registry
     is persisted. If the ledger write fails, a ``DriveDiscoveryError`` is
@@ -182,6 +197,20 @@ def grant_rights(
         raise ValueError(f"RIGHTS_GRANT_UNKNOWN_FILE: {file_id}")
     if not approver or not approver.strip():
         raise ValueError("RIGHTS_GRANT_APPROVER_REQUIRED")
+    principals: Optional[List[str]] = None
+    if allowed_principals is not None:
+        if not isinstance(allowed_principals, (list, tuple, set, frozenset)):
+            raise ValueError(
+                "RIGHTS_GRANT_PRINCIPALS_MUST_BE_COLLECTION: "
+                "allowed_principals must be a list/tuple/set of strings")
+        cleaned = sorted({p for p in allowed_principals
+                          if isinstance(p, str) and p})
+        if not cleaned or any(not isinstance(p, str) or not p
+                              for p in allowed_principals):
+            raise ValueError(
+                "RIGHTS_GRANT_PRINCIPALS_INVALID: every entry must be a "
+                "non-empty string and the collection must not be empty")
+        principals = cleaned
     prev = record.get("rights_status")
     if prev == "approved":
         ok, _ = _rights_approved_for_search(file_id, record)
@@ -201,6 +230,8 @@ def grant_rights(
         "granted_at": _utcnow(),
         "note": note,
     }
+    if principals is not None:
+        grant["allowed_principals"] = principals
     event_ts = grant["granted_at"]
     try:
         append_ledger(ledger_path, {
