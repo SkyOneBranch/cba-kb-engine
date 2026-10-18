@@ -1,37 +1,36 @@
 # CBA-KB｜让每一条篮球结论都有出处
 
-[English](README.md) · [快速开始](#5-分钟快速开始) · [运维手册](docs/operations/OPERATIONS.zh-CN.md)
+[English](README.md) · [快速开始](#5-分钟快速开始) · [操作手册](docs/operations/OPERATIONS.zh-CN.md)
 
-**新闻说了什么，不等于事实已经得到证实。** CBA-KB 是面向中国男子篮球职业联赛（CBA）的开源知识库引擎：帮助研究者和开发者整理比赛报道、球员资料、联赛公告与文档，保留来源、身份、版权和核验状态，让人或 AI 查资料时可以追问：**“这条结论依据什么？”**
+**CBA-KB 是一个开源的 CBA 篮球资料整理与研究引擎。** 它帮助你整理球员资料、新闻报道、联赛公告和其他文件，让每条信息都能找到来源，方便人和 AI 查询、比较和核实。
 
-> **v2.0.4-2 已在 GitHub 发布**（Engine Release，tag `74f8987`）。注意四个不同状态：Python 包版本仍为 `2.0.2`；Drive 数据生产发布仍为 `v2.0.1-1`；生产 Drive 仅完成只读运行验证——完整写入功能未启用，Human 最终验收未通过。
+**当前正式版本：[v2.0.4-2](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.0.4-2)（已发布，已完成本轮交付）。**
 
 ## 为什么需要 CBA-KB？
 
-想象你在研究“某球员是否转会”。一篇新闻可能说“据悉即将加盟”，另一份名单却仍显示原球队。普通搜索容易把两句话混在一起；直接让 AI 总结，更可能把传闻写成确定事实。
+假设你想知道一名球员是否转会。一篇新闻说“可能加盟”，另一份官方名单仍显示原球队。如果只看搜索摘要，很容易把传闻当成事实。
 
-CBA-KB 希望把它们分清楚：
+CBA-KB 希望让你分清楚：
 
-- **Source（来源）**：消息来自哪篇文章、哪份公告、哪个文件？
-- **Document（文档）**：原件是什么，版本有没有变化，能否回到出处？
-- **Statement（陈述）**：来源原文到底说了什么？
-- **Claim（主张）**：哪些判断仍然只是待验证的说法？
-- **Fact（事实）**：哪些结论已有足够的权威证据和核验记录？
+- **来源（Source）**：这条消息来自哪里？
+- **文档（Document）**：原始报道或文件是什么？
+- **陈述（Statement）**：原文究竟说了什么？
+- **主张（Claim）**：哪些说法还需要核实？
+- **事实（Fact）**：哪些结论有足够证据支持？
 
-**核心原则：陈述 ≠ 事实；证据 ≠ 事实；未知 ≠ 0。** 当身份、权限或证据不清楚时，系统应保留未决状态或交给人工复核，而不是猜测。
+**核心原则：陈述 ≠ 事实；证据 ≠ 事实；未知 ≠ 0。** AI 的回答应当有出处，不能把猜测包装成确定事实。
 
 ## 它能做什么？
 
-| 场景 | CBA-KB 的作用 | 当前边界 |
-| --- | --- | --- |
-| 整理研究资料 | 建立来源、文档、球员身份和可追溯记录 | 公开 Engine 已具备相关数据模型与 CLI |
-| 检查新闻和观点 | 分离 Statement、Claim、Fact，保留待核验事项 | 不会自动把 AI 摘要认定为事实 |
-| 本地 Inbox 试用 | 发现 `.txt`、登记 Source/Document、去重、状态查询和关键词检索 | v2.0.4-2 已发布功能；需同名权利声明文件 |
-| Google Drive 资料发现 | 只读发现、增量轮询、记录修订、搜索索引与审批记录 | 已发布能力，不等于生产 Drive 写入已启用 |
-| 安全整理和归档 | 明确计划、人工批准、受控执行、操作后回读 | v2.0.4-2 已发布；生产写入功能尚未启用 |
-| 给人和 AI 使用 | 生成带身份、证据和权限语义的研究数据 | 使用者仍需核验证据并尊重版权 |
+| 你想做的事 | CBA-KB 提供的能力 |
+| --- | --- |
+| 整理资料 | 登记文件与来源，识别重复内容，保留可追溯记录 |
+| 查找内容 | 按关键词查询已建立索引的文档，找到对应来源 |
+| 管理 Google Drive 文件 | 发现文件变化，制定归档或保留计划，经授权后执行并核对结果 |
+| 研究球员和球队 | 使用身份、陈述、主张和事实等数据模型，区分不同证据的可信程度 |
+| 让 AI 辅助阅读 | 为获授权的资料查询提供文档及来源信息，便于核对原文 |
 
-**CBA-KB 不是聊天机器人，也不是自动抓取全网、自动判定所有篮球事实的服务。** 它是可复用的处理引擎，需要你选择合法数据来源、运行环境和审核流程。
+CBA-KB **不是**自动抓取全网、直接宣布篮球事实的聊天机器人。它提供处理资料和追溯证据的工具；真实数据、核验和授权仍由使用者管理。
 
 ## 主要版本与当前状态
 
@@ -39,106 +38,69 @@ CBA-KB 希望把它们分清楚：
 | --- | --- | --- |
 | **v1.5.x** | 球员注册数据模型、可复现的 Excel 导出、早期 Drive 发布工具 | 历史里程碑 |
 | **v1.8.x** | 文档证据、稳定球员身份、消费端核验 | 历史里程碑 |
-| **v1.9.0** | 资料来源摄入、Statement、Claim、核验队列和研究视图 | 历史里程碑 |
+| **v1.9.0** | 来源入库、Statement、Claim、核验队列和研究视图 | 历史里程碑 |
 | **v2.0.2** | 公开开源 Engine、许可证与脱敏、合成测试样例及可复现工具 | 历史里程碑 |
-| **v2.0.4-2** | Drive 发现/轮询、权限感知索引、受控计划、故障恢复、M4 E2E 工具 | **最新 Engine 发布**（包版本 `2.0.2`，数据 `v2.0.1-1`） |
+| **v2.0.4-2** | 本地 Inbox、Drive 发现与轮询、受控归档、搜索索引及故障恢复 | **已发布 · 本轮交付完成** |
 
-**v2.0.4-2（已发布）：** 包含本地 Inbox、Drive 文件发现和轮询、权限感知索引、受控计划与故障恢复。真实隔离 Drive E2E（业务通路）已验证；生产 Drive 只读验证完成。完整写入功能与 Human 最终验收尚待完成。
+在项目所有者授权的私人环境中，本轮已经完成实际的 Drive 资料整理，并通过了一次可回溯原件的私人资料问答验收。公开仓库**不包含**这些私人资料。[查看正式版本记录](https://github.com/SkyOneBranch/cba-kb-engine/releases)。
 
 ## 5 分钟快速开始
 
-准备：Python **3.11+**、Git；以下命令适用于 Linux/macOS 或兼容的终端。无需任何真实 CBA 私有数据，也无需 Google Drive 凭据。
+准备好 **Python 3.11+** 和 **Git**。以下命令适用于 macOS、Linux 或兼容终端；使用公开合成数据，**不需要真实 CBA 资料或 Google Drive 账号**。
 
 ```bash
-# 1. 获取公开仓库
+# 获取公开代码
 git clone https://github.com/SkyOneBranch/cba-kb-engine.git
 cd cba-kb-engine
 
-# 2. 安装到虚拟环境
+# 使用 v2.0.4-2 正式发布版本
+git checkout v2.0.4-2
+
+# 创建独立 Python 环境并安装
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.lock
 python -m pip install --no-deps --no-build-isolation -e .
 
-# 3. 环境检查和离线测试
+# 查看环境和命令
 make doctor
-make test
-
-# 4. 查看可以使用的命令
 cba-kb --help
-```
 
-如果你想复现 **v2.0.2** 的源码，请在安装前明确切换到 `v2.0.2` Tag；默认克隆 `main` 得到的是已发布的 v2.0.4-2 代码。
-
-### 体验 1：用虚构数据走一次研究流程
-
-```bash
-# 避免把私有环境变量混入公开合成测试
+# 用仓库内的虚构数据体验研究流程
 unset CBA_KB_INSTANCE_ROOT CBA_KB_SOURCE_POLICY_JSON CBA_STATS_AES_KEY GOOGLE_APPLICATION_CREDENTIALS
-
-# 只使用公开的合成样例，不上传真实内容
 python scripts/run_cleanroom_smoke.py --output .cleanroom/ci-smoke
 ```
 
-它会运行仓库中定义的合成数据研究流程。需要分步查看 Source、Statement、Claim、Research View 等命令，可阅读[公开操作手册](docs/operations/OPERATIONS.zh-CN.md)。
+以上示例不会移动或发布你的真实文件。想进一步试用本地 Inbox、关键词检索或 Drive 操作，请阅读[中文操作手册](docs/operations/OPERATIONS.zh-CN.md)。需要最新开发改动时，可以查看 [`main` 分支](https://github.com/SkyOneBranch/cba-kb-engine)；它不一定与已发布的 Tag 完全相同。
 
-### 体验 2：本地 Inbox 自动发现与搜索（开发功能）
+## 使用真实数据前要知道
 
-```bash
-# 运行在仓库外部的独立目录
-mkdir -p /tmp/cbakb-demo/config /tmp/cbakb-demo/inbox/documents
+- **操作要授权。** 处理私人文件或移动 Drive 文件时，需要相应访问权限；每次真实文件操作都要确认结果。
+- **私人数据不等于公开数据。** 本仓库只有开源代码及合成样例，不提供项目所有者的私人篮球资料。阅读私人资料的许可也不等于可以公开转载。
+- **多用户检索仍有限制。** 当前 Engine 底层搜索接口存在待修复的逐用户权限隔离问题（[Issue #169](https://github.com/SkyOneBranch/cba-kb-engine/issues/169)）。修复前，不要直接将其作为面向不可信多用户的授权边界。
+- **有来源不代表已证实。** AI 摘要和文件中的说法仍需按证据核实。
 
-cat > /tmp/cbakb-demo/inbox/documents/demo.txt <<'TXT'
-Synthetic CBA Bulletin
-The Harbor Falcons won a fictional preseason game.
-TXT
+## 接下来关注什么？
 
-# 本地 TXT 需要相应的来源和权利声明
-cat > /tmp/cbakb-demo/inbox/documents/demo.txt.source.json <<'JSON'
-{
-  "schema_version": 1,
-  "title": "Synthetic CBA Bulletin",
-  "origin": "synthetic_fixture",
-  "source_url": null,
-  "rights": {
-    "classification": "private",
-    "public_export_allowed": false,
-    "evidence": []
-  }
-}
-JSON
+- 完善不同用户之间的检索权限隔离。
+- 让资料来源、文档 ID 与原件链接更加一致可靠。
+- 让新增资料更方便地进入索引，供已授权的用户查询。
 
-# 稳定性检查：间隔后执行第二次扫描
-cba-kb --instance-root /tmp/cbakb-demo inbox-scan
-sleep 2
-cba-kb --instance-root /tmp/cbakb-demo inbox-scan
-
-# 查看状态与关键词检索
-cba-kb --instance-root /tmp/cbakb-demo archive-status --all
-cba-kb --instance-root /tmp/cbakb-demo archive-query --keyword "Harbor Falcons"
-```
-
-这里不会移动、删除或公开你的原始文件。实际处理结果以命令输出为准；若权利声明错误、文件未稳定或需要人工复核，系统可能拒绝摄入。正式使用前请先阅读[完整安全与操作说明](docs/operations/OPERATIONS.zh-CN.md)。
-
-## Google Drive：先确认，再整理
-
-CBA-KB 可以发现、跟踪 Drive 文件，并为归档或保留生成明确计划。**实际移动前需要人工授权，移动后还要核验结果。** 如果文件身份或版本证据不足，就停止操作。
-
-受控移动代码已在 v2.0.4-2 发布（M4 业务 E2E 已验证），但**完整生产激活尚未完成**。生产写入仍需单独的人类授权；OAuth 凭据和私人文件夹信息不得放入公开仓库。
+这些是改进方向，**不代表已承诺的下一版本范围或发布日期**。具体进展见 [Issues](https://github.com/SkyOneBranch/cba-kb-engine/issues)。
 
 ## 谁适合使用？
 
-- **篮球研究者 / 数据整理者**：想知道每个结论来自哪里、哪些仍待验证。
-- **开发者**：想复用 CBA 数据契约、身份映射、解析工具和合成样例。
-- **AI 应用构建者**：不希望模型把传闻、陈述和核验事实混为一谈。
+- **篮球研究者和资料整理者**：希望每个结论都能查到出处。
+- **开发者**：希望复用数据模型、入库工具和检索能力。
+- **AI 应用开发者**：希望 AI 回答有证据，而不是把传闻当事实。
+
+## 文档与贡献
+
+- [操作手册（中文）](docs/operations/OPERATIONS.zh-CN.md) · [Operations Manual (English)](docs/operations/OPERATIONS.md)
+- [参与贡献](CONTRIBUTING.md) · [安全说明](SECURITY.md)
+- [数据与许可](DATA_LICENSE.md) · [第三方资料说明](THIRD_PARTY_DATA.md)
+- [Releases](https://github.com/SkyOneBranch/cba-kb-engine/releases) · [Issues](https://github.com/SkyOneBranch/cba-kb-engine/issues)
 
 公开仓库提供 **Public Engine**；私人真实资料应由使用者在独立的 **Private Instance** 中依法管理。代码采用 [Apache-2.0](LICENSE)，文档依 [CC BY 4.0](DATA_LICENSE.md)，仓库的合成样例依 [CC0-1.0](DATA_LICENSE.md)。第三方报道、照片等仍受原版权约束，详见[第三方数据说明](THIRD_PARTY_DATA.md)。
 
-## 文档与参与贡献
-
-- [运维手册（中文）](docs/operations/OPERATIONS.zh-CN.md) · [Operations Manual (English)](docs/operations/OPERATIONS.md)
-- [贡献指南](CONTRIBUTING.md) · [安全报告](SECURITY.md)
-- [数据和版权许可](DATA_LICENSE.md) · [第三方材料说明](THIRD_PARTY_DATA.md)
-- [GitHub Issues](https://github.com/SkyOneBranch/cba-kb-engine/issues) · [Pull Requests](https://github.com/SkyOneBranch/cba-kb-engine/pulls)
-
-**我们的目标不是让 AI 说出更确定的话，而是让每个值得相信的篮球结论都能找到证据。**
+**让篮球研究更容易查证，而不是让 AI 听起来更确定。**
