@@ -101,4 +101,6 @@ python scripts/run_cleanroom_smoke.py --output .cleanroom/ci-smoke
 - [数据与许可](DATA_LICENSE.md) · [第三方资料说明](THIRD_PARTY_DATA.md)
 - [Releases](https://github.com/SkyOneBranch/cba-kb-engine/releases) · [Issues](https://github.com/SkyOneBranch/cba-kb-engine/issues)
 
+代码采用 [Apache-2.0](LICENSE) 许可证。
+
 **让篮球研究更容易查证，而不是让 AI 听起来更确定。**

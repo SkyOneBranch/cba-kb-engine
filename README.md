@@ -101,4 +101,6 @@ These are directions for improvement, **not a committed scope or release date**.
 - [Data and licenses](DATA_LICENSE.md) · [Third-party materials](THIRD_PARTY_DATA.md)
 - [Releases](https://github.com/SkyOneBranch/cba-kb-engine/releases) · [Issues](https://github.com/SkyOneBranch/cba-kb-engine/issues)
 
+Code is licensed under [Apache-2.0](LICENSE).
+
 **Make basketball research easier to verify—not just more confident-sounding.**
