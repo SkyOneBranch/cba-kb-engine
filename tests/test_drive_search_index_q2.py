@@ -23,7 +23,7 @@ SRC_DIR = Path(__file__).parent.parent / "src"
 def _grant(file_id, **over):
     g = {"approved": True, "approver": "boss", "file_id": file_id,
          "scope": "drive:read", "granted_at": "2026-10-15T00:00:00Z",
-         "note": ""}
+         "note": "", "allowed_principals": ["alice"]}
     g.update(over)
     return g
 
