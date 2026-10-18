@@ -278,10 +278,15 @@ class TestAC36SurfaceConsistency:
         assert out["verdict"] == "PASS"
 
     def test_cross_track_legal_difference_is_explicitly_bound(self):
+        # Updated post-Q2-B5: EXPLICITLY_BOUND now requires demonstrable
+        # binding_evidence per binding; the old version auto-legitimized
+        # any cross-track difference (fail-open).
         out = rw.check_surface_consistency("documents", [
-            self._binding("live_status", "data_production"),
+            self._binding("live_status", "data_production",
+                          binding_evidence="release_status readback 2026-10-18"),
             self._binding("engine_release", "engine", release_id="v9.9.4-2",
-                          code_commit="dddeee", manifest_binding="m-2"),
+                          code_commit="dddeee", manifest_binding="m-2",
+                          binding_evidence="github release readback 2026-10-18"),
         ])
         assert out["verdict"] == "EXPLICITLY_BOUND"
         assert "not forced equal" in out["note"]
@@ -315,8 +320,12 @@ class TestAC36SurfaceConsistency:
 
 class TestAC37BatchGate:
     def _ok(self, **kw):
+        # Updated post-Q2-B6: manifest SHAs must be independently established
+        # (evidence params); the old version accepted self-reported hashes.
         args = {"expected_manifest_sha": "a" * 64,
                 "observed_manifest_sha": "a" * 64,
+                "expected_manifest_evidence": "consumer target readback 2026-10-18",
+                "observed_manifest_evidence": "consumer target readback 2026-10-18",
                 "required_artifacts": ["doc-1", "doc-2"],
                 "artifacts_present": ["doc-1", "doc-2"],
                 "silent_truncation": 0,
@@ -384,13 +393,266 @@ class TestAC38ZeroDiffGuard:
 
 
 # ---------------------------------------------------------------------------
+# Adversarial regression tests (Q2-FAIL B1~B7 attack rehearsal)
+#
+# Each test replicates the independent reviewer's EXACT counterexample.
+# They were written BEFORE the fix and confirmed to FAIL on the unfixed
+# code (demonstrating the fail-open defect), then confirmed to PASS after.
+# Synthetic fixtures only. No real data.
+# ---------------------------------------------------------------------------
+
+class TestAdversarialB1:
+    def test_empty_dict_with_file_id_is_blocked_not_ok(self):
+        # Reviewer B1: bind_release_status accepts {} + any file_id as OK.
+        out = rw.bind_release_status(b"{}", file_id="any-file-id",
+                                     read_timestamp="2026-10-18T14:00:00Z")
+        assert out["verdict"] == "BLOCKED/NOT_VERIFIED"
+
+    def test_malformed_timestamp_is_blocked(self):
+        # Reviewer B1: read_timestamp="not-a-timestamp" must be rejected.
+        out = rw.bind_release_status(_raw(COMPLETE_STATUS), file_id="x",
+                                     read_timestamp="not-a-timestamp")
+        assert out["verdict"] == "BLOCKED/NOT_VERIFIED"
+        assert "timestamp" in out["reason"]
+
+    def test_missing_release_id_is_blocked(self):
+        doc = dict(COMPLETE_STATUS)
+        del doc["current_release_id"]
+        out = rw.bind_release_status(_raw(doc), file_id="x",
+                                     read_timestamp="2026-10-18T14:00:00Z")
+        assert out["verdict"] == "BLOCKED/NOT_VERIFIED"
+
+    def test_missing_state_is_blocked(self):
+        doc = dict(COMPLETE_STATUS)
+        del doc["state"]
+        out = rw.bind_release_status(_raw(doc), file_id="x",
+                                     read_timestamp="2026-10-18T14:00:00Z")
+        assert out["verdict"] == "BLOCKED/NOT_VERIFIED"
+
+    def test_revision_availability_is_distinguished(self):
+        # Reviewer B1: genuinely-available revision vs missing revision (None).
+        with_rev = rw.bind_release_status(
+            _raw(COMPLETE_STATUS), file_id="x",
+            read_timestamp="2026-10-18T14:00:00Z", revision="42")
+        assert with_rev["verdict"] == "OK"
+        assert with_rev["data_production"]["evidence"]["revision_status"] == "BOUND"
+        without_rev = rw.bind_release_status(
+            _raw(COMPLETE_STATUS), file_id="x",
+            read_timestamp="2026-10-18T14:00:00Z", revision=None)
+        assert without_rev["verdict"] == "OK"
+        assert without_rev["data_production"]["evidence"]["revision_status"] == "NOT_AVAILABLE"
+        assert without_rev["data_production"]["evidence"]["revision"] is None
+
+
+class TestAdversarialB2:
+    def test_complete_with_none_release_id_is_not_consumable(self):
+        # Reviewer B2: state=COMPLETE + release_id=None must NOT be CONSUMABLE.
+        out = rw.judge_consumability(
+            "data_production_current",
+            manifest_ok=True, materialized=True,
+            rights_ok=True, provenance_ok=True,
+            release_state="COMPLETE",
+            data_production_release_id=None)
+        assert out["verdict"] != "CONSUMABLE"
+
+    def test_complete_with_empty_release_id_is_not_consumable(self):
+        out = rw.judge_consumability(
+            "data_production_current",
+            manifest_ok=True, materialized=True,
+            rights_ok=True, provenance_ok=True,
+            release_state="COMPLETE",
+            data_production_release_id="")
+        assert out["verdict"] != "CONSUMABLE"
+
+
+class TestAdversarialB3:
+    def test_materialized_without_evidence_is_refused(self):
+        # Reviewer B3: capability_status("documents", status="MATERIALIZED")
+        # with no evidence must not return MATERIALIZED.
+        with pytest.raises(ValueError):
+            rw.capability_status("documents", status="MATERIALIZED")
+
+    def test_materialized_with_batch_ref_is_allowed(self):
+        e = rw.capability_status("documents", status="MATERIALIZED",
+                                 batch_ref="batch-77")
+        assert e["status"] == "MATERIALIZED"
+        assert e["batch_or_catalog_ref"] == "batch-77"
+
+
+class TestAdversarialB4:
+    def test_unsafe_snapshot_entry_is_not_trusted(self):
+        # Reviewer B4: previous_snapshot[0] in FAILED state must not be
+        # returned as last-safe.
+        bad = dict(PUBLISHING_STATUS)
+        bad["previous_snapshot"] = [
+            {"release_id": "v9.9.8-2", "state": "FAILED"},
+            {"release_id": "v9.9.7-1", "state": "COMPLETE"},
+        ]
+        out = rw.last_safe_read(bad)
+        # Either NOT_VERIFIED, or last_safe pointing at the safe entry --
+        # never last_safe pointing at the FAILED entry.
+        assert not (out.get("mode") == "last_safe"
+                    and out.get("release_id") == "v9.9.8-2"), \
+            "must not trust an unsafe snapshot entry"
+
+    def test_snapshot_pointer_mismatch_fails_closed(self):
+        # Reviewer B4: snapshot entries must be pointer-consistent with
+        # previous_release_id.
+        bad = dict(PUBLISHING_STATUS)
+        bad["previous_release_id"] = "v9.9.0-0"  # does not match snapshot
+        out = rw.last_safe_read(bad)
+        assert out.get("verdict") == "NOT_VERIFIED" or \
+               out.get("release_id") == "v9.9.0-0", \
+            "pointer inconsistency must fail closed, never silently use [0]"
+
+    def test_entry_missing_release_id_fails_closed(self):
+        bad = dict(PUBLISHING_STATUS)
+        bad["previous_snapshot"] = [{"state": "COMPLETE"}, {"nope": 1}]
+        out = rw.last_safe_read(bad)
+        assert out.get("verdict") == "NOT_VERIFIED"
+
+
+class TestAdversarialB4Compatibility:
+    """Reconciliation with current_state.consumer_artifacts() semantics."""
+
+    def test_transitional_agrees_on_snapshot_source(self):
+        from cba_kb import current_state as cs
+        # consumer_artifacts() returns the snapshot list on transitional states.
+        snaps = cs.consumer_artifacts(PUBLISHING_STATUS)
+        assert isinstance(snaps, list) and len(snaps) == 2
+        # last_safe_read() must pick its release_id from that same snapshot,
+        # validated, never the pending candidate.
+        out = rw.last_safe_read(PUBLISHING_STATUS)
+        assert out["mode"] == "last_safe"
+        assert out["release_id"] in {
+            e.get("release_id") for e in snaps if isinstance(e, dict)}
+        assert out["release_id"] != PUBLISHING_STATUS["pending_release_id"]
+
+    def test_complete_agrees_on_current_source(self):
+        from cba_kb import current_state as cs
+        status = dict(COMPLETE_STATUS, artifacts=["a1"])
+        assert cs.consumer_artifacts(status) == ["a1"]
+        out = rw.last_safe_read(status)
+        assert out["mode"] == "current"
+        assert out["release_id"] == "v9.9.9-1"
+
+    def test_both_fail_closed_on_missing_snapshot(self):
+        from cba_kb import current_state as cs
+        bad = dict(PUBLISHING_STATUS, previous_snapshot=[])
+        with pytest.raises(ValueError):
+            cs.consumer_artifacts(bad)
+        out = rw.last_safe_read(bad)
+        assert out["verdict"] == "NOT_VERIFIED"
+
+
+class TestAdversarialB5:
+    def _binding(self, **kw):
+        b = {"source": "live_status", "track": "data_production",
+             "release_id": "v9.9.4-2", "code_commit": "aaabbb",
+             "manifest_binding": "m-1", "stale": False}
+        b.update(kw)
+        return b
+
+    def test_empty_identity_values_rejected(self):
+        # Reviewer B5: binding keys present but values empty/None must not PASS.
+        out = rw.check_surface_consistency("documents", [
+            self._binding(release_id=""),
+            self._binding(code_commit=None),
+        ])
+        assert out["verdict"] in ("NOT_VERIFIED", "FAIL", "CONTRACT_CONFLICT")
+        assert out["verdict"] != "PASS"
+
+    def test_cross_track_difference_without_evidence_not_legitimized(self):
+        # Reviewer B5: cross-track difference must not auto-legitimize to
+        # EXPLICITLY_BOUND without demonstrable binding evidence.
+        out = rw.check_surface_consistency("documents", [
+            self._binding(source="live_status", track="data_production"),
+            self._binding(source="engine_release", track="engine",
+                          release_id="v9.9.4-2", code_commit="dddeee",
+                          manifest_binding="m-2"),
+        ])
+        assert out["verdict"] != "EXPLICITLY_BOUND", \
+            "cross-track difference without binding evidence must not be legitimized"
+
+    def test_cross_track_difference_with_evidence_is_explicitly_bound(self):
+        out = rw.check_surface_consistency("documents", [
+            self._binding(source="live_status", track="data_production",
+                          binding_evidence="release_status readback 2026-10-18"),
+            self._binding(source="engine_release", track="engine",
+                          release_id="v9.9.4-2", code_commit="dddeee",
+                          manifest_binding="m-2",
+                          binding_evidence="github release readback 2026-10-18"),
+        ])
+        assert out["verdict"] == "EXPLICITLY_BOUND"
+
+
+class TestAdversarialB6:
+    def _args(self, **kw):
+        args = {"expected_manifest_sha": "a" * 64,
+                "observed_manifest_sha": "a" * 64,
+                "expected_manifest_evidence": "consumer target readback 2026-10-18",
+                "observed_manifest_evidence": "consumer target readback 2026-10-18",
+                "required_artifacts": ["doc-1"],
+                "artifacts_present": ["doc-1"],
+                "silent_truncation": 0,
+                "third_party_read": True}
+        args.update(kw)
+        return args
+
+    def test_empty_required_artifacts_rejected(self):
+        # Reviewer B6: empty required_artifacts=[] + self-reported hashes
+        # must be rejected, never MATERIALIZED_ALLOWED.
+        out = rw.gate_new_batch(**self._args(required_artifacts=[],
+                                             artifacts_present=[]))
+        assert out["verdict"] == "REFUSED"
+
+    def test_self_reported_hashes_without_evidence_rejected(self):
+        # Reviewer B6: manifest SHAs without independent establishment
+        # evidence must be rejected.
+        args = self._args()
+        del args["expected_manifest_evidence"]
+        del args["observed_manifest_evidence"]
+        out = rw.gate_new_batch(**args)
+        assert out["verdict"] == "REFUSED"
+        assert "evidence" in out["reason"] or "established" in out["reason"]
+
+    def test_independently_established_manifest_allowed(self):
+        out = rw.gate_new_batch(**self._args())
+        assert out["verdict"] == "MATERIALIZED_ALLOWED"
+
+
+class TestAdversarialB7:
+    def test_write_to_evaluation_output_with_hostile_detail_denied(self):
+        # Reviewer B7 EXACT counterexample: must be DENIED, not ALLOWED.
+        out = rw.zero_diff_guard([
+            {"target": "evaluation_output", "kind": "write",
+             "detail": "overwrite protected history"}])
+        assert out["verdict"] == "ALL_REFUSED"
+
+    def test_mutating_kind_on_non_designated_target_denied(self):
+        out = rw.zero_diff_guard([
+            {"target": "evaluation_output", "kind": "delete",
+             "detail": "cleanup"}])
+        assert out["verdict"] == "ALL_REFUSED"
+
+    def test_read_only_evaluation_still_allowed(self):
+        out = rw.zero_diff_guard([
+            {"target": "evaluation_output", "kind": "read",
+             "detail": "current_world view"}])
+        assert out["verdict"] == "ALL_ALLOWED"
+
+
+# ---------------------------------------------------------------------------
 # Output shape: v2 §4.1 conceptual view
 # ---------------------------------------------------------------------------
 
 class TestOutputShape:
     def test_build_current_world_shape(self):
+        # Updated post-Q2-B1: read_timestamp must be a valid ISO-8601
+        # timestamp; the old "t" placeholder no longer binds.
         dp = rw.bind_release_status(
-            _raw(COMPLETE_STATUS), file_id="f", read_timestamp="t")
+            _raw(COMPLETE_STATUS), file_id="f",
+            read_timestamp="2026-10-18T14:00:00Z")
         world = rw.build_current_world(
             data_production=dp["data_production"],
             engine={"release_tag": {"value": "v9.9.4-2", "source": "github"},

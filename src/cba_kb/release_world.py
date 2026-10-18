@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 SPEC_ID = "Q1-V205-UNIFIED-REALDATA-CANARY-v2"
@@ -40,6 +41,26 @@ _PROTECTED_TARGETS = frozenset({
     "release_status",      # release_status.json content / version rewrite
     "data_production_old", # old Data Production data
 })
+
+# Operation kinds this guard understands.
+_READONLY_KINDS = frozenset({"read", "evaluate", "view", "inspect"})
+# The only designated lawful write path (still needs its own authorized path).
+_LAWFUL_WRITE_TARGETS = frozenset({"new_data_release"})
+
+
+def _detail_targets_history(detail: Any) -> bool:
+    """Detect whether a change detail describes touching protected history.
+
+    B7: the guard examines WHAT the operation proposes, not just the
+    target name. A hostile detail (e.g. "overwrite protected history")
+    is denied even when the target name itself is allowlisted.
+    """
+    d = detail if isinstance(detail, str) else ""
+    d = d.lower()
+    return any(k in d for k in (
+        "git_tag", "release_status", "data_production_old",
+        "protected histor", "overwrite histor", "rewrite histor",
+        "force version", "force_version", "v2.0.4-2"))
 
 # Artifact kinds whose consumability release_status is allowed to judge.
 _DATA_PRODUCTION_KINDS = frozenset({"data_production_current"})
@@ -59,6 +80,23 @@ def _reject_duplicate_keys(pairs: List[tuple]) -> Dict[str, Any]:
 
 def _blocked(reason: str) -> Dict[str, Any]:
     return {"verdict": "BLOCKED/NOT_VERIFIED", "reason": reason}
+
+
+def _nonempty_str(value: Any) -> bool:
+    """Non-empty, non-blank string check (fail-closed identity validation)."""
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _valid_timestamp(value: Any) -> bool:
+    """Strict ISO-8601 timestamp check. Malformed values are rejected --
+    freshness must be provable, never assumed."""
+    if not _nonempty_str(value):
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return True
+    except ValueError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +141,21 @@ def bind_release_status(
     if not isinstance(doc, dict):
         return _blocked("top-level JSON is not an object")
 
+    # B1 (fail-closed identity binding): an anonymous or malformed status
+    # document must never bind as OK. current_release_id, state and a
+    # provable read timestamp are mandatory; revision is optional but its
+    # availability is explicitly distinguished (BOUND vs NOT_AVAILABLE).
+    if not _valid_timestamp(read_timestamp):
+        return _blocked("malformed read_timestamp: freshness unprovable")
+    release_id = doc.get("current_release_id")
+    if not _nonempty_str(release_id):
+        return _blocked("current_release_id missing or empty: cannot bind identity")
+    state = doc.get("state")
+    if not _nonempty_str(state):
+        return _blocked("state missing or empty: cannot bind identity")
+    if "previous_snapshot" in doc and not isinstance(doc["previous_snapshot"], list):
+        return _blocked("previous_snapshot present but not a list")
+
     snapshot = doc.get("previous_snapshot")
     pointers = {
         "pending_release_id": doc.get("pending_release_id"),
@@ -113,11 +166,12 @@ def bind_release_status(
     return {
         "verdict": "OK",
         "data_production": {
-            "release_id": doc.get("current_release_id"),
-            "state": doc.get("state"),
+            "release_id": release_id,
+            "state": state,
             "evidence": {
                 "file_id": file_id,
                 "revision": revision,
+                "revision_status": "BOUND" if _nonempty_str(revision) else "NOT_AVAILABLE",
                 "sha256": digest,
                 "read_timestamp": read_timestamp,
             },
@@ -192,6 +246,13 @@ def judge_consumability(
     """
     if artifact_kind in _DATA_PRODUCTION_KINDS:
         if release_state == "COMPLETE":
+            # B2 (fail-closed): a COMPLETE state with a missing/empty
+            # release identity must NOT return CONSUMABLE. Positive
+            # consumability requires a valid bound release identity.
+            if not _nonempty_str(data_production_release_id):
+                return {"verdict": "NOT_CONSUMABLE",
+                        "reason": "COMPLETE state but release identity "
+                                  "missing: fail closed"}
             return {"verdict": "CONSUMABLE",
                     "via": "release_status",
                     "release_id": data_production_release_id}
@@ -222,7 +283,16 @@ def capability_status(
     reason: Optional[str] = None,
     batch_ref: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Judge one advertised capability on its own evidence (AC-34).
+    """Format one advertised capability status entry (AC-34).
+
+    FORMATTER, NOT CERTIFIER: this function does NOT independently
+    establish or certify materialization. It formats a status entry for
+    the CW-01 view. A ``MATERIALIZED`` entry REQUIRES a non-empty
+    ``batch_or_catalog_ref`` binding it to materialized artifacts --
+    callers must have established materialization through an evidence
+    path (e.g. ``gate_new_batch`` for new batches, consumer manifest
+    readback for existing capabilities) BEFORE formatting. Formatting
+    ``MATERIALIZED`` without evidence is refused.
 
     Each capability is judged independently: an AVAILABLE/MATERIALIZED
     documents capability never implies that person/stats/claim are also
@@ -232,6 +302,11 @@ def capability_status(
         raise ValueError(f"illegal capability status: {status!r}")
     if status == "NOT_MATERIALIZED" and not reason:
         raise ValueError("NOT_MATERIALIZED requires a reason")
+    if status == "MATERIALIZED" and not _nonempty_str(batch_ref):
+        raise ValueError(
+            "MATERIALIZED requires a batch_or_catalog_ref binding it to "
+            "materialized artifacts; this formatter does not certify "
+            "materialization without evidence")
     entry: Dict[str, Any] = {"capability": name, "status": status}
     if reason:
         entry["reason"] = reason
@@ -244,13 +319,25 @@ def capability_status(
 # AC-35: last-safe read on transitional states
 # ---------------------------------------------------------------------------
 
-def _snapshot_release_id(entry: Any) -> Optional[str]:
-    if isinstance(entry, dict):
-        rid = entry.get("release_id")
-        return rid if isinstance(rid, str) and rid else None
-    if isinstance(entry, str) and entry:
-        return entry
-    return None
+# Snapshot entries usable as last-safe must be in a safe terminal state.
+_SAFE_SNAPSHOT_STATES = frozenset({"COMPLETE", "ROLLED_BACK"})
+
+
+def _safe_snapshot_release_id(entry: Any) -> Optional[str]:
+    """Return the release_id iff the snapshot entry is safe AND complete.
+
+    B4: a snapshot entry is usable as last-safe only when it is a dict
+    with a non-empty release_id AND in a safe terminal state (COMPLETE
+    or ROLLED_BACK). Anything else -> None (entry unusable).
+    """
+    if not isinstance(entry, dict):
+        return None
+    rid = entry.get("release_id")
+    if not _nonempty_str(rid):
+        return None
+    if entry.get("state") not in _SAFE_SNAPSHOT_STATES:
+        return None
+    return rid
 
 
 def last_safe_read(status_doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -260,11 +347,18 @@ def last_safe_read(status_doc: Dict[str, Any]) -> Dict[str, Any]:
     is never read; the previous_snapshot supplies this track's last safe
     version. A malformed snapshot fails closed. Other capabilities that
     are independent and stable are not touched by this judgement.
+
+    B4: snapshot entries are VALIDATED (safe state, completeness,
+    pointer consistency with previous_release_id) -- previous_snapshot[0]
+    is never blindly trusted.
     """
     state = status_doc.get("state")
     if state == "COMPLETE":
-        return {"mode": "current",
-                "release_id": status_doc.get("current_release_id")}
+        rid = status_doc.get("current_release_id")
+        if not _nonempty_str(rid):
+            return {"verdict": "NOT_VERIFIED",
+                    "reason": "COMPLETE without release identity"}
+        return {"mode": "current", "release_id": rid}
     if state not in TRANSITIONAL_STATES:
         return {"verdict": "NOT_VERIFIED",
                 "reason": f"unknown release state: {state}"}
@@ -272,13 +366,29 @@ def last_safe_read(status_doc: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(snapshot, list) or not snapshot:
         return {"verdict": "NOT_VERIFIED",
                 "reason": "malformed_snapshot_fail_closed"}
-    release_id = _snapshot_release_id(snapshot[0])
-    if release_id is None:
+    # Validate entries; take the first safe+complete one. Never blindly [0].
+    chosen: Optional[str] = None
+    for entry in snapshot:
+        rid = _safe_snapshot_release_id(entry)
+        if rid is not None:
+            chosen = rid
+            break
+    if chosen is None:
         return {"verdict": "NOT_VERIFIED",
-                "reason": "malformed_snapshot_fail_closed"}
+                "reason": "no safe snapshot entry"}
+    # Pointer consistency: the chosen entry must be the previous release.
+    prev = status_doc.get("previous_release_id")
+    if not _nonempty_str(prev):
+        return {"verdict": "NOT_VERIFIED",
+                "reason": "previous_release_id missing: "
+                          "pointer consistency unverifiable"}
+    if chosen != prev:
+        return {"verdict": "NOT_VERIFIED",
+                "reason": f"snapshot/pointer mismatch: {chosen!r} != "
+                          f"previous_release_id {prev!r}"}
     return {
         "mode": "last_safe",
-        "release_id": release_id,
+        "release_id": chosen,
         "entries_considered": len(snapshot),
         # The pending candidate is deliberately NOT read.
         "pending_ignored": status_doc.get("pending_release_id"),
@@ -311,6 +421,16 @@ def check_surface_consistency(
         if not _REQUIRED_BINDING_KEYS.issubset(b.keys()):
             return {"verdict": "NOT_VERIFIED",
                     "reason": f"incomplete binding from {b.get('source', '?')}"}
+    # B5: keys present is not enough -- identity VALUES must be non-empty.
+    # A binding with empty/None release_id, code_commit, manifest_binding,
+    # source or track can never PASS.
+    for b in bindings:
+        for field in ("source", "track", "release_id", "code_commit",
+                      "manifest_binding"):
+            if not _nonempty_str(b.get(field)):
+                return {"verdict": "NOT_VERIFIED",
+                        "reason": f"empty identity field {field!r} from "
+                                  f"{b.get('source') or '?'}: cannot verify"}
     for b in bindings:
         if b["stale"]:
             return {"verdict": "FAIL",
@@ -333,14 +453,25 @@ def check_surface_consistency(
                   for b in bindings}
     if len(identities) == 1:
         return {"verdict": "PASS", "surface": surface}
+    # B5: a cross-track difference is legitimized as EXPLICITLY_BOUND ONLY
+    # with demonstrable binding evidence for the legal difference -- never
+    # auto-legitimized. Each binding must carry binding_evidence describing
+    # how the binding was established (e.g. manifest readback receipt).
+    for b in bindings:
+        if not _nonempty_str(b.get("binding_evidence")):
+            return {"verdict": "NOT_VERIFIED",
+                    "surface": surface,
+                    "reason": f"cross-track difference without binding "
+                              f"evidence from {b['source']}: not legitimized"}
     return {
         "verdict": "EXPLICITLY_BOUND",
         "surface": surface,
         "bindings": [
             {"source": b["source"], "track": b["track"],
              "release_id": b["release_id"], "code_commit": b["code_commit"],
-             "manifest_binding": b["manifest_binding"]} for b in bindings],
-        "note": "legal cross-track difference; not forced equal",
+             "manifest_binding": b["manifest_binding"],
+             "binding_evidence": b["binding_evidence"]} for b in bindings],
+        "note": "legal cross-track difference with evidence; not forced equal",
     }
 
 
@@ -352,6 +483,8 @@ def gate_new_batch(
     *,
     expected_manifest_sha: Optional[str],
     observed_manifest_sha: Optional[str],
+    expected_manifest_evidence: Optional[str] = None,
+    observed_manifest_evidence: Optional[str] = None,
     required_artifacts: List[str],
     artifacts_present: List[str],
     silent_truncation: int,
@@ -363,12 +496,26 @@ def gate_new_batch(
     Expected vs observed manifest must match in the consumer target, the
     full required artifact set must be reachable, and silent_truncation
     must be 0. A third party not yet read is EXTERNAL_PENDING, not PASS.
+
+    B6: the manifest SHAs must be INDEPENDENTLY ESTABLISHED -- each side
+    needs evidence describing its lawful, independent establishment
+    (e.g. consumer-target readback receipt). Self-reported hashes are
+    rejected. An empty required_artifacts list is rejected: there must be
+    a complete, non-empty artifact inventory to verify.
     """
     if not third_party_read:
         return {"verdict": "EXTERNAL_PENDING",
                 "reason": "third party not yet read; not a PASS"}
+    if not required_artifacts:
+        return {"verdict": "REFUSED",
+                "reason": "empty_required_artifact_set: nothing to verify"}
     if not expected_manifest_sha or expected_manifest_sha != observed_manifest_sha:
         return {"verdict": "REFUSED", "reason": "manifest_mismatch"}
+    if not _nonempty_str(expected_manifest_evidence) or \
+            not _nonempty_str(observed_manifest_evidence):
+        return {"verdict": "REFUSED",
+                "reason": "manifest_not_independently_established: "
+                          "self-reported hashes rejected"}
     missing = [a for a in required_artifacts if a not in set(artifacts_present)]
     if missing:
         return {"verdict": "REFUSED",
@@ -392,21 +539,37 @@ def zero_diff_guard(proposed_changes: List[Dict[str, Any]]) -> Dict[str, Any]:
     mutated. Only an independent, authorized new Data Release through the
     normal single-writer/rollback/readback path may update release status
     -- and this module performs no such update itself.
+
+    B7: the guard examines the OPERATION (kind + detail), not just the
+    target name. A mutating kind on a non-designated target is denied,
+    and any detail describing protected-history tampering is denied even
+    when the target name is allowlisted.
     """
     decisions = []
     for change in proposed_changes:
         target = change.get("target")
+        kind = change.get("kind")
+        detail = change.get("detail")
         if target in _PROTECTED_TARGETS:
             decisions.append({"change": change, "decision": "REFUSED",
                               "reason": f"protected target: {target}"})
-        elif target in ("evaluation_output", "new_data_release"):
+        elif _detail_targets_history(detail):
+            decisions.append({"change": change, "decision": "REFUSED",
+                              "reason": "detail indicates protected-history "
+                                        "tampering: fail closed"})
+        elif kind in _READONLY_KINDS:
             decisions.append({"change": change, "decision": "ALLOWED",
-                              "note": "no history rewritten; any real release "
+                              "note": "read-only operation; no history touched"})
+        elif target in _LAWFUL_WRITE_TARGETS:
+            decisions.append({"change": change, "decision": "ALLOWED",
+                              "note": "designated write path; any real release "
                                       "update needs its own authorized path"})
         else:
-            # Fail closed on anything unrecognized.
+            # Fail closed on mutating kinds against non-designated targets
+            # and on anything unrecognized.
             decisions.append({"change": change, "decision": "REFUSED",
-                              "reason": f"unknown target fails closed: {target}"})
+                              "reason": f"not an allowlisted read or lawful "
+                                        f"write: target={target!r} kind={kind!r}"})
     refused = [d for d in decisions if d["decision"] == "REFUSED"]
     if not decisions:
         verdict = "ALL_ALLOWED"
