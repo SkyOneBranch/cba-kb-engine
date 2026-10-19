@@ -113,7 +113,7 @@ def _is_weak_marker_cell(cell, markers, col_index):
     return False
 
 
-def _find_marker_kind(sheet):
+def _find_marker_kind(sheet, header_info=None):
     """Stream the ENTIRE worksheet for pivot/summary markers (B1-R2-01).
 
     Markers may sit below the header probe window (row 13+); a bounded scan
@@ -126,35 +126,98 @@ def _find_marker_kind(sheet):
     数据透视, 透视表, 计数项, (多项)) are pivot-specific vocabulary --
     substring match anywhere vetoes. Weak markers (汇总/总计/计数/统计/
     平均/合计) are common words -- they veto only as standalone cells
-    (exact match, any column) or at row-start position (col 0) with only
-    punctuation following. An article title like "统计方法说明" in a
-    non-first column never triggers (R6 boundary fix).
+    (exact match, any column) or at row-start position (col 0).
+
+    R6c schema-aware (fixes RC05-R6b-01): when header_info is provided
+    (from _find_article_header), data cells in the recognized title/ID
+    columns below the header row are article CONTENT, not structural
+    labels -- they are excluded from weak-marker detection. A title like
+    "统计方法说明" in the title column (even at col 0) never triggers.
     """
+    # Unpack header schema for content exclusion
+    header_row = title_col = id_col = None
+    if header_info is not None:
+        header_row, id_col, title_col, _ = header_info
+    data_cols = {c for c in (title_col, id_col) if c is not None}
+
     found_summary = False
-    for row in sheet.iter_rows(values_only=True):
+    for row_idx, row in enumerate(sheet.iter_rows(values_only=True)):
         for col_index, value in enumerate(row):
             cell = _cell_text(value)
             if not cell:
                 continue
+            # Strong markers always veto (pivot-specific vocabulary).
             if any(marker in cell for marker in STRONG_PIVOT_MARKERS):
                 return PIVOT
-            if _is_weak_marker_cell(cell, WEAK_PIVOT_MARKERS, col_index):
-                return PIVOT
-            if _is_weak_marker_cell(cell, WEAK_SUMMARY_MARKERS, col_index):
-                found_summary = True
+            # R6c: article content cells (title/ID columns, below header)
+            # get exact-match only for weak markers; prefix matches are
+            # skipped (they're titles like "统计方法说明", not labels).
+            # Non-content cells get the full weak-marker check.
+            is_content = (header_row is not None and row_idx > header_row
+                          and col_index in data_cols)
+            if is_content:
+                if cell in WEAK_PIVOT_MARKERS:
+                    return PIVOT
+                if cell in WEAK_SUMMARY_MARKERS:
+                    found_summary = True
+            else:
+                if _is_weak_marker_cell(cell, WEAK_PIVOT_MARKERS, col_index):
+                    return PIVOT
+                if _is_weak_marker_cell(cell, WEAK_SUMMARY_MARKERS, col_index):
+                    found_summary = True
     return SUMMARY if found_summary else None
+
+
+def _has_aggregate_row_pattern(sheet, header_info):
+    """Detect disguised aggregate tables (fixes RC05-R6b-02).
+
+    A sheet with an article-like header whose EVERY data row has a
+    numeric-looking ID and a weak-marker-prefixed title (e.g. ID='89',
+    title='统计口径说明') is an aggregate table in disguise, not article
+    data. Fail closed: return True to veto ARTICLE_DATA.
+
+    Requires ALL data rows to match (a single odd row doesn't kill a sheet).
+    Legitimate articles have alphanumeric IDs (W001, A0001) and real titles;
+    a sheet full of numeric-ID + summary-label rows is not articles.
+    """
+    header_row, id_col, title_col, _ = header_info
+    rows_checked = 0
+    for row_idx, row in enumerate(sheet.iter_rows(values_only=True)):
+        if row_idx <= header_row:
+            continue
+        cells = [_cell_text(v) for v in row]
+        # Skip empty rows
+        if not any(cells):
+            continue
+        # Need enough columns
+        if id_col >= len(cells) or title_col >= len(cells):
+            return False
+        id_cell = cells[id_col]
+        title_cell = cells[title_col]
+        # Aggregate pattern: numeric ID + marker-prefixed title
+        is_numeric_id = id_cell and id_cell.replace('.', '').isdigit()
+        has_marker_title = any(title_cell.startswith(m)
+                               for m in WEAK_PIVOT_MARKERS + WEAK_SUMMARY_MARKERS)
+        if not (is_numeric_id and has_marker_title):
+            return False  # Found a legitimate-looking row
+        rows_checked += 1
+    # All data rows matched the aggregate pattern (and at least one exists)
+    return rows_checked > 0
 
 
 def _classify_sheet(sheet):
     # B1-R2-01: the marker scan covers the whole sheet (streaming); the
     # article-header probe stays bounded to rows 1-12 (headers live at top).
-    marker = _find_marker_kind(sheet)
+    # R6c: detect header FIRST so marker scan can exclude article content.
     probe = [[_cell_text(value) for value in row]
              for row in sheet.iter_rows(min_row=1, max_row=12, values_only=True)]
     flat = [cell for row in probe for cell in row if cell]
+    header = _find_article_header(probe)
+    # _find_article_header returns 0-based row index; _find_marker_kind
+    # uses 0-based row_idx from iter_rows, so they align directly.
+    marker = _find_marker_kind(sheet, header_info=header)
     if not flat and marker is None:
         return SHEET_UNKNOWN
-    header = _find_article_header(probe)
     # B1: pivot/summary markers take precedence, fail-closed. A sheet carrying
     # markers is NEVER article data; markers + article-like header coexisting
     # is ambiguous -> unknown (never emitted as facts).
@@ -167,6 +230,11 @@ def _classify_sheet(sheet):
     if has_summary:
         return SUMMARY
     if header is not None:
+        # R6c: check for disguised aggregate tables (RC05-R6b-02).
+        # A sheet with article-like headers but all-aggregate data rows
+        # (numeric IDs + summary-label titles) is not article data.
+        if _has_aggregate_row_pattern(sheet, header):
+            return SHEET_UNKNOWN
         return ARTICLE_DATA
     return SHEET_UNKNOWN
 

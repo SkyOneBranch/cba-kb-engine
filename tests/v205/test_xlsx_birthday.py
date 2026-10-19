@@ -382,3 +382,32 @@ def test_article_title_starting_with_weak_marker_not_killed(tmp_path):
     _, rows = foreign_xlsx.article_rows(path, sheet='工作表1')
     assert len(rows) == 2
     assert rows[0]['title'] == '统计方法说明'
+
+
+def test_r6c_reordered_title_column_not_killed(tmp_path):
+    """RC05-R6b-01: 标题列在 col 0 的合法文章表不得误杀（schema-aware）。"""
+    from openpyxl import Workbook
+    book = Workbook()
+    sheet = book.active
+    sheet.title = '工作表1'
+    sheet.append(['文章标题', '微信文章编号', '日期'])
+    sheet.append(['统计方法说明', 'W001', 45705])
+    path = tmp_path / 'r6b01.xlsx'
+    book.save(path)
+    roles = foreign_xlsx.classify_sheets(path)
+    assert roles['工作表1'] == foreign_xlsx.ARTICLE_DATA
+
+
+def test_r6c_disguised_aggregate_table_rejected(tmp_path):
+    """RC05-R6b-02: 伪装汇总表（数字ID+汇总标签标题）必须拒绝。"""
+    from openpyxl import Workbook
+    book = Workbook()
+    sheet = book.active
+    sheet.title = '工作表1'
+    sheet.append(['微信文章编号', '文章标题', '日期'])
+    sheet.append(['89', '统计口径说明', None])
+    sheet.append(['58', '总计说明', None])
+    path = tmp_path / 'r6b02.xlsx'
+    book.save(path)
+    roles = foreign_xlsx.classify_sheets(path)
+    assert roles['工作表1'] != foreign_xlsx.ARTICLE_DATA
