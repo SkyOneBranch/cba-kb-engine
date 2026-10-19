@@ -13,6 +13,7 @@ plain text, OOXML .xlsx, corrupt stream) raises ``XlsFormatError`` or
 """
 from pathlib import Path
 from typing import List, NamedTuple, Tuple
+import datetime
 
 import xlrd
 from xlrd.xldate import xldate_as_datetime
@@ -28,10 +29,29 @@ class XlsFormatError(Exception):
 
 
 class XlsCell(NamedTuple):
-    value: object  # parsed value; Excel date serials -> datetime.date
+    value: object  # parsed value; Excel date serials -> date (pure) or datetime (with time)
     raw: object    # original xlrd value; date serials kept as float
     ctype: int     # xlrd cell type (XL_CELL_*)
     merged: bool   # True when forward-filled from a merged range's top-left
+    row: int       # 0-based row index in the sheet
+    col: int       # 0-based column index in the sheet
+
+
+class Rc04Record(NamedTuple):
+    """One validated RC-04 roster record (evidence-preserving).
+
+    Built only by read_rc04_records() from read_cells() evidence.
+    person_id is always None and identity_status always 'candidate':
+    this adapter never infers person identity.
+    """
+    seq: object          # 序号 (as read)
+    name: object         # 姓名 (as read)
+    dob: object          # 出生日期: datetime.date (date-only; never datetime)
+    dob_raw: object      # original Excel serial (float) for the dob cell
+    source_row: int      # 0-based row index in the sheet
+    sheet: str           # sheet name
+    person_id: object    # always None (no inference)
+    identity_status: str # always 'candidate'
 
 
 def _open(path):
@@ -53,7 +73,15 @@ def _parse(xl_cell, datemode):
     ctype, raw = xl_cell.ctype, xl_cell.value
     if ctype == xlrd.XL_CELL_DATE:
         try:
-            value = xldate_as_datetime(raw, datemode).date()
+            dt = xldate_as_datetime(raw, datemode)
+            # B2: never silently truncate time. Pure dates (midnight) keep
+            # the historical date-only behavior; any non-zero time component
+            # is preserved as a full datetime. Downstream schema validation
+            # (e.g. RC-04) decides whether time-bearing values are allowed.
+            if dt.hour or dt.minute or dt.second or dt.microsecond:
+                value = dt
+            else:
+                value = dt.date()
         except Exception:
             # Unparseable serial: keep the raw number, never guess a date.
             value = raw
@@ -91,15 +119,111 @@ def read_cells(path, sheet=None):
             if (r, c) in fill_from:
                 r0, c0 = fill_from[(r, c)]
                 value, raw, ctype = _parse(sh.cell(r0, c0), book.datemode)
-                row.append(XlsCell(value, raw, ctype, True))
+                row.append(XlsCell(value, raw, ctype, True, r, c))
             else:
                 value, raw, ctype = _parse(sh.cell(r, c), book.datemode)
-                row.append(XlsCell(value, raw, ctype, False))
+                row.append(XlsCell(value, raw, ctype, False, r, c))
         grid.append(row)
     return name, grid
 
 
 def rows(path, sheet=None):
-    """Return ``(sheet_name, table)`` of plain values, like ``foreign_xlsx.rows``."""
+    """Return ``(sheet_name, table)`` of plain values, like ``foreign_xlsx.rows``.
+
+    B1: convenience interface only — it discards raw serials, cell types,
+    merged-cell provenance and positions. It is kept for backward
+    compatibility but MUST NOT be used for formal RC-04 ingestion; use
+    ``read_cells()`` or ``read_rc04_records()`` instead.
+    """
     name, grid = read_cells(path, sheet)
     return name, [[cell.value for cell in row] for row in grid]
+
+
+# --- B3: thin RC-04 structural validation on top of the generic reader ---
+
+RC04_REQUIRED_HEADERS = ('序号', '姓名', '出生日期')
+_RC04_HEADER_SCAN_ROWS = 3  # tolerate merged title rows above the header
+
+
+def _rc04_find_header(grid):
+    """Locate the RC-04 header row within the first few rows.
+
+    Returns (header_index, seq_col, name_col, dob_col) or None.
+    Header cells match exactly after stripping surrounding whitespace;
+    column order may vary.
+    """
+    for i in range(min(_RC04_HEADER_SCAN_ROWS, len(grid))):
+        labels = [c.value.strip() if isinstance(c.value, str) else ''
+                  for c in grid[i]]
+        try:
+            seq_c = labels.index(RC04_REQUIRED_HEADERS[0])
+            name_c = labels.index(RC04_REQUIRED_HEADERS[1])
+            dob_c = labels.index(RC04_REQUIRED_HEADERS[2])
+        except ValueError:
+            continue
+        return i, seq_c, name_c, dob_c
+    return None
+
+
+def read_rc04_records(path, sheet=None):
+    """Read and validate RC-04 roster records (fail-closed).
+
+    B3: thin business validation reusing the generic ``read_cells()``
+    evidence path. This is NOT a generic schema framework — it validates
+    only the RC-04 roster shape required this round:
+
+    - header row with 序号 / 姓名 / 出生日期 (first 3 rows scanned, so a
+      merged title row above the header is tolerated; column order free);
+    - at least one non-empty data row (empty business data is rejected);
+    - every birth-date cell must be a pure date: a datetime with a non-zero
+      time component, or any non-date value, rejects the whole table
+      (fail-closed; no silent truncation, no per-row guessing).
+
+    Returns ``(sheet_name, [Rc04Record, ...])``. Each record keeps the raw
+    serial, source row and sheet. ``person_id`` is always None and
+    ``identity_status`` always ``'candidate'`` — no identity inference.
+
+    Raises ``ValueError`` on wrong header, empty data, or uninterpretable
+    records; ``XlsFormatError``/``FileNotFoundError`` from the reader pass
+    through unchanged.
+    """
+    name, grid = read_cells(path, sheet)
+    found = _rc04_find_header(grid)
+    if found is None:
+        raise ValueError(
+            f'RC-04 header not found (need 序号/姓名/出生日期): {path}')
+    header_idx, seq_c, name_c, dob_c = found
+    records: List[Rc04Record] = []
+    for r in range(header_idx + 1, len(grid)):
+        row = grid[r]
+        if not any(c.value is not None for c in row):
+            continue  # blank spacer rows are not records
+        # Guard against ragged rows.
+        if max(seq_c, name_c, dob_c) >= len(row):
+            raise ValueError(
+                f'RC-04 row {r} is ragged (missing columns): {path}')
+        seq_cell, name_cell, dob_cell = row[seq_c], row[name_c], row[dob_c]
+        dob_val = dob_cell.value
+        # Birth date must be a pure date. A datetime with time, or a
+        # non-date value, means the record cannot be reliably interpreted.
+        if isinstance(dob_val, datetime.datetime):
+            raise ValueError(
+                f'RC-04 row {r} birth date has a time component '
+                f'({dob_val!r}); refusing table: {path}')
+        if not isinstance(dob_val, datetime.date):
+            raise ValueError(
+                f'RC-04 row {r} birth date is not a date '
+                f'({dob_val!r}); refusing table: {path}')
+        records.append(Rc04Record(
+            seq=seq_cell.value,
+            name=name_cell.value,
+            dob=dob_val,
+            dob_raw=dob_cell.raw,
+            source_row=r,
+            sheet=name,
+            person_id=None,
+            identity_status='candidate',
+        ))
+    if not records:
+        raise ValueError(f'RC-04 has no data rows: {path}')
+    return name, records

@@ -283,3 +283,119 @@ def test_rows_returns_plain_values(roster_xls):
     _name, table = xls_adapter.rows(roster_xls, sheet="教练组")
     assert isinstance(table[1][2], datetime.date)
     assert table[1][0] == 1
+
+
+# ---------------------------------------------------------------------------
+# R2: B1/B2/B3 regression tests (must FAIL on pre-fix code)
+# ---------------------------------------------------------------------------
+import xlwt as _xlwt
+from types import SimpleNamespace as _NS
+import xlrd as _xlrd
+
+
+def _make_xls(path, rows):
+    """Write a minimal synthetic .xls via xlwt (test-only helper)."""
+    book = _xlwt.Workbook()
+    sheet = book.add_sheet('Sheet1')
+    date_style = _xlwt.easyxf(num_format_str='YYYY-MM-DD')
+    dt_style = _xlwt.easyxf(num_format_str='YYYY-MM-DD HH:MM:SS')
+    for r, row in enumerate(rows):
+        for c, (val, style) in enumerate(row):
+            st = date_style if style == 'date' else (dt_style if style == 'dt' else _xlwt.Style.default_style)
+            sheet.write(r, c, val, st)
+    book.save(str(path))
+
+
+def test_b2_time_component_preserved_not_truncated():
+    # 34700.5 = 1995-01-01 12:00:00. Must keep full datetime, raw untouched.
+    fake = _NS(ctype=_xlrd.XL_CELL_DATE, value=34700.5)
+    value, raw, ctype = xls_adapter._parse(fake, 0)
+    assert raw == 34700.5
+    assert value == datetime.datetime(1995, 1, 1, 12, 0, 0)
+    assert isinstance(value, datetime.datetime)
+
+
+def test_b2_pure_date_stays_date_regression():
+    # 34700.0 = 1995-01-01 00:00:00. Keeps existing date-only behavior.
+    fake = _NS(ctype=_xlrd.XL_CELL_DATE, value=34700.0)
+    value, raw, ctype = xls_adapter._parse(fake, 0)
+    assert raw == 34700.0
+    assert value == datetime.date(1995, 1, 1)
+    assert type(value) is datetime.date  # not datetime
+
+
+def test_b1_xlscell_carries_position(roster_xls):
+    _name, grid = xls_adapter.read_cells(roster_xls, sheet="运动员")
+    cell = grid[2][2]
+    assert cell.row == 2
+    assert cell.col == 2
+    assert cell.raw == 34700.0  # evidence preserved
+
+
+def test_b1_rows_documented_as_lossy():
+    # rows() is a plain-value convenience; docstring must warn against
+    # using it for RC-04 ingestion (evidence loss).
+    assert 'RC-04' in xls_adapter.rows.__doc__
+    assert 'not' in xls_adapter.rows.__doc__.lower()
+
+
+def test_b3_rc04_happy_path(roster_xls):
+    name, records = xls_adapter.read_rc04_records(roster_xls, sheet="运动员")
+    assert name == "运动员"
+    # Synthetic fixture: 21 rows + empty row + 1 more row = 22 records.
+    # (Count is fixture-specific, not a code limit.)
+    assert len(records) == 22
+    r0 = records[0]
+    assert r0.seq == 1
+    assert r0.name  # synthetic name present
+    assert r0.dob == datetime.date(1995, 1, 1)
+    assert r0.dob_raw == 34700.0
+    assert r0.source_row == 2  # 0-based: title row 0, header row 1
+    assert r0.sheet == "运动员"
+    assert r0.person_id is None
+    assert r0.identity_status == 'candidate'
+
+
+def test_b3_rc04_wrong_header_rejected(tmp_path):
+    p = tmp_path / "wrong.xls"
+    _make_xls(p, [[('A', None), ('B', None), ('C', None)],
+                  [(1, None), ('X', None), (34700.0, 'date')]])
+    with pytest.raises(ValueError, match="RC-04 header not found"):
+        xls_adapter.read_rc04_records(p)
+
+
+def test_b3_rc04_empty_data_rejected(tmp_path):
+    p = tmp_path / "empty.xls"
+    _make_xls(p, [[('序号', None), ('姓名', None), ('出生日期', None)]])
+    with pytest.raises(ValueError):
+        xls_adapter.read_rc04_records(p)
+
+
+def test_b3_rc04_time_bearing_dob_rejects_table(tmp_path):
+    p = tmp_path / "badtime.xls"
+    _make_xls(p, [[('序号', None), ('姓名', None), ('出生日期', None)],
+                  [(1, None), ('Test', None), (34700.5, 'dt')]])
+    with pytest.raises(ValueError, match="[Tt]ime"):
+        xls_adapter.read_rc04_records(p)
+
+
+def test_b3_rc04_merged_title_row_compatible(tmp_path):
+    # Merged big title on row 0, header on row 1 -> still found.
+    p = tmp_path / "merged.xls"
+    _make_xls(p, [[('大标题', None), (None, None), (None, None)],
+                  [('序号', None), ('姓名', None), ('出生日期', None)],
+                  [(1, None), ('Test', None), (34700.0, 'date')]])
+    name, records = xls_adapter.read_rc04_records(p)
+    assert len(records) == 1
+    assert records[0].seq == 1
+
+
+def test_b3_generic_reader_still_reads_arbitrary_biff(tmp_path):
+    # B3 decision: generic read_cells() reads any valid BIFF (even A1-only).
+    # That is NOT a business PASS -- read_rc04_records must still refuse it.
+    p = tmp_path / "arbitrary.xls"
+    _make_xls(p, [[('arbitrary text', None)]])
+    name, grid = xls_adapter.read_cells(p)
+    assert grid[0][0].value == 'arbitrary text'  # generic read works
+    with pytest.raises(ValueError, match="RC-04 header not found"):
+        xls_adapter.read_rc04_records(p)
