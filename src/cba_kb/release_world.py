@@ -42,10 +42,23 @@ _PROTECTED_TARGETS = frozenset({
     "data_production_old", # old Data Production data
 })
 
-# Operation kinds this guard understands.
-_READONLY_KINDS = frozenset({"read", "evaluate", "view", "inspect"})
-# The only designated lawful write path (still needs its own authorized path).
-_LAWFUL_WRITE_TARGETS = frozenset({"new_data_release"})
+# AC-38 (Q2-R2 NEW-2): this READ+JUDGE module authorizes NO writes.
+# Only explicitly allowlisted (target, kind) pairs are permitted, and they
+# are all read-only. There is no generic write allowlist: new_data_release
+# is NOT a lawful-write target for this module; real release writes go
+# through the independent authorized publish path.
+_READONLY_OPERATIONS = frozenset({
+    ("evaluation_output", "read"),
+    ("evaluation_output", "evaluate"),
+    ("evaluation_output", "view"),
+    ("evaluation_output", "inspect"),
+})
+# Mutating or ambiguous kinds: always refused, on ANY target.
+# (Kind matching is case-insensitive; "DELETE" == "delete".)
+_REFUSED_KINDS = frozenset({
+    "delete", "rewrite", "overwrite", "mutate",
+    "write", "update", "create", "force_version",
+})
 
 
 def _detail_targets_history(detail: Any) -> bool:
@@ -61,6 +74,24 @@ def _detail_targets_history(detail: Any) -> bool:
         "git_tag", "release_status", "data_production_old",
         "protected histor", "overwrite histor", "rewrite histor",
         "force version", "force_version", "v2.0.4-2"))
+
+
+# NEW-2 (AC-38): mutation verbs for defense-in-depth detail screening.
+# A read-labeled operation whose detail describes a state change is a
+# mislabeled write. This is a SECONDARY signal; the primary decision is
+# the structured (target, kind) allowlist above.
+_MUTATION_VERBS = frozenset({
+    "delete", "remove", "rewrite", "overwrite", "mutate",
+    "modify", "update", "erase", "purge", "drop",
+    "删除", "移除", "重写", "覆盖", "修改", "更新", "清除",
+})
+
+
+def _detail_describes_mutation(detail: Any) -> bool:
+    """Detect whether a detail string describes a state-changing action."""
+    d = detail if isinstance(detail, str) else ""
+    d = d.lower()
+    return any(v in d for v in _MUTATION_VERBS)
 
 # Artifact kinds whose consumability release_status is allowed to judge.
 _DATA_PRODUCTION_KINDS = frozenset({"data_production_current"})
@@ -97,6 +128,63 @@ def _valid_timestamp(value: Any) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _valid_sha256(value: Any) -> bool:
+    """SHA-256 digest format: exactly 64 hex characters.
+
+    NEW-1: pseudo-hashes like "x" are rejected before any comparison.
+    """
+    return (isinstance(value, str) and len(value) == 64 and
+            all(c in "0123456789abcdefABCDEF" for c in value))
+
+
+# NEW-1 (AC-37): structured evidence receipt schema.
+# A receipt is produced by a TRUSTED UPSTREAM read (e.g. consumer-target
+# readback, engine manifest publish). This module validates the receipt's
+# STRUCTURE and BINDING (internal consistency + cross-consistency with the
+# judged inputs). It does NOT independently verify that the upstream
+# actually performed the read -- that trust is established by the pipeline
+# outside this module. Without a well-formed, bound receipt, the verdict
+# is fail-closed. An arbitrary dict, a bare True, or a non-empty string
+# is NEVER accepted as independent proof.
+_RECEIPT_REQUIRED_FIELDS = ("source", "target", "sha", "read_id",
+                            "read_timestamp")
+
+
+def _valid_evidence_receipt(receipt: Any) -> Optional[str]:
+    """Validate a structured evidence receipt.
+
+    Returns None if valid, else a machine-readable reason.
+    """
+    if not isinstance(receipt, dict):
+        return ("evidence_must_be_structured_receipt_dict: "
+                f"got {type(receipt).__name__}")
+    for field in _RECEIPT_REQUIRED_FIELDS:
+        if not _nonempty_str(receipt.get(field)):
+            return f"receipt_missing_binding_field: {field}"
+    if not _valid_sha256(receipt["sha"]):
+        return "receipt_sha_not_valid_sha256"
+    if not _valid_timestamp(receipt["read_timestamp"]):
+        return "receipt_read_timestamp_not_iso8601"
+    return None
+
+
+def _valid_inventory_receipt(receipt: Any) -> Optional[str]:
+    """Validate a structured artifact-inventory receipt."""
+    if not isinstance(receipt, dict):
+        return ("inventory_must_be_structured_receipt_dict: "
+                f"got {type(receipt).__name__}")
+    for field in ("source", "target", "read_id", "read_timestamp"):
+        if not _nonempty_str(receipt.get(field)):
+            return f"inventory_missing_binding_field: {field}"
+    artifacts = receipt.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts or not all(
+            _nonempty_str(a) for a in artifacts):
+        return "inventory_artifacts_must_be_nonempty_list"
+    if not _valid_timestamp(receipt["read_timestamp"]):
+        return "inventory_read_timestamp_not_iso8601"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -483,40 +571,95 @@ def gate_new_batch(
     *,
     expected_manifest_sha: Optional[str],
     observed_manifest_sha: Optional[str],
-    expected_manifest_evidence: Optional[str] = None,
-    observed_manifest_evidence: Optional[str] = None,
+    expected_manifest_evidence: Optional[Dict[str, Any]] = None,
+    observed_manifest_evidence: Optional[Dict[str, Any]] = None,
     required_artifacts: List[str],
-    artifacts_present: List[str],
+    artifact_inventory: Optional[Dict[str, Any]] = None,
     silent_truncation: int,
     third_party_read: bool,
+    consumer_target: str,
 ) -> Dict[str, Any]:
     """Judge whether a new batch may be claimed AVAILABLE/MATERIALIZED.
 
     AC-37: only after lawful intake AND an actual consumer projection.
-    Expected vs observed manifest must match in the consumer target, the
-    full required artifact set must be reachable, and silent_truncation
-    must be 0. A third party not yet read is EXTERNAL_PENDING, not PASS.
 
-    B6: the manifest SHAs must be INDEPENDENTLY ESTABLISHED -- each side
-    needs evidence describing its lawful, independent establishment
-    (e.g. consumer-target readback receipt). Self-reported hashes are
-    rejected. An empty required_artifacts list is rejected: there must be
-    a complete, non-empty artifact inventory to verify.
+    NEW-1 (fail-closed invariant): MATERIALIZED_ALLOWED is NEVER derived
+    from unverified caller assertions. The manifest SHAs must be valid
+    SHA-256 digests; each side needs a STRUCTURED evidence receipt (dict,
+    not a string/bool) that is BOUND to the compared digest, to the
+    consumer target, and to a distinct read operation. The artifact
+    inventory must be a bound receipt too -- a caller-supplied name list
+    matching required_artifacts is self-proof and is rejected.
+
+    TRUST BOUNDARY (explicit): this module validates receipt STRUCTURE and
+    BINDING. It does not independently verify that the trusted upstream
+    actually performed the reads -- that trust is established by the
+    pipeline outside this module. Callers must supply receipts produced by
+    the trusted upstream; anything else fails closed.
+
+    A third party not yet read is EXTERNAL_PENDING, not PASS.
     """
     if not third_party_read:
         return {"verdict": "EXTERNAL_PENDING",
                 "reason": "third party not yet read; not a PASS"}
+    if not _nonempty_str(consumer_target):
+        return {"verdict": "REFUSED",
+                "reason": "missing_consumer_target: nothing to bind evidence to"}
     if not required_artifacts:
         return {"verdict": "REFUSED",
                 "reason": "empty_required_artifact_set: nothing to verify"}
-    if not expected_manifest_sha or expected_manifest_sha != observed_manifest_sha:
-        return {"verdict": "REFUSED", "reason": "manifest_mismatch"}
-    if not _nonempty_str(expected_manifest_evidence) or \
-            not _nonempty_str(observed_manifest_evidence):
+    # SHA-256 format first: pseudo-hashes ("x") are rejected before any
+    # comparison. No format -> no judgement.
+    if not _valid_sha256(expected_manifest_sha):
         return {"verdict": "REFUSED",
-                "reason": "manifest_not_independently_established: "
-                          "self-reported hashes rejected"}
-    missing = [a for a in required_artifacts if a not in set(artifacts_present)]
+                "reason": "expected_manifest_sha_not_valid_sha256"}
+    if not _valid_sha256(observed_manifest_sha):
+        return {"verdict": "REFUSED",
+                "reason": "observed_manifest_sha_not_valid_sha256"}
+    if expected_manifest_sha != observed_manifest_sha:
+        return {"verdict": "REFUSED", "reason": "manifest_mismatch"}
+    # Structured receipts, not strings/bools/arbitrary dicts.
+    err = _valid_evidence_receipt(expected_manifest_evidence)
+    if err:
+        return {"verdict": "REFUSED",
+                "reason": f"expected_manifest_evidence_invalid: {err}"}
+    err = _valid_evidence_receipt(observed_manifest_evidence)
+    if err:
+        return {"verdict": "REFUSED",
+                "reason": f"observed_manifest_evidence_invalid: {err}"}
+    # Binding: each receipt must attest to the digest being compared.
+    if expected_manifest_evidence["sha"] != expected_manifest_sha:
+        return {"verdict": "REFUSED",
+                "reason": "expected_evidence_not_bound_to_manifest_sha"}
+    if observed_manifest_evidence["sha"] != observed_manifest_sha:
+        return {"verdict": "REFUSED",
+                "reason": "observed_evidence_not_bound_to_manifest_sha"}
+    # Independence: expected and observed must come from DIFFERENT reads.
+    # The same receipt supplied twice is self-proof, not corroboration.
+    if (expected_manifest_evidence["read_id"] ==
+            observed_manifest_evidence["read_id"]):
+        return {"verdict": "REFUSED",
+                "reason": "expected_and_observed_not_independent_reads: "
+                          "same read_id supplied twice"}
+    # Target binding: evidence must apply to the judged consumer target.
+    if expected_manifest_evidence["target"] != consumer_target:
+        return {"verdict": "REFUSED",
+                "reason": "expected_evidence_target_mismatch"}
+    if observed_manifest_evidence["target"] != consumer_target:
+        return {"verdict": "REFUSED",
+                "reason": "observed_evidence_target_mismatch"}
+    # Artifact inventory: a bound receipt, not a caller-supplied name list.
+    # required_artifacts matching a bare artifacts_present list is
+    # self-proof and is no longer accepted.
+    err = _valid_inventory_receipt(artifact_inventory)
+    if err:
+        return {"verdict": "REFUSED",
+                "reason": f"artifact_inventory_invalid: {err}"}
+    if artifact_inventory["target"] != consumer_target:
+        return {"verdict": "REFUSED",
+                "reason": "artifact_inventory_target_mismatch"}
+    inventory_artifacts = set(artifact_inventory["artifacts"])
+    missing = [a for a in required_artifacts if a not in inventory_artifacts]
     if missing:
         return {"verdict": "REFUSED",
                 "reason": f"incomplete_artifact_set: {missing}"}
@@ -524,7 +667,10 @@ def gate_new_batch(
         return {"verdict": "REFUSED",
                 "reason": f"silent_truncation={silent_truncation}"}
     return {"verdict": "MATERIALIZED_ALLOWED",
-            "note": "judgement only; this module marks nothing itself"}
+            "note": ("judgement only; this module marks nothing itself. "
+                     "Receipt structure and binding validated; the trust "
+                     "that the upstream performed the reads is established "
+                     "outside this module.")}
 
 
 # ---------------------------------------------------------------------------
@@ -536,40 +682,71 @@ def zero_diff_guard(proposed_changes: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     Historical git tags are never rewritten, release_status.json is never
     force-written to a new version, old Data Production data is never
-    mutated. Only an independent, authorized new Data Release through the
-    normal single-writer/rollback/readback path may update release status
-    -- and this module performs no such update itself.
+    mutated.
 
-    B7: the guard examines the OPERATION (kind + detail), not just the
-    target name. A mutating kind on a non-designated target is denied,
-    and any detail describing protected-history tampering is denied even
-    when the target name is allowlisted.
+    NEW-2 (fail-closed invariant): ALL_ALLOWED must NEVER contain a state
+    change that lacks independent authorization. This READ+JUDGE module
+    authorizes NO writes: only explicitly allowlisted (target, kind) pairs
+    are permitted, and every allowlisted pair is read-only. Mutating kinds
+    (delete/rewrite/overwrite/mutate/...), unknown kinds, and ambiguous
+    operations are refused on ANY target. new_data_release is NOT a
+    generic write allowlist -- real release writes go through the
+    independent authorized publish path, never through this function.
+
+    Decision order (primary = structured target+kind; detail text is only
+    a defense-in-depth secondary signal):
+      1. protected target -> REFUSED (any kind, even "read": the target
+         itself must not be touched by this module's judgements);
+      2. mutating/ambiguous kind (case-insensitive) -> REFUSED on any target;
+      3. detail targets protected history -> REFUSED (defense in depth;
+         checked before the allowlist so a hostile detail cannot ride on
+         an allowlisted pair);
+      4. explicitly allowlisted (target, kind) read-only pair -> ALLOWED,
+         unless the detail describes a state change (mislabeled write);
+      5. anything else -> REFUSED (fail closed).
+
+    Verdicts describe the PROPOSALS only (judgement-only): this function
+    never claims to have verified actual execution effects.
     """
     decisions = []
     for change in proposed_changes:
         target = change.get("target")
         kind = change.get("kind")
         detail = change.get("detail")
+        kind_norm = kind.lower() if isinstance(kind, str) else kind
         if target in _PROTECTED_TARGETS:
             decisions.append({"change": change, "decision": "REFUSED",
-                              "reason": f"protected target: {target}"})
+                              "reason": f"protected target: {target}; "
+                                        "judgement-only, no authorization"})
+        elif kind_norm in _REFUSED_KINDS:
+            decisions.append({"change": change, "decision": "REFUSED",
+                              "reason": f"mutating/ambiguous kind refused on "
+                                        f"any target: {kind!r}; judgement-only"})
         elif _detail_targets_history(detail):
             decisions.append({"change": change, "decision": "REFUSED",
                               "reason": "detail indicates protected-history "
-                                        "tampering: fail closed"})
-        elif kind in _READONLY_KINDS:
-            decisions.append({"change": change, "decision": "ALLOWED",
-                              "note": "read-only operation; no history touched"})
-        elif target in _LAWFUL_WRITE_TARGETS:
-            decisions.append({"change": change, "decision": "ALLOWED",
-                              "note": "designated write path; any real release "
-                                      "update needs its own authorized path"})
+                                        "tampering: fail closed; "
+                                        "judgement-only"})
+        elif (target, kind_norm) in _READONLY_OPERATIONS:
+            # Defense in depth: a read-labeled operation whose detail
+            # describes a state change is a mislabeled write.
+            if _detail_describes_mutation(detail):
+                decisions.append({"change": change, "decision": "REFUSED",
+                                  "reason": "read-labeled operation describes "
+                                            "a state change: mislabeled write; "
+                                            "judgement-only"})
+            else:
+                decisions.append({"change": change, "decision": "ALLOWED",
+                                  "note": "read-only operation; no state "
+                                          "change authorized by this module; "
+                                          "judgement-only"})
         else:
-            # Fail closed on mutating kinds against non-designated targets
-            # and on anything unrecognized.
+            # Fail closed on unknown kinds, unknown targets, and read
+            # kinds on non-allowlisted targets.
             decisions.append({"change": change, "decision": "REFUSED",
-                              "reason": f"not an allowlisted read or lawful "
-                                        f"write: target={target!r} kind={kind!r}"})
+                              "reason": f"not an allowlisted read-only "
+                                        f"operation: target={target!r} "
+                                        f"kind={kind!r}; judgement-only"})
     refused = [d for d in decisions if d["decision"] == "REFUSED"]
     if not decisions:
         verdict = "ALL_ALLOWED"
@@ -579,7 +756,11 @@ def zero_diff_guard(proposed_changes: List[Dict[str, Any]]) -> Dict[str, Any]:
         verdict = "ALL_REFUSED"
     else:
         verdict = "MIXED"
-    return {"verdict": verdict, "decisions": decisions}
+    return {"verdict": verdict,
+            "decisions": decisions,
+            "note": ("judgement-only: ALLOWED means 'read-only and "
+                     "allowlisted'; this module authorizes no state "
+                     "change and verifies no execution effects")}
 
 
 # ---------------------------------------------------------------------------

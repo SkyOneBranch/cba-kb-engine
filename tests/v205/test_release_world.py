@@ -319,17 +319,38 @@ class TestAC36SurfaceConsistency:
 # ---------------------------------------------------------------------------
 
 class TestAC37BatchGate:
+    def _receipt(self, **kw):
+        # Trusted-upstream evidence receipt (synthetic): structured, bound.
+        # This is a UNIT-TEST stand-in proving the algorithm; real consumer
+        # readback receipts are produced by the trusted upstream in the
+        # applicable phase.
+        r = {"source": "consumer-drive-readback",
+             "target": "consumer-docs",
+             "sha": "a" * 64,
+             "read_id": "read-001",
+             "read_timestamp": "2026-10-18T15:00:00Z"}
+        r.update(kw)
+        return r
+
+    def _inventory(self, **kw):
+        inv = {"source": "consumer-drive-readback",
+               "target": "consumer-docs",
+               "artifacts": ["doc-1", "doc-2"],
+               "read_id": "inv-001",
+               "read_timestamp": "2026-10-18T15:00:00Z"}
+        inv.update(kw)
+        return inv
+
     def _ok(self, **kw):
-        # Updated post-Q2-B6: manifest SHAs must be independently established
-        # (evidence params); the old version accepted self-reported hashes.
         args = {"expected_manifest_sha": "a" * 64,
                 "observed_manifest_sha": "a" * 64,
-                "expected_manifest_evidence": "consumer target readback 2026-10-18",
-                "observed_manifest_evidence": "consumer target readback 2026-10-18",
+                "expected_manifest_evidence": self._receipt(read_id="read-001"),
+                "observed_manifest_evidence": self._receipt(read_id="read-002"),
                 "required_artifacts": ["doc-1", "doc-2"],
-                "artifacts_present": ["doc-1", "doc-2"],
+                "artifact_inventory": self._inventory(),
                 "silent_truncation": 0,
-                "third_party_read": True}
+                "third_party_read": True,
+                "consumer_target": "consumer-docs"}
         args.update(kw)
         return rw.gate_new_batch(**args)
 
@@ -342,7 +363,7 @@ class TestAC37BatchGate:
         assert "manifest" in out["reason"]
 
     def test_incomplete_artifacts_refused(self):
-        out = self._ok(artifacts_present=["doc-1"])
+        out = self._ok(required_artifacts=["doc-1", "ghost"])
         assert out["verdict"] == "REFUSED"
 
     def test_silent_truncation_refused(self):
@@ -587,36 +608,56 @@ class TestAdversarialB5:
 
 
 class TestAdversarialB6:
+    def _receipt(self, **kw):
+        r = {"source": "consumer-drive-readback",
+             "target": "consumer-docs",
+             "sha": "a" * 64,
+             "read_id": "read-001",
+             "read_timestamp": "2026-10-18T15:00:00Z"}
+        r.update(kw)
+        return r
+
+    def _inventory(self, **kw):
+        inv = {"source": "consumer-drive-readback",
+               "target": "consumer-docs",
+               "artifacts": ["doc-1"],
+               "read_id": "inv-001",
+               "read_timestamp": "2026-10-18T15:00:00Z"}
+        inv.update(kw)
+        return inv
+
     def _args(self, **kw):
         args = {"expected_manifest_sha": "a" * 64,
                 "observed_manifest_sha": "a" * 64,
-                "expected_manifest_evidence": "consumer target readback 2026-10-18",
-                "observed_manifest_evidence": "consumer target readback 2026-10-18",
+                "expected_manifest_evidence": self._receipt(read_id="read-001"),
+                "observed_manifest_evidence": self._receipt(read_id="read-002"),
                 "required_artifacts": ["doc-1"],
-                "artifacts_present": ["doc-1"],
+                "artifact_inventory": self._inventory(),
                 "silent_truncation": 0,
-                "third_party_read": True}
+                "third_party_read": True,
+                "consumer_target": "consumer-docs"}
         args.update(kw)
         return args
 
     def test_empty_required_artifacts_rejected(self):
-        # Reviewer B6: empty required_artifacts=[] + self-reported hashes
-        # must be rejected, never MATERIALIZED_ALLOWED.
-        out = rw.gate_new_batch(**self._args(required_artifacts=[],
-                                             artifacts_present=[]))
+        # Reviewer B6: empty required_artifacts=[] must be rejected,
+        # never MATERIALIZED_ALLOWED.
+        out = rw.gate_new_batch(**self._args(required_artifacts=[]))
         assert out["verdict"] == "REFUSED"
 
     def test_self_reported_hashes_without_evidence_rejected(self):
-        # Reviewer B6: manifest SHAs without independent establishment
-        # evidence must be rejected.
+        # Reviewer B6: manifest SHAs without structured evidence receipts
+        # must be rejected.
         args = self._args()
         del args["expected_manifest_evidence"]
         del args["observed_manifest_evidence"]
         out = rw.gate_new_batch(**args)
         assert out["verdict"] == "REFUSED"
-        assert "evidence" in out["reason"] or "established" in out["reason"]
+        assert "evidence" in out["reason"]
 
     def test_independently_established_manifest_allowed(self):
+        # Updated post-Q2-R2-NEW-1: "independently established" now means
+        # structured, bound, independent-read receipts (not bare strings).
         out = rw.gate_new_batch(**self._args())
         assert out["verdict"] == "MATERIALIZED_ALLOWED"
 
@@ -669,3 +710,169 @@ class TestOutputShape:
                            "reconciliation"}
         assert world["spec_id"] == "Q1-V205-UNIFIED-REALDATA-CANARY-v2"
         assert cw["data_production"]["release_id"] == "v9.9.9-1"
+
+
+# ---------------------------------------------------------------------------
+# Q2-R2定向修复：NEW-1 / NEW-2 对抗回归测试（先红后绿）
+#
+# NEW-1 (AC-37): gate_new_batch 不得接受未验证的调用方声明作为材料化证据。
+#   不变量：MATERIALIZED_ALLOWED 不得来源于未验证的调用方声明。
+# NEW-2 (AC-38): zero_diff_guard 不得授权未经独立授权的状态变更。
+#   不变量：ALL_ALLOWED 不得包含未经独立授权的状态变更。
+#
+# 这些测试在 e8aa422 上先 FAIL（记录真实输出），修复后 PASS。
+# 合成 fixture。无真实数据。
+# ---------------------------------------------------------------------------
+
+class TestAdversarialNEW1:
+    """NEW-1: AC-37 batch gate must not trust caller assertions."""
+
+    def _receipt(self, **kw):
+        r = {"source": "consumer-drive-readback",
+             "target": "consumer-docs",
+             "sha": "a" * 64,
+             "read_id": "read-001",
+             "read_timestamp": "2026-10-18T15:00:00Z"}
+        r.update(kw)
+        return r
+
+    def _inventory(self, **kw):
+        inv = {"source": "consumer-drive-readback",
+               "target": "consumer-docs",
+               "artifacts": ["doc-1", "doc-2"],
+               "read_id": "inv-001",
+               "read_timestamp": "2026-10-18T15:00:00Z"}
+        inv.update(kw)
+        return inv
+
+    def _args(self, **kw):
+        args = {"expected_manifest_sha": "a" * 64,
+                "observed_manifest_sha": "a" * 64,
+                "expected_manifest_evidence": self._receipt(read_id="read-001"),
+                "observed_manifest_evidence": self._receipt(read_id="read-002"),
+                "required_artifacts": ["doc-1", "doc-2"],
+                "artifact_inventory": self._inventory(),
+                "silent_truncation": 0,
+                "third_party_read": True,
+                "consumer_target": "consumer-docs"}
+        args.update(kw)
+        return rw.gate_new_batch(**args)
+
+    def test_pseudo_hash_x_rejected(self):
+        # 负例1: "x"/"x" 伪哈希 -> 格式非法，拒绝。
+        out = self._args(expected_manifest_sha="x", observed_manifest_sha="x")
+        assert out["verdict"] == "REFUSED"
+
+    def test_trust_me_evidence_rejected(self):
+        # 负例2: "trust me" 自报证据 -> 非结构化，拒绝。
+        out = self._args(expected_manifest_evidence="trust me",
+                         observed_manifest_evidence="trust me")
+        assert out["verdict"] == "REFUSED"
+
+    def test_valid_sha_without_binding_rejected(self):
+        # 负例3: 格式合法但 receipt 未绑定到被比较的 SHA -> 拒绝。
+        out = self._args(
+            expected_manifest_evidence=self._receipt(sha="b" * 64,
+                                                     read_id="read-001"),
+            observed_manifest_evidence=self._receipt(sha="b" * 64,
+                                                     read_id="read-002"))
+        assert out["verdict"] == "REFUSED"
+
+    def test_same_receipt_twice_rejected(self):
+        # 变体: 同一份 receipt 用两次（非独立读取）-> 拒绝。
+        r = self._receipt(read_id="read-001")
+        out = self._args(expected_manifest_evidence=r,
+                         observed_manifest_evidence=dict(r))
+        assert out["verdict"] == "REFUSED"
+
+    def test_ghost_document_rejected(self):
+        # 负例4: ghost-document 虚构工件 -> 无可达性证明，拒绝。
+        out = self._args(required_artifacts=["ghost-document"])
+        assert out["verdict"] == "REFUSED"
+
+    def test_evidence_target_mismatch_rejected(self):
+        # 负例5: Manifest 与消费端目标不匹配 -> 拒绝。
+        out = self._args(
+            expected_manifest_evidence=self._receipt(target="other-target",
+                                                     read_id="read-001"))
+        assert out["verdict"] == "REFUSED"
+
+    def test_third_party_unread_not_allowed(self):
+        # 负例6: 第三方未实际读回 -> 不可是 MATERIALIZED_ALLOWED。
+        out = self._args(third_party_read=False)
+        assert out["verdict"] != "MATERIALIZED_ALLOWED"
+        assert out["verdict"] in ("EXTERNAL_PENDING", "NOT_VERIFIED")
+
+    def test_bound_independent_receipts_allow(self):
+        # 正向: 结构化、已绑定、独立读取的可信上游证据 -> 允许。
+        # 注意：这是合成单元测试，证明算法；真实消费端核验在适用阶段。
+        out = self._args()
+        assert out["verdict"] == "MATERIALIZED_ALLOWED"
+
+
+class TestAdversarialNEW2:
+    """NEW-2: AC-38 zero-diff guard must not authorize state changes."""
+
+    def test_new_data_release_delete_refused(self):
+        # 负例1: new_data_release + delete -> 拒绝。
+        out = rw.zero_diff_guard([
+            {"target": "new_data_release", "kind": "delete",
+             "detail": "remove archived records"}])
+        assert out["verdict"] == "ALL_REFUSED"
+
+    def test_new_data_release_overwrite_refused(self):
+        # 负例2: new_data_release + overwrite -> 拒绝。
+        out = rw.zero_diff_guard([
+            {"target": "new_data_release", "kind": "overwrite",
+             "detail": "replace release"}])
+        assert out["verdict"] == "ALL_REFUSED"
+
+    def test_read_labeled_write_refused(self):
+        # 负例3: read 标签掩盖写入语义 -> 拒绝，不能 ALL_ALLOWED。
+        out = rw.zero_diff_guard([
+            {"target": "evaluation_output", "kind": "read",
+             "detail": "remove archived records"}])
+        assert out["verdict"] == "ALL_REFUSED"
+
+    def test_unknown_kind_refused(self):
+        # 负例4: 未知操作类型 -> 拒绝。
+        out = rw.zero_diff_guard([
+            {"target": "evaluation_output", "kind": "frobnicator",
+             "detail": "?"}])
+        assert out["verdict"] == "ALL_REFUSED"
+
+    def test_readonly_target_history_mutation_refused(self):
+        # 负例5: 只读目标搭配修改历史的声明 -> 拒绝。
+        out = rw.zero_diff_guard([
+            {"target": "evaluation_output", "kind": "read",
+             "detail": "rewrite release_status.json history"}])
+        assert out["verdict"] == "ALL_REFUSED"
+
+    def test_historical_mutation_attempts_refused(self):
+        # 负例6: 修改旧 tag / 旧 Data Production / 历史 release_status.json。
+        cases = [
+            {"target": "git_tag", "kind": "rewrite", "detail": "v2.0.4-2"},
+            {"target": "data_production_old", "kind": "delete",
+             "detail": "purge"},
+            {"target": "release_status", "kind": "overwrite",
+             "detail": "bump version"},
+            {"target": "evaluation_output", "kind": "evaluate",
+             "detail": "force_version release_status.json to v99"},
+        ]
+        for c in cases:
+            out = rw.zero_diff_guard([c])
+            assert out["verdict"] == "ALL_REFUSED", c
+
+    def test_genuine_readonly_still_allowed(self):
+        # 正向: 真正只读的 evaluation_output 操作继续 PASS。
+        out = rw.zero_diff_guard([
+            {"target": "evaluation_output", "kind": "read",
+             "detail": "current_world view"}])
+        assert out["verdict"] == "ALL_ALLOWED"
+
+    def test_case_variant_delete_refused(self):
+        # 变体: 大小写变体 ("DELETE") -> 拒绝。
+        out = rw.zero_diff_guard([
+            {"target": "new_data_release", "kind": "DELETE",
+             "detail": "cleanup"}])
+        assert out["verdict"] == "ALL_REFUSED"
