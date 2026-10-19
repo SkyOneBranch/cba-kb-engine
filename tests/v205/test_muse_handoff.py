@@ -364,3 +364,13 @@ def test_b3_temporal_supersession_follows_stats_policy():
     result = adapt_handoff(doc)
     assert len(result["records"]) == 1
     assert result["records"][0]["metrics"]["points_per_game"] == 5.0
+
+
+def test_b2_r2_null_envelope_rejected():
+    """B2-R2-01: 显式 null envelope 也算 present，必须拒绝。"""
+    # records=None + 有效 provider_rows -> AMBIGUOUS（不能静默走 provider_rows）
+    # 这是 reviewer 的精确 bypass 构造。
+    p1 = _probe_base(records=None,
+                     provider_rows=[_probe_row(_valid_metrics_raw())])
+    with pytest.raises(HandoffError, match="AMBIGUOUS"):
+        adapt_handoff(p1)

@@ -344,8 +344,11 @@ def _iter_rows(payload: Mapping[str, Any]):
     """
     records = payload.get("records")
     probe_rows = payload.get("provider_rows")
-    records_present = records is not None
-    probe_present = probe_rows is not None
+    # R3/B2-R2-01: presence is key membership, not non-None value.
+    # An explicit null envelope (records=None) is still "present" and
+    # must trigger the ambiguity rejection, not silent fallback.
+    records_present = "records" in payload
+    probe_present = "provider_rows" in payload
     if records_present and probe_present:
         raise HandoffError(
             "HANDOFF_AMBIGUOUS_ENVELOPE:records and provider_rows "
