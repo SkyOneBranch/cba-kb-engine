@@ -404,9 +404,10 @@ class TestAC38ZeroDiffGuard:
         assert out["verdict"] == "ALL_REFUSED"
 
     def test_read_only_evaluation_allowed(self):
+        # R6 strict contract: allowlisted reads carry no detail.
         out = rw.zero_diff_guard([
             {"target": "evaluation_output", "kind": "read",
-             "detail": "current_world view"}])
+             "detail": None}])
         assert out["verdict"] == "ALL_ALLOWED"
 
     def test_empty_proposal_list_allowed(self):
@@ -681,9 +682,10 @@ class TestAdversarialB7:
         assert out["verdict"] == "ALL_REFUSED"
 
     def test_read_only_evaluation_still_allowed(self):
+        # R6 strict contract: allowlisted reads carry no detail.
         out = rw.zero_diff_guard([
             {"target": "evaluation_output", "kind": "read",
-             "detail": "current_world view"}])
+             "detail": None}])
         assert out["verdict"] == "ALL_ALLOWED"
 
 
@@ -869,9 +871,10 @@ class TestAdversarialNEW2:
 
     def test_genuine_readonly_still_allowed(self):
         # 正向: 真正只读的 evaluation_output 操作继续 PASS。
+        # R6 strict contract: allowlisted reads carry no detail.
         out = rw.zero_diff_guard([
             {"target": "evaluation_output", "kind": "read",
-             "detail": "current_world view"}])
+             "detail": None}])
         assert out["verdict"] == "ALL_ALLOWED"
 
     def test_case_variant_delete_refused(self):
@@ -940,10 +943,10 @@ class TestAdversarialNEW2R4:
             {"target": "new_data_release", "kind": " delete "}])
         assert out["verdict"] == "ALL_REFUSED"
         assert "mutating/ambiguous kind" in out["decisions"][0]["reason"]
-        # 合法的 read 加空白 -> 归一化后仍放行。
+        # 合法的 read 加空白 -> 归一化后仍放行（R6: 无 detail）。
         out = rw.zero_diff_guard([
             {"target": "  evaluation_output  ", "kind": "  Read  ",
-             "detail": "view"}])
+             "detail": None}])
         assert out["verdict"] == "ALL_ALLOWED"
 
     def test_missing_or_empty_target_kind_refused(self):
@@ -981,11 +984,11 @@ class TestAdversarialNEW2R4:
                 {"target": "evaluation_output", "kind": k,
                  "detail": "delete archived records"}])
             assert out["verdict"] == "ALL_REFUSED", k
-        # 超长 detail 不影响只读放行（detail 只是次要信号）。
+        # R6 strict contract: 非空 detail 一律拒绝，不再有"良性长文本"例外。
         out = rw.zero_diff_guard([
             {"target": "evaluation_output", "kind": "read",
              "detail": "x" * 10000}])
-        assert out["verdict"] == "ALL_ALLOWED"
+        assert out["verdict"] == "ALL_REFUSED"
 
 
 # ---------------------------------------------------------------------------
@@ -1103,10 +1106,40 @@ class TestAdversarialNEW1R4:
             assert out["decisions"][0]["decision"] == "REFUSED"
 
     def test_r5_none_and_empty_detail_still_allowed_on_read(self):
-        # None / "" detail on an allowlisted read pair stays ALLOWED --
-        # the structural rejection targets only non-string, non-None types.
-        for ok_detail in (None, ""):
+        # R6 strict contract: only None/missing detail is ALLOWED.
+        # Empty string "" is now REFUSED (strict schema).
+        out = rw.zero_diff_guard([{
+            "target": "evaluation_output", "kind": "read",
+            "detail": None}])
+        assert out["verdict"] == "ALL_ALLOWED"
+        out = rw.zero_diff_guard([{
+            "target": "evaluation_output", "kind": "read",
+            "detail": ""}])
+        assert out["verdict"] == "ALL_REFUSED"
+
+class TestAdversarialNEW2R6:
+    """R6: strict contract -- allowlisted reads carry no detail.
+
+    Covers: extra undefined fields smuggling operation semantics;
+    free-text modification instructions (verb-blacklist removed, so any
+    non-None detail on an allowlisted read is refused structurally).
+    """
+
+    def test_r6_extra_field_hiding_delete_refused(self):
+        # 未识别的额外字段隐藏 delete 意图 -> 拒绝。
+        out = rw.zero_diff_guard([{
+            "target": "evaluation_output", "kind": "read",
+            "detail": None, "action": "delete"}])
+        assert out["verdict"] == "ALL_REFUSED"
+        assert out["decisions"][0]["decision"] == "REFUSED"
+        assert "undefined proposal fields" in out["decisions"][0]["reason"]
+
+    def test_r6_freetext_modification_instruction_refused(self):
+        # 未列入任何词表的自由文本修改指令 -> 拒绝（不再依赖动词表）。
+        for detail in ("make the data go away",
+                       "null out the records",
+                       "synchronize to /dev/null"):
             out = rw.zero_diff_guard([{
                 "target": "evaluation_output", "kind": "read",
-                "detail": ok_detail}])
-            assert out["verdict"] == "ALL_ALLOWED", ok_detail
+                "detail": detail}])
+            assert out["verdict"] == "ALL_REFUSED", detail

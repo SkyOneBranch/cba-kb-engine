@@ -127,28 +127,6 @@ def _detail_targets_history(detail: Any) -> bool:
         "force version", "force_version", "v2.0.4-2"))
 
 
-# NEW-2 (AC-38): mutation verbs for defense-in-depth detail screening.
-# A read-labeled operation whose detail describes a state change is a
-# mislabeled write. This is a SECONDARY signal; the primary decision is
-# the structured (target, kind) allowlist above. Non-string details are
-# rejected structurally (never silently discarded).
-_MUTATION_VERBS = frozenset({
-    "delete", "remove", "rewrite", "overwrite", "mutate",
-    "modify", "update", "erase", "purge", "drop",
-    "append", "insert", "add", "push", "pop", "create",
-    "write", "publish", "attach", "inject", "set", "alter",
-    "truncate", "replace", "upsert",
-    "删除", "移除", "重写", "覆盖", "修改", "更新", "清除",
-    "添加", "插入", "追加", "写入", "创建", "发布",
-})
-
-
-def _detail_describes_mutation(detail: Any) -> bool:
-    """Detect whether a detail string describes a state-changing action."""
-    d = detail if isinstance(detail, str) else ""
-    d = d.lower()
-    return any(v in d for v in _MUTATION_VERBS)
-
 # Artifact kinds whose consumability release_status is allowed to judge.
 _DATA_PRODUCTION_KINDS = frozenset({"data_production_current"})
 # Artifact kinds judged per surface/capability via manifest, materialization,
@@ -764,21 +742,24 @@ def zero_diff_guard(proposed_changes: List[Dict[str, Any]]) -> Dict[str, Any]:
     generic write allowlist -- real release writes go through the
     independent authorized publish path, never through this function.
 
-    Decision order (primary = structured target+kind; detail text is only
-    a defense-in-depth secondary signal):
-      0. malformed proposal (not a dict), missing/non-string/empty target,
-         or non-string/empty kind -> REFUSED (fail closed, never crash);
+    Decision order (structural, no free-text keyword gating):
+      0. proposal not a dict, or has undefined extra fields -> REFUSED;
+         target missing/non-string/empty -> REFUSED;
+         kind missing/non-string/empty -> REFUSED;
+         detail not None and not a string -> REFUSED (never crash,
+         never silently discard);
       1. protected target (exact name OR pattern: release_status, version
          tags like v2.0.1-1, previous_snapshot, ...) -> REFUSED (any kind,
          even "read": the target itself must not be touched);
       2. mutating/ambiguous kind (case-insensitive after strip+lower:
          delete/rewrite/overwrite/mutate/write/update/create/publish/
          remove/purge/...) -> REFUSED on any target;
-      3. detail targets protected history -> REFUSED (defense in depth;
-         checked before the allowlist so a hostile detail cannot ride on
-         an allowlisted pair);
-      4. explicitly allowlisted (target, kind) read-only pair -> ALLOWED,
-         unless the detail describes a state change (mislabeled write);
+      3. detail targets protected history -> REFUSED (defense in depth);
+      4. explicitly allowlisted (target, kind) read-only pair AND detail
+         is missing or None -> ALLOWED. Any non-None detail is REFUSED:
+         the (target, kind) pair IS the complete operation description.
+         (R6 strict contract: free-text details are not classified, so
+         the verb-blacklist is removed -- single security logic.)
       5. anything else -> REFUSED (fail closed).
 
     Verdicts describe the PROPOSALS only (judgement-only): this function
@@ -791,6 +772,16 @@ def zero_diff_guard(proposed_changes: List[Dict[str, Any]]) -> Dict[str, Any]:
             decisions.append({"change": change, "decision": "REFUSED",
                               "reason": "malformed proposal: not a dict; "
                                         "judgement-only"})
+            continue
+        # 0. Strict proposal schema: only target/kind/detail are defined.
+        #    Undefined extra fields are refused -- they must not smuggle
+        #    operation semantics past the guard (e.g. {"action": "delete"}).
+        _ALLOWED_PROPOSAL_KEYS = frozenset({"target", "kind", "detail"})
+        extra_keys = set(change.keys()) - _ALLOWED_PROPOSAL_KEYS
+        if extra_keys:
+            decisions.append({"change": change, "decision": "REFUSED",
+                              "reason": f"undefined proposal fields: "
+                                        f"{sorted(extra_keys)}; judgement-only"})
             continue
         target = change.get("target")
         kind = change.get("kind")
@@ -848,13 +839,19 @@ def zero_diff_guard(proposed_changes: List[Dict[str, Any]]) -> Dict[str, Any]:
                                         "judgement-only"})
             continue
         # 6. Explicitly allowlisted (target, kind) read-only pair only.
+        #    STRICT CONTRACT (R6): a read-only proposal carries NO detail.
+        #    detail must be missing or None. Any non-None detail -- empty
+        #    string, non-empty string, or any other value -- is REFUSED.
+        #    The (target, kind) pair IS the complete operation description;
+        #    free-text details cannot be reliably classified as benign,
+        #    so they are not accepted. This replaces the verb-blacklist
+        #    as the primary guarantee (single security logic, no dual).
         if (target_key, kind_norm) in _READONLY_OPERATIONS:
-            # Defense in depth: a read-labeled operation whose detail
-            # describes a state change is a mislabeled write.
-            if _detail_describes_mutation(detail):
+            if detail is not None:
                 decisions.append({"change": change, "decision": "REFUSED",
-                                  "reason": "read-labeled operation describes "
-                                            "a state change: mislabeled write; "
+                                  "reason": "allowlisted read must not carry "
+                                            "detail: strict schema requires "
+                                            "detail missing or None; "
                                             "judgement-only"})
             else:
                 decisions.append({"change": change, "decision": "ALLOWED",
