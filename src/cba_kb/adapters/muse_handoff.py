@@ -38,8 +38,10 @@ from ..stats import (
     PROVIDER_CBA_OFFICIAL,
     SEMANTIC_GRAIN,
     STATS_SCHEMA_VERSION,
+    StatsError,
     StatsValidationError,
     build_record_id,
+    deduplicate_and_reconcile_stats,
     resolve_stats_player_identity,
     validate_stats_record,
 )
@@ -74,9 +76,10 @@ NORMALIZED_TO_CANONICAL: Dict[str, str] = {
 }
 
 #: Probe ``provider_rows`` raw provider key -> canonical metric mapping.
-#: Raw keys that are not stat fields at all (age, birthDate, ...) are dropped
-#: with the rest of metrics_raw. A raw key that IS a stat field but has no
-#: mapping here -> REJECTED (fail-closed: mapping table incomplete).
+#: Raw keys that are not stat fields at all are listed in
+#: RAW_NON_STAT_METADATA_KEYS (explicit allowlist, acknowledged then dropped).
+#: A raw key that IS a stat field but has no mapping here -> REJECTED
+#: (fail-closed: mapping table incomplete).
 RAW_TO_CANONICAL: Dict[str, str] = {
     "playerTimes": "games_played",
     "gameStartNum": "games_started",
@@ -109,6 +112,16 @@ RAW_STAT_KEYS_WITHOUT_MAPPING = frozenset({
     "fieldGoalsPercentageSort",
     "threePointPercentageSort",
     "freeThrowsPercentageSort",
+})
+
+#: Known non-stat provider metadata keys (explicit allowlist, R2/B1).
+#: These are recognized but never mapped to canonical metrics; they are
+#: acknowledged and dropped from the normalized output. Any raw key outside
+#: RAW_TO_CANONICAL, RAW_STAT_KEYS_WITHOUT_MAPPING, and this set ->
+#: REJECTED (fail-closed: unknown fields are never silently discarded).
+RAW_NON_STAT_METADATA_KEYS = frozenset({
+    "age",
+    "birthDate",
 })
 
 #: match_type_code -> (canonical match_type, match_type_label).
@@ -173,7 +186,15 @@ def _map_probe_metrics(raw: Any, where: str) -> Dict[str, Any]:
             raise HandoffError(
                 f"HANDOFF_PROBE_RAW_STAT_KEY_UNMAPPED:{where}:{k}"
             )
-        # else: non-stat provider metadata (age, birthDate, ...) -> dropped
+        elif k in RAW_NON_STAT_METADATA_KEYS:
+            # Explicitly recognized non-stat metadata (age, birthDate, ...):
+            # acknowledged and dropped from normalized metrics (never mapped).
+            continue
+        else:
+            # R2/B1: unknown raw fields are never silently discarded.
+            raise HandoffError(
+                f"HANDOFF_PROBE_UNKNOWN_RAW_KEY:{where}:{k}"
+            )
     return metrics
 
 
@@ -314,10 +335,25 @@ def _build_record(row: Mapping[str, Any], ctx: Mapping[str, Any],
 
 
 def _iter_rows(payload: Mapping[str, Any]):
-    """Yield (row, context, metrics, where) for both envelope shapes."""
+    """Yield (row, context, metrics, where) for exactly one envelope shape.
+
+    R2/B2: ``records`` and ``provider_rows`` are mutually exclusive. Both
+    present (even if one is empty or mistyped) -> REJECTED. No if/elif
+    fallback, no silent truncation. A single present-but-empty or
+    mistyped list -> REJECTED (no partial output).
+    """
     records = payload.get("records")
     probe_rows = payload.get("provider_rows")
-    if isinstance(records, list) and records:
+    records_present = records is not None
+    probe_present = probe_rows is not None
+    if records_present and probe_present:
+        raise HandoffError(
+            "HANDOFF_AMBIGUOUS_ENVELOPE:records and provider_rows "
+            "are mutually exclusive")
+    if records_present:
+        if not isinstance(records, list) or not records:
+            raise HandoffError(
+                "HANDOFF_NO_RECORDS:records must be a non-empty list")
         for i, row in enumerate(records):
             where = f"records[{i}]"
             if not isinstance(row, dict):
@@ -330,7 +366,11 @@ def _iter_rows(payload: Mapping[str, Any]):
                 raise HandoffError(f"HANDOFF_INVALID_SCOPE:{scope!r}:{where}")
             metrics = _map_normalized_metrics(row.get("metrics_normalized"), where)
             yield row, {}, metrics, where
-    elif isinstance(probe_rows, list) and probe_rows:
+        return
+    if probe_present:
+        if not isinstance(probe_rows, list) or not probe_rows:
+            raise HandoffError(
+                "HANDOFF_NO_RECORDS:provider_rows must be a non-empty list")
         # RC-02 probe shape: top-level carries player/match context,
         # rows carry row_classification + team + raw metrics.
         ctx = {k: payload.get(k) for k in (
@@ -348,8 +388,8 @@ def _iter_rows(payload: Mapping[str, Any]):
             row["scope"] = classification
             metrics = _map_probe_metrics(prow.get("metrics_raw"), where)
             yield row, ctx, metrics, where
-    else:
-        raise HandoffError("HANDOFF_NO_RECORDS:need records[] or provider_rows[]")
+        return
+    raise HandoffError("HANDOFF_NO_RECORDS:need records[] or provider_rows[]")
 
 
 def adapt_handoff(payload: Mapping[str, Any]) -> Dict[str, Any]:
@@ -364,10 +404,18 @@ def adapt_handoff(payload: Mapping[str, Any]) -> Dict[str, Any]:
         REVIEW_REQUIRED are included with identity_status set; REJECTED rows
         raise HandoffError (fail-closed: no partial silent output).
 
+        Batch idempotency boundary: after construction and validation, the
+        batch is passed through stats.deduplicate_and_reconcile_stats()
+        (identical record_id + identical content -> deduped; conflicting
+        content -> temporal supersession or HandoffError). This adapter is
+        a pure converter; it does NOT guarantee persistence-layer
+        idempotency -- that remains the caller's ingestion boundary.
+
     Raises:
         HandoffError: schema mismatch, unknown provider, unknown metric key,
-            missing normalized key, missing team_id on TEAM_SPLIT, or any
-            provenance element stats.py mandates but the row lacks.
+            missing normalized key, missing team_id on TEAM_SPLIT, any
+            provenance element stats.py mandates but the row lacks, or
+            unreconcilable duplicate record_ids.
     """
     if not isinstance(payload, Mapping):
         raise HandoffError("HANDOFF_PAYLOAD_OBJECT_REQUIRED")
@@ -378,6 +426,11 @@ def adapt_handoff(payload: Mapping[str, Any]) -> Dict[str, Any]:
     records: List[Dict[str, Any]] = []
     for row, ctx, metrics, where in _iter_rows(payload):
         records.append(_build_record(row, ctx, metrics, where))
+    # R2/B3: reuse the frozen reconciliation policy (no algorithm copy).
+    try:
+        records = deduplicate_and_reconcile_stats(records)
+    except StatsError as e:
+        raise HandoffError(f"HANDOFF_RECONCILE_FAILED:{e}") from e
     return {"records": records}
 
 

@@ -252,3 +252,115 @@ def test_probe_rows_shape_maps():
     assert "raw_metrics" not in split or "age" not in str(split.get("raw_metrics", {}))
     for rec in result["records"]:
         validate_stats_record(rec)
+
+
+# ---------------------------------------------------------------------------
+# R2: B1/B2/B3 regression tests (must FAIL on pre-fix code)
+# ---------------------------------------------------------------------------
+
+def _probe_base(**overrides):
+    """Minimal probe document with valid provenance."""
+    base = {
+        "provider": "CBA_OFFICIAL",
+        "provider_player_id": "900099",
+        "player_name": "虚构球员丁",
+        "season": "2023-2024",
+        "match_type_code": "1",
+        "match_type_name": "常规赛",
+    }
+    base.update(overrides)
+    return base
+
+
+def _probe_row(metrics_raw, classification="WHOLE_SEASON"):
+    return {
+        "row_classification": classification,
+        "team_provider_id": "T999",
+        "team_name": "虚构球队丁",
+        "metrics_raw": metrics_raw,
+        "source_uri": "synthetic://test/probe/900099/r2",
+        "observed_at": "2026-10-18T00:00:00Z",
+        "raw_sha256": "a" * 64,
+        "decoded_sha256": "b" * 64,
+    }
+
+
+def _valid_metrics_raw():
+    return {"playerTimes": 10, "minutes": 5.0, "points": 2.0}
+
+
+def test_b1_unknown_raw_field_rejected():
+    """B1: pointsPerGame 未知字段 -> HandoffError（含字段名）。"""
+    doc = _probe_base(provider_rows=[_probe_row(
+        {**_valid_metrics_raw(), "pointsPerGame": 9.9})])
+    with pytest.raises(HandoffError, match="pointsPerGame"):
+        adapt_handoff(doc)
+
+
+def test_b1_known_metadata_still_compatible():
+    """B1: 合法 age/birthDate 元数据 -> 探针仍可转换（兼容性回归）。"""
+    doc = _probe_base(provider_rows=[_probe_row(
+        {**_valid_metrics_raw(), "age": 27, "birthDate": "1998-01-01"})])
+    result = adapt_handoff(doc)
+    assert len(result["records"]) == 1
+    assert result["records"][0]["metrics"]["points_per_game"] == 2.0
+
+
+def test_b2_both_envelopes_rejected():
+    """B2: records + provider_rows 同时存在 -> 拒绝。"""
+    doc = _probe_base(
+        records=[{"record_type": "PLAYER_SEASON_STATS"}],
+        provider_rows=[_probe_row(_valid_metrics_raw())],
+    )
+    doc["schema"] = "player_season_stats_handoff_v1"
+    with pytest.raises(HandoffError, match="AMBIGUOUS_ENVELOPE"):
+        adapt_handoff(doc)
+
+
+def test_b2_empty_and_wrong_type_envelope_rejected():
+    """B2: 空列表 / 非法类型组合 -> 拒绝，无部分输出。"""
+    # records 为空列表，provider_rows 缺失
+    doc = _probe_base(records=[])
+    doc["schema"] = "player_season_stats_handoff_v1"
+    with pytest.raises(HandoffError):
+        adapt_handoff(doc)
+    # records 为非法类型
+    doc2 = _probe_base(records="not-a-list")
+    doc2["schema"] = "player_season_stats_handoff_v1"
+    with pytest.raises(HandoffError):
+        adapt_handoff(doc2)
+    # 两者都缺失
+    with pytest.raises(HandoffError):
+        adapt_handoff(_probe_base())
+
+
+def test_b3_duplicate_identical_records_deduped():
+    """B3: 相同 record_id + 相同内容 -> 只返回一条。"""
+    row = _probe_row(_valid_metrics_raw())
+    doc = _probe_base(provider_rows=[row, dict(row)])
+    result = adapt_handoff(doc)
+    assert len(result["records"]) == 1
+
+
+def test_b3_conflicting_records_unresolvable_rejected():
+    """B3: 相同 record_id + 不同内容且无有效时间戳 -> 拒绝。"""
+    r1 = _probe_row({**_valid_metrics_raw(), "points": 2.0})
+    r2 = _probe_row({**_valid_metrics_raw(), "points": 5.0})
+    # 去掉 observed_at -> 无 supersession 时间戳 -> 无法调和
+    del r1["observed_at"]
+    del r2["observed_at"]
+    doc = _probe_base(provider_rows=[r1, r2])
+    with pytest.raises(HandoffError):
+        adapt_handoff(doc)
+
+
+def test_b3_temporal_supersession_follows_stats_policy():
+    """B3: 有效时间先后 -> 遵循 stats.py 调和规则（新者胜）。"""
+    r1 = _probe_row({**_valid_metrics_raw(), "points": 2.0})
+    r1["observed_at"] = "2026-10-18T00:00:00Z"
+    r2 = _probe_row({**_valid_metrics_raw(), "points": 5.0})
+    r2["observed_at"] = "2026-10-19T00:00:00Z"
+    doc = _probe_base(provider_rows=[r1, r2])
+    result = adapt_handoff(doc)
+    assert len(result["records"]) == 1
+    assert result["records"][0]["metrics"]["points_per_game"] == 5.0
