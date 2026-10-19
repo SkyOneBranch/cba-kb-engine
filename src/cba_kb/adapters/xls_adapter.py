@@ -203,6 +203,16 @@ def read_rc04_records(path, sheet=None):
             raise ValueError(
                 f'RC-04 row {r} is ragged (missing columns): {path}')
         seq_cell, name_cell, dob_cell = row[seq_c], row[name_c], row[dob_c]
+        # B3-R2-1: seq and name must be non-blank. A record with a valid
+        # date but missing seq/name is structurally incomplete.
+        seq_val = seq_cell.value
+        name_val = name_cell.value
+        if seq_val is None or (isinstance(seq_val, str) and not seq_val.strip()):
+            raise ValueError(
+                f'RC-04 row {r} has blank seq; refusing table: {path}')
+        if name_val is None or (isinstance(name_val, str) and not name_val.strip()):
+            raise ValueError(
+                f'RC-04 row {r} has blank name; refusing table: {path}')
         dob_val = dob_cell.value
         # Birth date must be a pure date. A datetime with time, or a
         # non-date value, means the record cannot be reliably interpreted.
