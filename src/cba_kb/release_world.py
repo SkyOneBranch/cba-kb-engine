@@ -130,11 +130,16 @@ def _detail_targets_history(detail: Any) -> bool:
 # NEW-2 (AC-38): mutation verbs for defense-in-depth detail screening.
 # A read-labeled operation whose detail describes a state change is a
 # mislabeled write. This is a SECONDARY signal; the primary decision is
-# the structured (target, kind) allowlist above.
+# the structured (target, kind) allowlist above. Non-string details are
+# rejected structurally (never silently discarded).
 _MUTATION_VERBS = frozenset({
     "delete", "remove", "rewrite", "overwrite", "mutate",
     "modify", "update", "erase", "purge", "drop",
+    "append", "insert", "add", "push", "pop", "create",
+    "write", "publish", "attach", "inject", "set", "alter",
+    "truncate", "replace", "upsert",
     "删除", "移除", "重写", "覆盖", "修改", "更新", "清除",
+    "添加", "插入", "追加", "写入", "创建", "发布",
 })
 
 
@@ -824,6 +829,15 @@ def zero_diff_guard(proposed_changes: List[Dict[str, Any]]) -> Dict[str, Any]:
             decisions.append({"change": change, "decision": "REFUSED",
                               "reason": f"mutating/ambiguous kind refused on "
                                         f"any target: {kind!r}; judgement-only"})
+            continue
+        # 4b. Detail must be None or a string. Structured/typed details
+        #     (dict/list/int/bool) are refused outright -- their contents
+        #     must never be silently discarded to reach an allowlist.
+        if detail is not None and not isinstance(detail, str):
+            decisions.append({"change": change, "decision": "REFUSED",
+                              "reason": f"unsupported detail type: "
+                                        f"{type(detail).__name__}; "
+                                        "judgement-only"})
             continue
         # 5. Detail targets protected history (defense in depth, checked
         #    before the allowlist so a hostile detail cannot ride along).

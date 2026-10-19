@@ -1082,3 +1082,31 @@ class TestAdversarialNEW1R4:
         out = self._args(expected_manifest_evidence=None,
                          observed_manifest_evidence=self._receipt(read_id="read-002"))
         assert out["verdict"] != "MATERIALIZED_ALLOWED"
+
+    def test_r5_append_verb_mislabeled_read_refused(self):
+        # R5: reviewer R4 bypass -- "append" was missing from the verb list.
+        out = rw.zero_diff_guard([{
+            "target": "evaluation_output", "kind": "read",
+            "detail": "append a new row to evaluation_output"}])
+        assert out["verdict"] == "ALL_REFUSED"
+        assert out["decisions"][0]["decision"] == "REFUSED"
+
+    def test_r5_nonstring_detail_refused_not_silently_dropped(self):
+        # R5: reviewer R4 bypass -- dict detail was silently replaced with "".
+        # Structured details must be refused outright, never ignored.
+        for bad_detail in ({"action": "delete", "object": "evaluation_output"},
+                           ["delete everything"], 12345, True):
+            out = rw.zero_diff_guard([{
+                "target": "evaluation_output", "kind": "read",
+                "detail": bad_detail}])
+            assert out["verdict"] == "ALL_REFUSED", bad_detail
+            assert out["decisions"][0]["decision"] == "REFUSED"
+
+    def test_r5_none_and_empty_detail_still_allowed_on_read(self):
+        # None / "" detail on an allowlisted read pair stays ALLOWED --
+        # the structural rejection targets only non-string, non-None types.
+        for ok_detail in (None, ""):
+            out = rw.zero_diff_guard([{
+                "target": "evaluation_output", "kind": "read",
+                "detail": ok_detail}])
+            assert out["verdict"] == "ALL_ALLOWED", ok_detail
