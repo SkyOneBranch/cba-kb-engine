@@ -273,3 +273,94 @@ def test_full_sheet_marker_scan_perf(tmp_path):
     elapsed = time.monotonic() - start
     assert roles['big'] == foreign_xlsx.ARTICLE_DATA
     assert elapsed < 30, f'full-sheet marker scan took {elapsed:.1f}s'
+
+
+# ---------------------------------------------------------------------------
+# RC-05 real-sample compatibility (R6): real column names, serial dates,
+# structural pivot detection, no false positives on article text.
+# All fixtures are SYNTHETIC -- no real private data.
+# ---------------------------------------------------------------------------
+
+def _rc05_shaped_workbook(tmp_path, name='rc05shaped.xlsx'):
+    """Synthetic workbook mirroring RC-05 STRUCTURE (not content).
+
+    Real header: 序号 / 微信文章编号 / 文章标题 / 日期.
+    Real Sheet3: 2-col pivot with 行标签/(多项)/总计.
+    Real Sheet4: 2-col pivot with 行标签/计数项.
+    """
+    from openpyxl import Workbook
+    book = Workbook()
+    data = book.active
+    data.title = '工作表1'
+    data.append(['序号', '微信文章编号', '文章标题', '日期'])
+    # Synthetic rows: serial dates like the real file (int), text IDs.
+    for i in range(1, 21):
+        data.append([i, f"'9000{i:04d}'", f'合成标题{i:02d}', 45700 + i])
+    # One title containing 统计 -- must NOT kill the article sheet.
+    data.append([21, "'90000021'", '数据统计方法说明', 45721])
+    s3 = book.create_sheet('Sheet3')
+    s3.append(['月', '(多项)'])
+    s3.append([])
+    s3.append(['行标签', ''])
+    s3.append(['总计', ''])
+    s4 = book.create_sheet('Sheet4')
+    s4.append([])
+    s4.append([])
+    s4.append(['行标签', '计数项:微信文章编号'])
+    s4.append(['A组', 5])
+    path = tmp_path / name
+    book.save(path)
+    return path
+
+
+def test_rc05_real_column_names_recognized(tmp_path):
+    from cba_kb.adapters import foreign_xlsx
+    path = _rc05_shaped_workbook(tmp_path)
+    roles = foreign_xlsx.classify_sheets(path)
+    assert roles['工作表1'] == foreign_xlsx.ARTICLE_DATA
+    sheet, rows = foreign_xlsx.article_rows(path, sheet='工作表1')
+    assert len(rows) == 21
+    r0 = rows[0]
+    # 微信文章编号 mapped to article ID; 序号 recognized but not ID.
+    assert r0['article_id'] == "'90000001'"
+    assert r0['title'] == '合成标题01'
+    assert r0['identity_status'] == 'candidate'
+    assert r0['person_id'] is None
+
+
+def test_rc05_excel_serial_dates_converted_raw_preserved(tmp_path):
+    from cba_kb.adapters import foreign_xlsx
+    path = _rc05_shaped_workbook(tmp_path)
+    _, rows = foreign_xlsx.article_rows(path, sheet='工作表1')
+    r0 = rows[0]
+    # raw keeps the original serial int; text shows converted ISO date.
+    assert r0['row_date_raw'] == 45701
+    assert r0['row_date_text'] == '2025-02-13'
+    # AC-22: never inferred.
+    assert r0['date_interpretation'] is None
+    assert r0['date_verified'] is False
+
+
+def test_rc05_pivot_sheets_structurally_detected(tmp_path):
+    from cba_kb.adapters import foreign_xlsx
+    path = _rc05_shaped_workbook(tmp_path)
+    roles = foreign_xlsx.classify_sheets(path)
+    # Structural pivot signals: 行标签, (多项), 计数项:, 总计.
+    assert roles['Sheet3'] == foreign_xlsx.PIVOT
+    assert roles['Sheet4'] == foreign_xlsx.PIVOT
+    import pytest
+    with pytest.raises(ValueError):
+        foreign_xlsx.article_rows(path, sheet='Sheet3')
+    with pytest.raises(ValueError):
+        foreign_xlsx.article_rows(path, sheet='Sheet4')
+
+
+def test_rc05_statistic_in_title_does_not_kill_sheet(tmp_path):
+    # 防误杀：文章标题含"统计"二字时，明细表不得被判为 summary。
+    from cba_kb.adapters import foreign_xlsx
+    path = _rc05_shaped_workbook(tmp_path)
+    roles = foreign_xlsx.classify_sheets(path)
+    assert roles['工作表1'] == foreign_xlsx.ARTICLE_DATA
+    _, rows = foreign_xlsx.article_rows(path, sheet='工作表1')
+    titles = [r['title'] for r in rows]
+    assert '数据统计方法说明' in titles

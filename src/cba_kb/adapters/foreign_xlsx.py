@@ -45,17 +45,32 @@ def extract(path, season, source, clubs=None, strict=True, sheet=None):
 # fact rows. AC-22: dates are carried verbatim, never interpreted as birthdays
 # or publish times. AC-23: nicknames/aliases/titles are retrieval candidates
 # only; a Person ID is never assigned by this adapter.
+#
+# External-source principle (applies to Agent JSON inputs as well):
+#   原件保留 -- raw cell values are preserved verbatim in *_raw fields;
+#   已知 schema 映射 -- known header synonyms map to canonical columns;
+#   未知结构待核验 -- unrecognized layouts classify as unknown (fail-closed),
+#   never guessed. This principle does NOT relax any existing validation:
+#   Stats-domain checks and fail-closed classification stay as-is.
 
 ARTICLE_DATA = 'article_data'
 PIVOT = 'pivot'
 SUMMARY = 'summary'
 SHEET_UNKNOWN = 'unknown'
 
-ARTICLE_ID_HEADERS = ('文章编号', '编号', 'id', 'ID', '文章ID')
-ARTICLE_TITLE_HEADERS = ('标题', '题目', 'title')
+ARTICLE_ID_HEADERS = ('文章编号', '微信文章编号', '编号', 'id', 'ID', '文章ID')
+ARTICLE_TITLE_HEADERS = ('标题', '文章标题', '题目', 'title')
 ARTICLE_DATE_HEADERS = ('日期', 'date', '时间')
-PIVOT_MARKERS = ('数据透视', '透视表', '汇总', '总计', '计数', 'Grand Total')
-SUMMARY_MARKERS = ('统计', '平均', '合计')
+# 序号列：识别但不作为 ID（行号语义，非文章身份）。
+ARTICLE_SERIAL_HEADERS = ('序号', 'seq', 'No.', 'no')
+# 强标记：透视表特有词汇，子串匹配即可（几乎不可能出现在文章明细中）。
+STRONG_PIVOT_MARKERS = ('行标签', '数据透视', '透视表', '计数项', '(多项)')
+# 弱标记：常见汇总词汇，仅当独立成格或行首出现时才算（避免文章标题含"统计"被误杀）。
+WEAK_PIVOT_MARKERS = ('汇总', '总计', '计数', 'Grand Total')
+WEAK_SUMMARY_MARKERS = ('统计', '平均', '合计')
+# 保留旧名称兼容（内部使用已迁移到强/弱两级）。
+PIVOT_MARKERS = STRONG_PIVOT_MARKERS + WEAK_PIVOT_MARKERS
+SUMMARY_MARKERS = WEAK_SUMMARY_MARKERS
 
 
 def _cell_text(value):
@@ -78,6 +93,16 @@ def _find_article_header(rows):
     return None
 
 
+def _is_weak_marker_cell(cell, markers):
+    """弱标记仅当独立成格或位于行首时有效（防误杀）。
+
+    文章明细的标题中可能含有"统计"等词（如"数据统计方法"），不能仅因
+    子串出现就否决整表。独立成格（cell == marker）或行首出现
+    （cell.startswith(marker)）才是汇总行的结构性信号。
+    """
+    return any(cell == m or cell.startswith(m) for m in markers)
+
+
 def _find_marker_kind(sheet):
     """Stream the ENTIRE worksheet for pivot/summary markers (B1-R2-01).
 
@@ -86,6 +111,13 @@ def _find_marker_kind(sheet):
     marker anywhere vetoes ARTICLE_DATA (fail-closed). Returns PIVOT,
     SUMMARY, or None. Pivot takes precedence, matching _classify_sheet.
     Streams row-by-row on the read-only sheet; early-exits on a pivot hit.
+
+    RC-05 refinement: markers are two-tiered. Strong markers (行标签,
+    数据透视, 透视表, 计数项, (多项)) are pivot-specific vocabulary --
+    substring match anywhere vetoes. Weak markers (汇总/总计/计数/统计/
+    平均/合计) are common words -- they veto only as standalone cells or
+    at cell start (structural position), never as substrings inside
+    article text (e.g. a title containing "统计" must not kill the sheet).
     """
     found_summary = False
     for row in sheet.iter_rows(values_only=True):
@@ -93,9 +125,11 @@ def _find_marker_kind(sheet):
             cell = _cell_text(value)
             if not cell:
                 continue
-            if any(marker in cell for marker in PIVOT_MARKERS):
+            if any(marker in cell for marker in STRONG_PIVOT_MARKERS):
                 return PIVOT
-            if any(marker in cell for marker in SUMMARY_MARKERS):
+            if _is_weak_marker_cell(cell, WEAK_PIVOT_MARKERS):
+                return PIVOT
+            if _is_weak_marker_cell(cell, WEAK_SUMMARY_MARKERS):
                 found_summary = True
     return SUMMARY if found_summary else None
 
@@ -157,6 +191,16 @@ def _date_text(value):
         return 'TRUE' if value else 'FALSE'
     if isinstance(value, (datetime, date)):
         return value.isoformat()
+    # RC-05: Excel 日期序列（如 45705）在 data_only 读取下为 int。
+    # 转换为 ISO 文本以便阅读；raw 值原样保留；绝不推断语义（AC-22）。
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if 1 <= value <= 80000:  # 约 1900-01-01 至 2118 年，超出则按原文
+            try:
+                from openpyxl.utils.datetime import from_excel
+                dt = from_excel(value)
+                return dt.date().isoformat() if hasattr(dt, 'date') else dt.isoformat()
+            except (ValueError, OverflowError):
+                pass
     return str(value)
 
 
