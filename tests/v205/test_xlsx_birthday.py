@@ -1,0 +1,413 @@
+"""T2-3: birthday-article workbook (.xlsx) extension for foreign_xlsx.
+
+Synthetic fixtures only (generated with openpyxl). Real RC-05 data never
+enters the repo. Covers AC-17~AC-23 structural shapes:
+  - 89-row article sheet / 89 unique ids / 58 unique titles (synthetic mirror)
+  - nickname/alias titles are retrieval candidates, never Person IDs (AC-23)
+  - dates are never inferred as birthdays/publish times; raw values kept (AC-22)
+  - pivot (Sheet4) and aux summary (Sheet3) sheets are recognized as non-facts
+"""
+from datetime import datetime
+from openpyxl import Workbook
+import pytest
+from cba_kb.adapters import foreign_xlsx
+
+
+def birthday_workbook(tmp_path, name='birthday.xlsx'):
+    """Synthetic RC-05-shaped workbook: data + pivot + aux summary sheets."""
+    book = Workbook()
+    data = book.active
+    data.title = '工作表1'
+    data.append(['文章编号', '标题', '日期'])
+    titles = [f'文章标题{i:02d}' for i in range(1, 59)]
+    titles[4] = '大狙'      # nickname-like title
+    titles[9] = '贺希宁'    # real-name-like title: still must not get a Person ID
+    titles[14] = '小卢'     # alias-like title
+    for i in range(1, 90):
+        title = titles[(i - 1) % 58]
+        if i % 3 == 0:
+            date_value = f'2025/03/{(i % 28) + 1:02d}'      # string form
+        elif i % 3 == 1:
+            date_value = None                                # absent
+        else:
+            date_value = datetime(2025, 3, (i % 28) + 1)     # Excel date form
+        data.append([f'A{i:04d}', title, date_value])
+    aux = book.create_sheet('Sheet3')
+    aux.append(['统计口径说明'])
+    aux.append(['文章总数', 89])
+    aux.append(['平均每月', 7])
+    piv = book.create_sheet('Sheet4')
+    piv.append(['数据透视表'])
+    piv.append(['标题', '计数'])
+    piv.append(['文章标题01', 2])
+    path = tmp_path / name
+    book.save(path)
+    return path
+
+
+def test_classify_sheets_recognizes_data_pivot_summary(tmp_path):
+    roles = foreign_xlsx.classify_sheets(birthday_workbook(tmp_path))
+    assert roles == {'工作表1': 'article_data', 'Sheet3': 'summary', 'Sheet4': 'pivot'}
+
+
+def test_article_rows_structural_shape(tmp_path):
+    name, articles = foreign_xlsx.article_rows(birthday_workbook(tmp_path))
+    assert name == '工作表1'
+    assert len(articles) == 89
+    assert len({a['article_id'] for a in articles}) == 89
+    assert len({a['title'] for a in articles}) == 58
+
+
+def test_nickname_titles_are_candidates_never_ids(tmp_path):
+    _, articles = foreign_xlsx.article_rows(birthday_workbook(tmp_path))
+    assert all(a['person_id'] is None for a in articles)
+    assert all(a['identity_status'] == 'candidate' for a in articles)
+    by_title = {a['title']: a for a in articles}
+    for nickname in ('大狙', '小卢', '贺希宁'):
+        row = by_title[nickname]
+        assert row['person_id'] is None
+        assert row['identity_status'] == 'candidate'
+        assert row['title_raw'] == nickname
+
+
+def test_dates_never_inferred_and_raw_preserved(tmp_path):
+    _, articles = foreign_xlsx.article_rows(birthday_workbook(tmp_path))
+    assert all(a['date_interpretation'] is None for a in articles)
+    assert all(a['date_verified'] is False for a in articles)
+    datetimes = [a for a in articles if isinstance(a['row_date_raw'], datetime)]
+    strings = [a for a in articles if isinstance(a['row_date_raw'], str)]
+    assert datetimes and strings
+    for a in datetimes:
+        assert a['row_date_text'] == a['row_date_raw'].isoformat()
+    for a in strings:
+        assert a['row_date_text'] == a['row_date_raw']
+
+
+def test_pivot_and_summary_sheets_emit_no_facts(tmp_path):
+    path = birthday_workbook(tmp_path)
+    with pytest.raises(ValueError, match='not article data'):
+        foreign_xlsx.article_rows(path, sheet='Sheet4')
+    with pytest.raises(ValueError, match='not article data'):
+        foreign_xlsx.article_rows(path, sheet='Sheet3')
+
+
+def test_no_article_data_sheet_is_fail_closed(tmp_path):
+    book = Workbook()
+    sheet = book.active
+    sheet.title = 'Sheet4'
+    sheet.append(['数据透视表'])
+    sheet.append(['标题', '计数'])
+    path = tmp_path / 'nodata.xlsx'
+    book.save(path)
+    with pytest.raises(ValueError, match='exactly one article-data sheet'):
+        foreign_xlsx.article_rows(path)
+
+
+def test_ambiguous_data_sheets_require_explicit_choice(tmp_path):
+    book = Workbook()
+    first = book.active
+    first.title = '工作表1'
+    second = book.create_sheet('工作表2')
+    for sheet in (first, second):
+        sheet.append(['文章编号', '标题', '日期'])
+        sheet.append(['A1', 't', '2025-01-01'])
+    path = tmp_path / 'two.xlsx'
+    book.save(path)
+    with pytest.raises(ValueError, match='exactly one article-data sheet'):
+        foreign_xlsx.article_rows(path)
+    name, articles = foreign_xlsx.article_rows(path, sheet='工作表2')
+    assert name == '工作表2'
+    assert len(articles) == 1
+
+
+def test_source_provenance_points_at_sheet_and_row(tmp_path):
+    _, articles = foreign_xlsx.article_rows(birthday_workbook(tmp_path))
+    assert articles[0]['source_sheet'] == '工作表1'
+    assert articles[0]['source_row'] == 2
+    assert articles[-1]['source_row'] == 90
+
+
+def test_rows_single_sheet_guard_unchanged(tmp_path):
+    # Backward compat pin: the foreign-registration path still rejects
+    # multi-sheet files; only the new article_* functions handle them.
+    with pytest.raises(ValueError, match='single-sheet'):
+        foreign_xlsx.rows(birthday_workbook(tmp_path))
+
+
+# --- Q2-FAIL adversarial regression tests (B1/B2) ---
+# Synthetic conflict layouts the original 9 tests did not challenge.
+
+
+def _conflict_pivot_workbook(tmp_path):
+    """Pivot sheet carrying BOTH an article-like header and a pivot marker."""
+    book = Workbook()
+    sheet = book.active
+    sheet.title = '工作表1'
+    sheet.append(['文章编号', '标题', '日期'])
+    sheet.append(['A0001', '文章标题01', '2025/03/01'])
+    sheet.append(['数据透视表：按标题计数'])
+    sheet.append(['文章标题01', 2])
+    path = tmp_path / 'conflict_pivot.xlsx'
+    book.save(path)
+    return path
+
+
+def test_pivot_with_article_like_header_is_fail_closed(tmp_path):
+    """B1: pivot marker + article-like header must NEVER emit article facts."""
+    path = _conflict_pivot_workbook(tmp_path)
+    roles = foreign_xlsx.classify_sheets(path)
+    assert roles['工作表1'] != foreign_xlsx.ARTICLE_DATA
+    with pytest.raises(ValueError):
+        foreign_xlsx.article_rows(path)
+    with pytest.raises(ValueError):
+        foreign_xlsx.article_rows(path, sheet='工作表1')
+
+
+def _conflict_summary_workbook(tmp_path):
+    """Summary sheet carrying BOTH an article-like header and a summary marker."""
+    book = Workbook()
+    sheet = book.active
+    sheet.title = 'Sheet3'
+    sheet.append(['文章编号', '标题', '日期'])
+    sheet.append(['A0001', '文章标题01', '2025/03/01'])
+    sheet.append(['合计', 89])
+    path = tmp_path / 'conflict_summary.xlsx'
+    book.save(path)
+    return path
+
+
+def test_summary_with_article_like_header_is_fail_closed(tmp_path):
+    """B1: summary marker + article-like header must NEVER emit article facts."""
+    path = _conflict_summary_workbook(tmp_path)
+    roles = foreign_xlsx.classify_sheets(path)
+    assert roles['Sheet3'] != foreign_xlsx.ARTICLE_DATA
+    with pytest.raises(ValueError):
+        foreign_xlsx.article_rows(path, sheet='Sheet3')
+
+
+def _titled_article_workbook(tmp_path):
+    """Article sheet with a title row ABOVE the header row (B2 layout)."""
+    book = Workbook()
+    sheet = book.active
+    sheet.title = '工作表1'
+    sheet.append(['球队生日文章清单'])
+    sheet.append(['文章编号', '标题', '日期'])
+    sheet.append(['A0001', '文章标题01', '2025/03/01'])
+    sheet.append(['A0002', '大狙', '2025/03/02'])
+    path = tmp_path / 'titled.xlsx'
+    book.save(path)
+    return path
+
+
+def test_article_sheet_with_title_row_above_header(tmp_path):
+    """B2: header detector is shared — title-above-header works explicitly and auto."""
+    path = _titled_article_workbook(tmp_path)
+    roles = foreign_xlsx.classify_sheets(path)
+    assert roles['工作表1'] == foreign_xlsx.ARTICLE_DATA
+    name, articles = foreign_xlsx.article_rows(path, sheet='工作表1')
+    assert name == '工作表1'
+    assert [a['article_id'] for a in articles] == ['A0001', 'A0002']
+    assert articles[0]['source_row'] == 3
+    auto_name, auto_articles = foreign_xlsx.article_rows(path)
+    assert auto_name == '工作表1'
+    assert len(auto_articles) == 2
+
+
+def _row13_marker_workbook(tmp_path):
+    """B1-R2-01: pivot marker BELOW the header probe window (row 13)."""
+    book = Workbook()
+    sheet = book.active
+    sheet.title = '工作表1'
+    sheet.append(['文章编号', '标题', '日期'])          # row 1: article-like header
+    sheet.append(['A0001', '文章标题01', '2025/03/01'])   # row 2: article row
+    for i in range(3, 13):
+        sheet.append([f'A{i:04d}', f' filler {i}', '2025/03/01'])  # rows 3-12
+    sheet.append(['数据透视表：按标题计数'])  # row 13: pivot marker (probe-invisible)
+    sheet.append(['文章标题01', 2])           # row 14: pivot row
+    path = tmp_path / 'row13_marker.xlsx'
+    book.save(path)
+    return path
+
+
+def test_pivot_marker_on_row13_is_fail_closed(tmp_path):
+    """B1-R2-01: a marker below rows 1-12 must still veto ARTICLE_DATA."""
+    path = _row13_marker_workbook(tmp_path)
+    roles = foreign_xlsx.classify_sheets(path)
+    assert roles['工作表1'] != foreign_xlsx.ARTICLE_DATA
+    with pytest.raises(ValueError):
+        foreign_xlsx.article_rows(path)
+    with pytest.raises(ValueError):
+        foreign_xlsx.article_rows(path, sheet='工作表1')
+
+
+def test_summary_marker_on_row20_is_fail_closed(tmp_path):
+    """B1-R2-01 companion: summary marker below the probe window."""
+    book = Workbook()
+    sheet = book.active
+    sheet.title = 'Sheet3'
+    sheet.append(['文章编号', '标题', '日期'])
+    for i in range(2, 20):
+        sheet.append([f'A{i:04d}', f' filler {i}', '2025/03/01'])
+    sheet.append(['合计', 89])  # row 20: summary marker
+    path = tmp_path / 'row20_summary.xlsx'
+    book.save(path)
+    roles = foreign_xlsx.classify_sheets(path)
+    assert roles['Sheet3'] != foreign_xlsx.ARTICLE_DATA
+    with pytest.raises(ValueError):
+        foreign_xlsx.article_rows(path, sheet='Sheet3')
+
+
+def test_full_sheet_marker_scan_perf(tmp_path):
+    """B1-R2-01: full-sheet scan stays streaming-fast on a 10k-row sheet."""
+    import time
+    book = Workbook()
+    sheet = book.active
+    sheet.title = 'big'
+    sheet.append(['文章编号', '标题', '日期'])
+    for i in range(2, 10001):
+        sheet.append([f'A{i:05d}', f'文章标题{i:05d}', '2025/03/01'])
+    path = tmp_path / 'big.xlsx'
+    book.save(path)
+    start = time.monotonic()
+    roles = foreign_xlsx.classify_sheets(path)
+    elapsed = time.monotonic() - start
+    assert roles['big'] == foreign_xlsx.ARTICLE_DATA
+    assert elapsed < 30, f'full-sheet marker scan took {elapsed:.1f}s'
+
+
+# ---------------------------------------------------------------------------
+# RC-05 real-sample compatibility (R6): real column names, serial dates,
+# structural pivot detection, no false positives on article text.
+# All fixtures are SYNTHETIC -- no real private data.
+# ---------------------------------------------------------------------------
+
+def _rc05_shaped_workbook(tmp_path, name='rc05shaped.xlsx'):
+    """Synthetic workbook mirroring RC-05 STRUCTURE (not content).
+
+    Real header: 序号 / 微信文章编号 / 文章标题 / 日期.
+    Real Sheet3: 2-col pivot with 行标签/(多项)/总计.
+    Real Sheet4: 2-col pivot with 行标签/计数项.
+    """
+    from openpyxl import Workbook
+    book = Workbook()
+    data = book.active
+    data.title = '工作表1'
+    data.append(['序号', '微信文章编号', '文章标题', '日期'])
+    # Synthetic rows: serial dates like the real file (int), text IDs.
+    for i in range(1, 21):
+        data.append([i, f"'9000{i:04d}'", f'合成标题{i:02d}', 45700 + i])
+    # One title containing 统计 -- must NOT kill the article sheet.
+    data.append([21, "'90000021'", '数据统计方法说明', 45721])
+    s3 = book.create_sheet('Sheet3')
+    s3.append(['月', '(多项)'])
+    s3.append([])
+    s3.append(['行标签', ''])
+    s3.append(['总计', ''])
+    s4 = book.create_sheet('Sheet4')
+    s4.append([])
+    s4.append([])
+    s4.append(['行标签', '计数项:微信文章编号'])
+    s4.append(['A组', 5])
+    path = tmp_path / name
+    book.save(path)
+    return path
+
+
+def test_rc05_real_column_names_recognized(tmp_path):
+    from cba_kb.adapters import foreign_xlsx
+    path = _rc05_shaped_workbook(tmp_path)
+    roles = foreign_xlsx.classify_sheets(path)
+    assert roles['工作表1'] == foreign_xlsx.ARTICLE_DATA
+    sheet, rows = foreign_xlsx.article_rows(path, sheet='工作表1')
+    assert len(rows) == 21
+    r0 = rows[0]
+    # 微信文章编号 mapped to article ID; 序号 recognized but not ID.
+    assert r0['article_id'] == "'90000001'"
+    assert r0['title'] == '合成标题01'
+    assert r0['identity_status'] == 'candidate'
+    assert r0['person_id'] is None
+
+
+def test_rc05_excel_serial_dates_converted_raw_preserved(tmp_path):
+    from cba_kb.adapters import foreign_xlsx
+    path = _rc05_shaped_workbook(tmp_path)
+    _, rows = foreign_xlsx.article_rows(path, sheet='工作表1')
+    r0 = rows[0]
+    # raw keeps the original serial int; text shows converted ISO date.
+    assert r0['row_date_raw'] == 45701
+    assert r0['row_date_text'] == '2025-02-13'
+    # AC-22: never inferred.
+    assert r0['date_interpretation'] is None
+    assert r0['date_verified'] is False
+
+
+def test_rc05_pivot_sheets_structurally_detected(tmp_path):
+    from cba_kb.adapters import foreign_xlsx
+    path = _rc05_shaped_workbook(tmp_path)
+    roles = foreign_xlsx.classify_sheets(path)
+    # Structural pivot signals: 行标签, (多项), 计数项:, 总计.
+    assert roles['Sheet3'] == foreign_xlsx.PIVOT
+    assert roles['Sheet4'] == foreign_xlsx.PIVOT
+    import pytest
+    with pytest.raises(ValueError):
+        foreign_xlsx.article_rows(path, sheet='Sheet3')
+    with pytest.raises(ValueError):
+        foreign_xlsx.article_rows(path, sheet='Sheet4')
+
+
+def test_rc05_statistic_in_title_does_not_kill_sheet(tmp_path):
+    # 防误杀：文章标题含"统计"二字时，明细表不得被判为 summary。
+    from cba_kb.adapters import foreign_xlsx
+    path = _rc05_shaped_workbook(tmp_path)
+    roles = foreign_xlsx.classify_sheets(path)
+    assert roles['工作表1'] == foreign_xlsx.ARTICLE_DATA
+    _, rows = foreign_xlsx.article_rows(path, sheet='工作表1')
+    titles = [r['title'] for r in rows]
+    assert '数据统计方法说明' in titles
+
+
+def test_article_title_starting_with_weak_marker_not_killed(tmp_path):
+    """R6 boundary: 正常文章标题以弱标记开头（如"统计方法说明"）不得误杀文章表。"""
+    from openpyxl import Workbook
+    book = Workbook()
+    sheet = book.active
+    sheet.title = '工作表1'
+    sheet.append(['序号', '微信文章编号', '文章标题', '日期'])
+    sheet.append([1, 'W001', '统计方法说明', 45705])
+    sheet.append([2, 'W002', '数据汇总报告', 45706])
+    path = tmp_path / 'normal_titles.xlsx'
+    book.save(path)
+    roles = foreign_xlsx.classify_sheets(path)
+    assert roles['工作表1'] == foreign_xlsx.ARTICLE_DATA
+    _, rows = foreign_xlsx.article_rows(path, sheet='工作表1')
+    assert len(rows) == 2
+    assert rows[0]['title'] == '统计方法说明'
+
+
+def test_r6c_reordered_title_column_not_killed(tmp_path):
+    """RC05-R6b-01: 标题列在 col 0 的合法文章表不得误杀（schema-aware）。"""
+    from openpyxl import Workbook
+    book = Workbook()
+    sheet = book.active
+    sheet.title = '工作表1'
+    sheet.append(['文章标题', '微信文章编号', '日期'])
+    sheet.append(['统计方法说明', 'W001', 45705])
+    path = tmp_path / 'r6b01.xlsx'
+    book.save(path)
+    roles = foreign_xlsx.classify_sheets(path)
+    assert roles['工作表1'] == foreign_xlsx.ARTICLE_DATA
+
+
+def test_r6c_disguised_aggregate_table_rejected(tmp_path):
+    """RC05-R6b-02: 伪装汇总表（数字ID+汇总标签标题）必须拒绝。"""
+    from openpyxl import Workbook
+    book = Workbook()
+    sheet = book.active
+    sheet.title = '工作表1'
+    sheet.append(['微信文章编号', '文章标题', '日期'])
+    sheet.append(['89', '统计口径说明', None])
+    sheet.append(['58', '总计说明', None])
+    path = tmp_path / 'r6b02.xlsx'
+    book.save(path)
+    roles = foreign_xlsx.classify_sheets(path)
+    assert roles['工作表1'] != foreign_xlsx.ARTICLE_DATA
