@@ -781,7 +781,8 @@ def zero_diff_guard(proposed_changes: List[Dict[str, Any]]) -> Dict[str, Any]:
         if extra_keys:
             decisions.append({"change": change, "decision": "REFUSED",
                               "reason": f"undefined proposal fields: "
-                                        f"{sorted(extra_keys)}; judgement-only"})
+                                        f"{sorted(map(str, extra_keys))}; "
+                                        "judgement-only"})
             continue
         target = change.get("target")
         kind = change.get("kind")

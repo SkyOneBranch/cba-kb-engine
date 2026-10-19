@@ -1143,3 +1143,11 @@ class TestAdversarialNEW2R6:
                 "target": "evaluation_output", "kind": "read",
                 "detail": detail}])
             assert out["verdict"] == "ALL_REFUSED", detail
+
+    def test_r6_mixed_type_extra_keys_fail_closed(self):
+        # R5 reviewer NEW-R5-1: mixed-type dict keys must not crash sorted().
+        out = rw.zero_diff_guard([{
+            "target": "evaluation_output", "kind": "read", "detail": None,
+            "action": "delete", 7: "hidden_operation"}])
+        assert out["verdict"] == "ALL_REFUSED"
+        assert out["decisions"][0]["decision"] == "REFUSED"
