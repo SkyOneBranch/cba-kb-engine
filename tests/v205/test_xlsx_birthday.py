@@ -364,3 +364,21 @@ def test_rc05_statistic_in_title_does_not_kill_sheet(tmp_path):
     _, rows = foreign_xlsx.article_rows(path, sheet='工作表1')
     titles = [r['title'] for r in rows]
     assert '数据统计方法说明' in titles
+
+
+def test_article_title_starting_with_weak_marker_not_killed(tmp_path):
+    """R6 boundary: 正常文章标题以弱标记开头（如"统计方法说明"）不得误杀文章表。"""
+    from openpyxl import Workbook
+    book = Workbook()
+    sheet = book.active
+    sheet.title = '工作表1'
+    sheet.append(['序号', '微信文章编号', '文章标题', '日期'])
+    sheet.append([1, 'W001', '统计方法说明', 45705])
+    sheet.append([2, 'W002', '数据汇总报告', 45706])
+    path = tmp_path / 'normal_titles.xlsx'
+    book.save(path)
+    roles = foreign_xlsx.classify_sheets(path)
+    assert roles['工作表1'] == foreign_xlsx.ARTICLE_DATA
+    _, rows = foreign_xlsx.article_rows(path, sheet='工作表1')
+    assert len(rows) == 2
+    assert rows[0]['title'] == '统计方法说明'

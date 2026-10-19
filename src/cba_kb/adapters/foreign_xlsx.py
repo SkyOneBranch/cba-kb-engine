@@ -93,14 +93,24 @@ def _find_article_header(rows):
     return None
 
 
-def _is_weak_marker_cell(cell, markers):
-    """弱标记仅当独立成格或位于行首时有效（防误杀）。
+def _is_weak_marker_cell(cell, markers, col_index):
+    """弱标记仅当结构性位置有效时触发（防误杀）。
 
-    文章明细的标题中可能含有"统计"等词（如"数据统计方法"），不能仅因
-    子串出现就否决整表。独立成格（cell == marker）或行首出现
-    （cell.startswith(marker)）才是汇总行的结构性信号。
+    R6 边界修复：正常文章标题如"统计方法说明"可能以弱标记开头，
+    不能仅因 startswith 就否决整表。弱标记有效当且仅当：
+    (1) 独立成格（cell == marker，任意列）；或
+    (2) 位于行首列（col_index == 0）且以标记开头。
+
+    原理：透视/汇总表的标签（总计、统计口径说明）在行首列；
+    文章标题在标题列（非首列），即使以"统计"开头也不触发。
+    首列的序号/ID 列通常为数字，标题不会出现在首列。
     """
-    return any(cell == m or cell.startswith(m) for m in markers)
+    for m in markers:
+        if cell == m:
+            return True
+        if col_index == 0 and cell.startswith(m):
+            return True
+    return False
 
 
 def _find_marker_kind(sheet):
@@ -115,21 +125,22 @@ def _find_marker_kind(sheet):
     RC-05 refinement: markers are two-tiered. Strong markers (行标签,
     数据透视, 透视表, 计数项, (多项)) are pivot-specific vocabulary --
     substring match anywhere vetoes. Weak markers (汇总/总计/计数/统计/
-    平均/合计) are common words -- they veto only as standalone cells or
-    at cell start (structural position), never as substrings inside
-    article text (e.g. a title containing "统计" must not kill the sheet).
+    平均/合计) are common words -- they veto only as standalone cells
+    (exact match, any column) or at row-start position (col 0) with only
+    punctuation following. An article title like "统计方法说明" in a
+    non-first column never triggers (R6 boundary fix).
     """
     found_summary = False
     for row in sheet.iter_rows(values_only=True):
-        for value in row:
+        for col_index, value in enumerate(row):
             cell = _cell_text(value)
             if not cell:
                 continue
             if any(marker in cell for marker in STRONG_PIVOT_MARKERS):
                 return PIVOT
-            if _is_weak_marker_cell(cell, WEAK_PIVOT_MARKERS):
+            if _is_weak_marker_cell(cell, WEAK_PIVOT_MARKERS, col_index):
                 return PIVOT
-            if _is_weak_marker_cell(cell, WEAK_SUMMARY_MARKERS):
+            if _is_weak_marker_cell(cell, WEAK_SUMMARY_MARKERS, col_index):
                 found_summary = True
     return SUMMARY if found_summary else None
 
