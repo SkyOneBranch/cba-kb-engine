@@ -647,12 +647,16 @@ class TestAdversarialB6:
 
     def test_self_reported_hashes_without_evidence_rejected(self):
         # Reviewer B6: manifest SHAs without structured evidence receipts
-        # must be rejected.
+        # must be rejected (fail closed).
+        # R4 semantics: ABSENT upstream evidence -> NOT_VERIFIED (not yet
+        # established); MALFORMED evidence -> REFUSED (actively wrong).
+        # Both are fail-closed; neither is MATERIALIZED_ALLOWED.
         args = self._args()
         del args["expected_manifest_evidence"]
         del args["observed_manifest_evidence"]
         out = rw.gate_new_batch(**args)
-        assert out["verdict"] == "REFUSED"
+        assert out["verdict"] in ("REFUSED", "NOT_VERIFIED")
+        assert out["verdict"] != "MATERIALIZED_ALLOWED"
         assert "evidence" in out["reason"]
 
     def test_independently_established_manifest_allowed(self):
@@ -876,3 +880,205 @@ class TestAdversarialNEW2:
             {"target": "new_data_release", "kind": "DELETE",
              "detail": "cleanup"}])
         assert out["verdict"] == "ALL_REFUSED"
+
+
+# ---------------------------------------------------------------------------
+# R4: NEW-2 adversarial hardening (unhashable kinds, pattern targets,
+# expanded refused kinds, normalization, malformed proposals)
+# ---------------------------------------------------------------------------
+
+class TestAdversarialNEW2R4:
+    """R4: zero_diff_guard structural hardening beyond R2/R3.
+
+    Covers: unhashable kind types (must not crash), non-dict proposals,
+    pattern-based protected targets, expanded mutating-kind set,
+    strip+lower normalization, missing/empty target/kind.
+    """
+
+    def test_unhashable_kind_refused_no_crash(self):
+        # R4红线: kind 为 list/dict 时旧代码抛 TypeError；必须干净拒绝。
+        for bad_kind in (["read"], {"k": "read"}, ("read",)):
+            out = rw.zero_diff_guard([
+                {"target": "evaluation_output", "kind": bad_kind}])
+            assert out["verdict"] == "ALL_REFUSED", bad_kind
+
+    def test_non_dict_proposal_refused(self):
+        # proposal 不是 dict -> 拒绝，不崩溃。
+        for bad in (["just a string"], [None], [123]):
+            out = rw.zero_diff_guard(bad)
+            assert out["verdict"] == "ALL_REFUSED", bad
+
+    def test_pattern_protected_targets_refused(self):
+        # 模式匹配的历史目标：任何 kind 都拒绝。
+        cases = [
+            {"target": "release_status.json", "kind": "read"},
+            {"target": "Release_Status.JSON", "kind": "read"},
+            {"target": "v2.0.1-1", "kind": "read"},
+            {"target": "v2.0.4-2", "kind": "evaluate"},
+            {"target": "previous_snapshot", "kind": "read"},
+            {"target": "snapshot_history", "kind": "view"},
+            {"target": "archive/git_tag_backup", "kind": "read"},
+        ]
+        for c in cases:
+            out = rw.zero_diff_guard([c])
+            assert out["verdict"] == "ALL_REFUSED", c
+
+    def test_expanded_refused_kinds(self):
+        # 扩展的变异 kind 集：在任何 target 上拒绝。
+        for k in ("publish", "remove", "purge", "drop", "erase",
+                  "modify", "clear", "reset", "PUBLISH", "Remove"):
+            out = rw.zero_diff_guard([
+                {"target": "evaluation_output", "kind": k}])
+            assert out["verdict"] == "ALL_REFUSED", k
+            out = rw.zero_diff_guard([
+                {"target": "new_data_release", "kind": k}])
+            assert out["verdict"] == "ALL_REFUSED", k
+
+    def test_whitespace_kind_normalized(self):
+        # " delete " -> strip+lower -> "delete" -> 显式拒绝（非 fallthrough）。
+        out = rw.zero_diff_guard([
+            {"target": "new_data_release", "kind": " delete "}])
+        assert out["verdict"] == "ALL_REFUSED"
+        assert "mutating/ambiguous kind" in out["decisions"][0]["reason"]
+        # 合法的 read 加空白 -> 归一化后仍放行。
+        out = rw.zero_diff_guard([
+            {"target": "  evaluation_output  ", "kind": "  Read  ",
+             "detail": "view"}])
+        assert out["verdict"] == "ALL_ALLOWED"
+
+    def test_missing_or_empty_target_kind_refused(self):
+        cases = [
+            {"kind": "read"},                       # 缺 target
+            {"target": None, "kind": "read"},        # target None
+            {"target": "   ", "kind": "read"},       # target 全空白
+            {"target": "evaluation_output"},         # 缺 kind
+            {"target": "evaluation_output", "kind": None},
+            {"target": "evaluation_output", "kind": ""},
+            {"target": "evaluation_output", "kind": "   "},
+            {"target": 123, "kind": "read"},         # target 非字符串
+        ]
+        for c in cases:
+            out = rw.zero_diff_guard([c])
+            assert out["verdict"] == "ALL_REFUSED", c
+
+    def test_mixed_proposals_never_all_allowed(self):
+        # 1 个合法 read + 1 个 delete -> MIXED，绝不 ALL_ALLOWED。
+        out = rw.zero_diff_guard([
+            {"target": "evaluation_output", "kind": "read"},
+            {"target": "new_data_release", "kind": "delete"}])
+        assert out["verdict"] == "MIXED"
+        assert out["verdict"] != "ALL_ALLOWED"
+
+    def test_detail_deception_variants(self):
+        # kind=delete 配无辜 detail -> 仍拒绝（kind 是主要判断）。
+        out = rw.zero_diff_guard([
+            {"target": "evaluation_output", "kind": "delete",
+             "detail": "just reading, definitely not deleting"}])
+        assert out["verdict"] == "ALL_REFUSED"
+        # 近似只读词配真实写入 detail -> 拒绝。
+        for k in ("readonly", "view"):
+            out = rw.zero_diff_guard([
+                {"target": "evaluation_output", "kind": k,
+                 "detail": "delete archived records"}])
+            assert out["verdict"] == "ALL_REFUSED", k
+        # 超长 detail 不影响只读放行（detail 只是次要信号）。
+        out = rw.zero_diff_guard([
+            {"target": "evaluation_output", "kind": "read",
+             "detail": "x" * 10000}])
+        assert out["verdict"] == "ALL_ALLOWED"
+
+
+# ---------------------------------------------------------------------------
+# R4: NEW-1 proof-semantics correction (NOT_VERIFIED without upstream,
+# upstream->receipt->judge integration chain)
+# ---------------------------------------------------------------------------
+
+class TestAdversarialNEW1R4:
+    """R4: trusted-upstream proof semantics.
+
+    No new auth/signature platform. The module validates receipt structure
+    + binding; the pipeline establishes upstream trust. Without established
+    upstream evidence -> NOT_VERIFIED/EXTERNAL_PENDING, never
+    MATERIALIZED_ALLOWED.
+    """
+
+    def _receipt(self, **kw):
+        r = {"source": "consumer-drive-readback",
+             "target": "consumer-docs",
+             "sha": "a" * 64,
+             "read_id": "read-001",
+             "read_timestamp": "2026-10-18T15:00:00Z"}
+        r.update(kw)
+        return r
+
+    def _inventory(self, **kw):
+        inv = {"source": "consumer-drive-readback",
+               "target": "consumer-docs",
+               "artifacts": ["doc-1", "doc-2"],
+               "read_id": "inv-001",
+               "read_timestamp": "2026-10-18T15:00:00Z"}
+        inv.update(kw)
+        return inv
+
+    def _args(self, **kw):
+        args = {"expected_manifest_sha": "a" * 64,
+                "observed_manifest_sha": "a" * 64,
+                "expected_manifest_evidence": self._receipt(read_id="read-001"),
+                "observed_manifest_evidence": self._receipt(read_id="read-002"),
+                "required_artifacts": ["doc-1", "doc-2"],
+                "artifact_inventory": self._inventory(),
+                "silent_truncation": 0,
+                "third_party_read": True,
+                "consumer_target": "consumer-docs"}
+        args.update(kw)
+        return rw.gate_new_batch(**args)
+
+    def test_no_upstream_evidence_is_not_verified(self):
+        # 暂时没有可信上游收据时 -> NOT_VERIFIED。这是正确行为，不是功能缺失：
+        # 本模块不把"无证据"包装成通过，也不伪造正向 PASS。
+        out = self._args(expected_manifest_evidence=None,
+                         observed_manifest_evidence=None)
+        assert out["verdict"] == "NOT_VERIFIED"
+        assert out["verdict"] != "MATERIALIZED_ALLOWED"
+
+    def test_upstream_chain_integration(self):
+        # 集成形态：模拟"可信上游 -> 收据 -> 判定模块"证据传递链。
+        # 上游执行两次独立读取，生成绑定收据；判定模块验证字段映射。
+        def fake_trusted_upstream_read(target, read_id, payload=b"manifest-bytes"):
+            import hashlib
+            sha = hashlib.sha256(payload).hexdigest()
+            return {"source": "consumer-drive-readback",
+                    "target": target,
+                    "sha": sha,
+                    "read_id": read_id,
+                    "read_timestamp": "2026-10-18T15:00:00Z"}, sha
+
+        r1, sha1 = fake_trusted_upstream_read("consumer-docs", "up-001")
+        r2, sha2 = fake_trusted_upstream_read("consumer-docs", "up-002")
+        assert sha1 == sha2  # 同一内容，两次独立读取
+        inv = {"source": "consumer-drive-readback",
+               "target": "consumer-docs",
+               "artifacts": ["doc-1", "doc-2"],
+               "read_id": "up-inv-001",
+               "read_timestamp": "2026-10-18T15:00:00Z"}
+        out = rw.gate_new_batch(
+            expected_manifest_sha=sha1, observed_manifest_sha=sha2,
+            expected_manifest_evidence=r1, observed_manifest_evidence=r2,
+            required_artifacts=["doc-1", "doc-2"], artifact_inventory=inv,
+            silent_truncation=0, third_party_read=True,
+            consumer_target="consumer-docs")
+        assert out["verdict"] == "MATERIALIZED_ALLOWED"
+        # 链断裂：上游只读了一次（同一收据复用）-> 拒绝。
+        out2 = rw.gate_new_batch(
+            expected_manifest_sha=sha1, observed_manifest_sha=sha2,
+            expected_manifest_evidence=r1, observed_manifest_evidence=dict(r1),
+            required_artifacts=["doc-1", "doc-2"], artifact_inventory=inv,
+            silent_truncation=0, third_party_read=True,
+            consumer_target="consumer-docs")
+        assert out2["verdict"] == "REFUSED"
+
+    def test_caller_sha_without_receipt_never_proves(self):
+        # 调用方只给 SHA（即使格式合法）但无收据 -> 不可是 MATERIALIZED_ALLOWED。
+        out = self._args(expected_manifest_evidence=None,
+                         observed_manifest_evidence=self._receipt(read_id="read-002"))
+        assert out["verdict"] != "MATERIALIZED_ALLOWED"

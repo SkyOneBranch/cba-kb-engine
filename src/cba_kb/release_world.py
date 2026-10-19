@@ -17,12 +17,32 @@ identities, NOT a new production schema.
 Fail-closed throughout: unknown states -> ``NOT_VERIFIED``; missing
 evidence -> ``BLOCKED/NOT_VERIFIED``; never guess JSON; never infer
 equality from version strings alone; never silently relax a conflict.
+
+TRUSTED-UPSTREAM CONTRACT (AC-37, explicit -- no new auth/signature
+platform is introduced by this module):
+  Trusted upstream is responsible for the REAL verifications:
+    (a) performing the actual consumer-side reads,
+    (b) computing the manifest SHA-256 digests from read bytes,
+    (c) generating evidence receipts that bind
+        source / target / sha / read_id / read_timestamp.
+  This module is responsible ONLY for:
+    (d) validating receipt STRUCTURE (all five fields present, well-formed),
+    (e) validating BINDING consistency (receipt.sha == compared digest,
+        receipt.target == judged consumer target, expected/observed from
+        DISTINCT read_ids).
+  This module does NOT verify that the upstream actually performed the
+  reads -- that trust is established by the pipeline OUTSIDE this module.
+  A caller-supplied SHA, evidence string, or boolean is NEVER promoted to
+  a real Consumer materialization proof. Until verifiable upstream
+  evidence is established and bound, the verdict is ``NOT_VERIFIED`` or
+  ``EXTERNAL_PENDING`` -- never ``MATERIALIZED_ALLOWED``.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -54,11 +74,42 @@ _READONLY_OPERATIONS = frozenset({
     ("evaluation_output", "inspect"),
 })
 # Mutating or ambiguous kinds: always refused, on ANY target.
-# (Kind matching is case-insensitive; "DELETE" == "delete".)
+# (Kind matching is case-insensitive after strip+lower normalization;
+# "DELETE" == "delete" == " delete ".)
 _REFUSED_KINDS = frozenset({
     "delete", "rewrite", "overwrite", "mutate",
     "write", "update", "create", "force_version",
+    "publish", "remove", "purge", "drop", "erase",
+    "modify", "clear", "reset",
 })
+
+# Historical-target patterns: any target matching these is protected
+# regardless of the kind claimed. Catches "release_status.json",
+# "v2.0.1-1", "previous_snapshot", etc. -- not just the exact names.
+_VERSION_PATTERN = re.compile(r"v\d+\.\d+")
+_PROTECTED_TARGET_SUBSTRINGS = frozenset({
+    "release_status", "git_tag", "previous_snapshot",
+    "data_production_old", "snapshot_history",
+})
+
+
+def _is_protected_target(target: Any) -> bool:
+    """Whether a target names protected history (exact or pattern).
+
+    R4 hardening: pattern matching, not just exact-name membership, so
+    "release_status.json", "v2.0.1-1" or "previous_snapshot" cannot slip
+    past the guard by using a near-miss name.
+    """
+    if not isinstance(target, str):
+        return False
+    t = target.strip().lower()
+    if t in _PROTECTED_TARGETS:
+        return True
+    if any(s in t for s in _PROTECTED_TARGET_SUBSTRINGS):
+        return True
+    if _VERSION_PATTERN.search(t):
+        return True
+    return False
 
 
 def _detail_targets_history(detail: Any) -> bool:
@@ -591,11 +642,16 @@ def gate_new_batch(
     inventory must be a bound receipt too -- a caller-supplied name list
     matching required_artifacts is self-proof and is rejected.
 
-    TRUST BOUNDARY (explicit): this module validates receipt STRUCTURE and
-    BINDING. It does not independently verify that the trusted upstream
-    actually performed the reads -- that trust is established by the
-    pipeline outside this module. Callers must supply receipts produced by
-    the trusted upstream; anything else fails closed.
+    TRUST BOUNDARY (explicit; see also module docstring TRUSTED-UPSTREAM
+    CONTRACT): this module validates receipt STRUCTURE and BINDING. It
+    does not independently verify that the trusted upstream actually
+    performed the reads -- that trust is established by the pipeline
+    outside this module. Callers must supply receipts produced by the
+    trusted upstream; anything else fails closed. A caller-supplied SHA,
+    evidence string, or boolean is NEVER promoted to a real Consumer
+    materialization proof: without established, bound upstream evidence
+    the verdict is NOT_VERIFIED or EXTERNAL_PENDING, never
+    MATERIALIZED_ALLOWED.
 
     A third party not yet read is EXTERNAL_PENDING, not PASS.
     """
@@ -605,6 +661,16 @@ def gate_new_batch(
     if not _nonempty_str(consumer_target):
         return {"verdict": "REFUSED",
                 "reason": "missing_consumer_target: nothing to bind evidence to"}
+    # R4: no upstream evidence established at all (as opposed to malformed
+    # evidence) -> NOT_VERIFIED, not MATERIALIZED_ALLOWED. This is the
+    # correct behavior when the trusted upstream has not yet produced
+    # receipts; it is not a feature gap. Malformed receipts below are
+    # REFUSED (actively wrong); absent receipts are NOT_VERIFIED
+    # (not yet established).
+    if expected_manifest_evidence is None and observed_manifest_evidence is None:
+        return {"verdict": "NOT_VERIFIED",
+                "reason": "upstream evidence not established: no trusted "
+                          "receipts bound; judgement-only, no proof claimed"}
     if not required_artifacts:
         return {"verdict": "REFUSED",
                 "reason": "empty_required_artifact_set: nothing to verify"}
@@ -695,9 +761,14 @@ def zero_diff_guard(proposed_changes: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     Decision order (primary = structured target+kind; detail text is only
     a defense-in-depth secondary signal):
-      1. protected target -> REFUSED (any kind, even "read": the target
-         itself must not be touched by this module's judgements);
-      2. mutating/ambiguous kind (case-insensitive) -> REFUSED on any target;
+      0. malformed proposal (not a dict), missing/non-string/empty target,
+         or non-string/empty kind -> REFUSED (fail closed, never crash);
+      1. protected target (exact name OR pattern: release_status, version
+         tags like v2.0.1-1, previous_snapshot, ...) -> REFUSED (any kind,
+         even "read": the target itself must not be touched);
+      2. mutating/ambiguous kind (case-insensitive after strip+lower:
+         delete/rewrite/overwrite/mutate/write/update/create/publish/
+         remove/purge/...) -> REFUSED on any target;
       3. detail targets protected history -> REFUSED (defense in depth;
          checked before the allowlist so a hostile detail cannot ride on
          an allowlisted pair);
@@ -710,24 +781,60 @@ def zero_diff_guard(proposed_changes: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     decisions = []
     for change in proposed_changes:
+        # A proposal that is not even a dict cannot be judged safe.
+        if not isinstance(change, dict):
+            decisions.append({"change": change, "decision": "REFUSED",
+                              "reason": "malformed proposal: not a dict; "
+                                        "judgement-only"})
+            continue
         target = change.get("target")
         kind = change.get("kind")
         detail = change.get("detail")
-        kind_norm = kind.lower() if isinstance(kind, str) else kind
-        if target in _PROTECTED_TARGETS:
+        # 1. Target must be a non-empty string. Missing/non-string targets
+        #    fail closed (never silently skipped).
+        if not isinstance(target, str) or not target.strip():
             decisions.append({"change": change, "decision": "REFUSED",
-                              "reason": f"protected target: {target}; "
+                              "reason": f"missing or invalid target: "
+                                        f"{target!r}; judgement-only"})
+            continue
+        target_norm = target.strip()
+        target_key = target_norm.lower()
+        # 2. Protected history (exact name OR pattern): any kind refused.
+        #    The target itself must not be touched by this module.
+        if _is_protected_target(target_norm):
+            decisions.append({"change": change, "decision": "REFUSED",
+                              "reason": f"protected target: {target_norm!r}; "
                                         "judgement-only, no authorization"})
-        elif kind_norm in _REFUSED_KINDS:
+            continue
+        # 3. Kind must be a string. Non-string kinds (list/dict/int/None)
+        #    are refused -- never crash, never pass through.
+        if not isinstance(kind, str):
+            decisions.append({"change": change, "decision": "REFUSED",
+                              "reason": f"invalid kind type: {type(kind).__name__}; "
+                                        "judgement-only"})
+            continue
+        kind_norm = kind.strip().lower()
+        if not kind_norm:
+            decisions.append({"change": change, "decision": "REFUSED",
+                              "reason": "empty kind after normalization; "
+                                        "judgement-only"})
+            continue
+        # 4. Mutating/ambiguous kind: refused on ANY target.
+        if kind_norm in _REFUSED_KINDS:
             decisions.append({"change": change, "decision": "REFUSED",
                               "reason": f"mutating/ambiguous kind refused on "
                                         f"any target: {kind!r}; judgement-only"})
-        elif _detail_targets_history(detail):
+            continue
+        # 5. Detail targets protected history (defense in depth, checked
+        #    before the allowlist so a hostile detail cannot ride along).
+        if _detail_targets_history(detail):
             decisions.append({"change": change, "decision": "REFUSED",
                               "reason": "detail indicates protected-history "
                                         "tampering: fail closed; "
                                         "judgement-only"})
-        elif (target, kind_norm) in _READONLY_OPERATIONS:
+            continue
+        # 6. Explicitly allowlisted (target, kind) read-only pair only.
+        if (target_key, kind_norm) in _READONLY_OPERATIONS:
             # Defense in depth: a read-labeled operation whose detail
             # describes a state change is a mislabeled write.
             if _detail_describes_mutation(detail):
@@ -745,8 +852,8 @@ def zero_diff_guard(proposed_changes: List[Dict[str, Any]]) -> Dict[str, Any]:
             # kinds on non-allowlisted targets.
             decisions.append({"change": change, "decision": "REFUSED",
                               "reason": f"not an allowlisted read-only "
-                                        f"operation: target={target!r} "
-                                        f"kind={kind!r}; judgement-only"})
+                                        f"operation: target={target_norm!r} "
+                                        f"kind={kind_norm!r}; judgement-only"})
     refused = [d for d in decisions if d["decision"] == "REFUSED"]
     if not decisions:
         verdict = "ALL_ALLOWED"
