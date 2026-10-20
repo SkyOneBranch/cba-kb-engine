@@ -520,6 +520,50 @@ check("无修改返回空清单",
           {"a.py": ("100644", "b" * 40)},
           {"a.py": ("100644", "b" * 40)}) == [])
 
+# ---------- #211 merge-base 基线（根因修复） ----------
+# parse_merge_base 纯函数正反用例
+_S40B = "0123456789abcdef" * 2 + "01234567"
+check("#211 parse_merge_base 合法响应",
+      policy_gate.parse_merge_base(
+          {"merge_base_commit": {"sha": _S40B}}) == _S40B)
+check("#211 parse_merge_base 缺失字段 -> None",
+      policy_gate.parse_merge_base({}) is None)
+check("#211 parse_merge_base null -> None",
+      policy_gate.parse_merge_base({"merge_base_commit": None}) is None)
+check("#211 parse_merge_base 畸形 SHA -> None",
+      policy_gate.parse_merge_base(
+          {"merge_base_commit": {"sha": "xyz"}}) is None)
+check("#211 parse_merge_base 非 dict -> None",
+      policy_gate.parse_merge_base(["merge_base_commit"]) is None)
+
+# 兄弟 PR 场景（#204/#205/#206/#210 四度复现的误报）：
+# merge-base 清单 {a.py}；main 其后新增 sibling.py；PR head 只含
+# merge-base 时代的清单。用 main 清单做基线 -> 误报删除（旧行为）；
+# 用 merge-base 清单做基线 -> 通过（新行为）。真删除在新口径下仍阻断。
+_MB_IDS = {"a.py": ("100644", "b" * 40)}
+_MAIN_IDS = {"a.py": ("100644", "b" * 40),
+             "sibling.py": ("100644", "d" * 40)}
+_PR_IDS = {"a.py": ("100644", "b" * 40)}
+
+
+def _identities_blocked(base_ids, pr_ids):
+    try:
+        policy_gate.check_test_identities(base_ids, pr_ids)
+        return False
+    except SystemExit:
+        return True
+
+
+check("#211 旧口径（main 基线）误报兄弟 PR 新增文件",
+      _identities_blocked(_MAIN_IDS, _PR_IDS) is True)
+check("#211 新口径（merge-base 基线）不误报",
+      _identities_blocked(_MB_IDS, _PR_IDS) is False)
+check("#211 新口径下真删除仍阻断",
+      _identities_blocked(_MB_IDS, {}) is True)
+check("#211 新口径下类型改变仍阻断",
+      _identities_blocked(
+          _MB_IDS, {"a.py": ("120000", "b" * 40)}) is True)
+
 print()
 print(f"通过 {len(PASS)}/{len(PASS) + len(FAIL)}")
 if FAIL:
