@@ -564,6 +564,98 @@ check("#211 新口径下类型改变仍阻断",
       _identities_blocked(
           _MB_IDS, {"a.py": ("120000", "b" * 40)}) is True)
 
+# ---------- #211 生产路径集成（Q2 R1 补强） ----------
+# 上面的清单级断言不能证明生产路径已切换（保留旧基线也能全过）。
+# 本节在临时 Git 仓库中真实调用 resolve_merge_base_verified ->
+# check_integrity_baseline：共同祖先 + sibling main 提交 + PR head，
+# 在 depth=1 浅克隆（模拟可信 job checkout）中运行；compare API 以
+# stub 注入（selftest 无网络/令牌），其余全走真实 git 对象与扫描器。
+def _mb_integration_case(mode):
+    """mode: sibling|delete|badpayload|mismatch -> True 表示基线通过。"""
+    import shutil as _sh
+    _here = os.path.dirname(os.path.abspath(__file__))
+    with tempfile.TemporaryDirectory() as td:
+        def run(cmd, cwd):
+            return _sp.run(cmd, cwd=cwd, check=True,
+                           capture_output=True, text=True).stdout.strip()
+        origin = os.path.join(td, "origin.git")
+        run(["git", "init", "-q", "--bare", "-b", "main", origin], td)
+        seed = os.path.join(td, "seed")
+        run(["git", "clone", "-q", origin, seed], td)
+        run(["git", "config", "user.email", "t@t"], seed)
+        run(["git", "config", "user.name", "t"], seed)
+        os.makedirs(os.path.join(seed, "tests"))
+        os.makedirs(os.path.join(seed, ".github", "scripts"))
+        _sh.copy(os.path.join(_here, "integrity-scan.py"),
+                 os.path.join(seed, ".github", "scripts",
+                              "integrity-scan.py"))
+        with open(os.path.join(seed, "tests", "a.py"), "w") as f:
+            f.write("def test_a():\n    assert True\n")
+        run(["git", "add", "-A"], seed)
+        run(["git", "commit", "-qm", "mb"], seed)
+        mb_sha = run(["git", "rev-parse", "HEAD"], seed)
+        run(["git", "push", "-q", "origin", "HEAD:main"], seed)
+        with open(os.path.join(seed, "tests", "sibling.py"), "w") as f:
+            f.write("def test_s():\n    assert True\n")
+        run(["git", "add", "-A"], seed)
+        run(["git", "commit", "-qm", "sibling"], seed)
+        run(["git", "push", "-q", "origin", "HEAD:main"], seed)
+        main_tip = run(["git", "rev-parse", "HEAD"], seed)
+        pr = os.path.join(td, "pr")
+        run(["git", "clone", "-q", origin, pr], td)
+        run(["git", "config", "user.email", "t@t"], pr)
+        run(["git", "config", "user.name", "t"], pr)
+        run(["git", "checkout", "-q", "-b", "pr", mb_sha], pr)
+        if mode == "delete":
+            os.remove(os.path.join(pr, "tests", "a.py"))
+        else:
+            with open(os.path.join(pr, "src.txt"), "w") as f:
+                f.write("change\n")
+        run(["git", "add", "-A"], pr)
+        run(["git", "commit", "-qm", "pr"], pr)
+        head_sha = run(["git", "rev-parse", "HEAD"], pr)
+        run(["git", "push", "-q", "origin", "HEAD:refs/pull/7/head"], pr)
+        co = os.path.join(td, "co")
+        run(["git", "clone", "-q", "--depth", "1", origin, co], td)
+        if mode == "badpayload":
+            payload = {}
+        elif mode == "mismatch":
+            payload = {"merge_base_commit": {"sha": main_tip}}
+        else:
+            payload = {"merge_base_commit": {"sha": mb_sha}}
+        saved = {k: getattr(policy_gate, k) for k in
+                 ("REPO", "PR_NUMBER", "HEAD_SHA", "BASE_SHA",
+                  "PR_AUTHOR", "BASE_REF", "gh_api")}
+        cwd0 = os.getcwd()
+        try:
+            policy_gate.REPO = "o/r"
+            policy_gate.PR_NUMBER = 7
+            policy_gate.HEAD_SHA = head_sha
+            policy_gate.BASE_SHA = main_tip
+            policy_gate.PR_AUTHOR = "bot"
+            policy_gate.BASE_REF = "main"
+            policy_gate.gh_api = lambda path, _p=payload: _p
+            os.chdir(co)
+            try:
+                policy_gate.check_integrity_baseline()
+                return True
+            except SystemExit:
+                return False
+        finally:
+            os.chdir(cwd0)
+            for k, v in saved.items():
+                setattr(policy_gate, k, v)
+
+
+check("#211 生产路径：兄弟 PR 场景基线通过",
+      _mb_integration_case("sibling") is True)
+check("#211 生产路径：真删除被阻断",
+      _mb_integration_case("delete") is False)
+check("#211 生产路径：compare 响应缺失被阻断",
+      _mb_integration_case("badpayload") is False)
+check("#211 生产路径：API/本地 merge-base 不一致被阻断",
+      _mb_integration_case("mismatch") is False)
+
 print()
 print(f"通过 {len(PASS)}/{len(PASS) + len(FAIL)}")
 if FAIL:
