@@ -164,17 +164,33 @@ def test_r2_pair_binding_cannot_be_spent_cross_pair():
         evidence_refs=["synthetic://r"])
     with pytest.raises(trust.TrustError):
         minted.apply_pair(_sighting("c#1"), _sighting("d#1"))
-    # batch 插入绑定 pair，且与既有不同对象冲突时拒绝
-    batch_map = {}
-    minted.put_into_batch(batch_map)
+
+
+def test_r3_batch_spend_through_wrapper_only():
+    """B1/R3: batch 只能经 apply_batch 消费；无任何公共出口外发裸对象。"""
+    ctx = _ctx()
+    minted = trust.mint_human_decision(
+        ctx, left_ref="a#1", right_ref="b#1", link="same",
+        evidence_refs=["synthetic://r"])
+    # R1/R2 的提取路线全部关闭
+    assert not hasattr(minted, "for_pair")
+    assert not hasattr(minted, "put_into_batch")
+    assert not hasattr(minted, "authorization")
+    # 正向：apply_batch 在绑定 pair 上生效
+    out = trust.apply_batch(
+        [minted], [_sighting("a#1"), _sighting("b#1")])
+    assert out["groups"][0]["verdict"] == "MERGE_ALLOWED"
+    # 冲突：同 pair 两个不同铸造决定 -> 拒绝
     other = trust.mint_human_decision(
         ctx, left_ref="b#1", right_ref="a#1", link="not_same",
         evidence_refs=["synthetic://r2"])
     with pytest.raises(trust.TrustError):
-        other.put_into_batch(batch_map)
-    out = pc.assess_batch(
-        [_sighting("a#1"), _sighting("b#1")], human_decisions=batch_map)
-    assert out["groups"][0]["verdict"] == "MERGE_ALLOWED"
+        trust.apply_batch(
+            [minted, other], [_sighting("a#1"), _sighting("b#1")])
+    # 裸对象/普通 dict 混入 apply_batch -> 拒绝
+    with pytest.raises(trust.TrustError):
+        trust.apply_batch(
+            [{"link": "same"}], [_sighting("a#1"), _sighting("b#1")])
 
 
 def test_r2_verified_id_audit_ids_are_distinct():

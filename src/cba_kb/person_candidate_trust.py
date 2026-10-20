@@ -110,11 +110,12 @@ class MintedAuthorization:
     """An authorization bound to one pair of source_refs, plus its audit.
 
     The wrapped authorization object is NOT handed out (B1): it can
-    only be spent through :meth:`apply_pair` / :meth:`put_into_batch`,
-    which verify the target pair against the bound pair first. This
-    keeps the binding attached to the authorization for its whole life
-    on the sanctioned path. (In-boundary code can still reach privates
-    — the module docstring's honest boundary applies.)
+    only be spent through :meth:`apply_pair` (single pair) or
+    :func:`apply_batch` (batch, mappings built and consumed inside the
+    trust module) — both verify the target pair against the bound pair
+    first. This keeps the binding attached to the authorization for its
+    whole life on the sanctioned path. (In-boundary code can still
+    reach privates — the module docstring's honest boundary applies.)
     """
 
     _authorization: Any  # AuthorizedHumanDecision | AuthorizedTrustedLink
@@ -147,18 +148,40 @@ class MintedAuthorization:
             kwargs["trusted_link"] = self._authorization
         return assess_pair(left_sighting, right_sighting, **kwargs)
 
-    def put_into_batch(self, mapping: Dict[Tuple[str, str], Any]) -> None:
-        """Insert this authorization into a batch decisions/links map
-        under its bound pair. Refuses to overwrite a different object
-        already present under either orientation of the pair.
-        """
-        for key in (self.source_refs, self.source_refs[::-1]):
-            existing = mapping.get(key)
-            if existing is not None and existing is not self._authorization:
+
+def apply_batch(minted: Iterable[MintedAuthorization],
+                sightings: Iterable[Mapping[str, Any]], *,
+                verified_external_ids: Optional[Iterable[str]] = None):
+    """Spend a set of minted authorizations via assess_batch (B1).
+
+    The batch mappings are built and consumed INSIDE this function —
+    the wrapped authorizations never enter caller-owned storage, so
+    there is no extraction route (the R2 put_into_batch design leaked
+    the raw object into a caller dict and is removed). Each minted
+    item lands only under its own bound pair; assess_batch's canonical
+    keying then confines it to exactly that pair of sightings. Two
+    minted items binding the same pair with different authorizations
+    -> TrustError.
+    """
+    from .person_candidate import assess_batch
+    decisions: Dict[Tuple[str, str], Any] = {}
+    links: Dict[Tuple[str, str], Any] = {}
+    for item in minted:
+        if not isinstance(item, MintedAuthorization):
+            raise TrustError(
+                "APPLY_BATCH_REQUIRES_MINTED:raw authorizations and "
+                "plain dicts are not accepted here")
+        target = decisions if item.kind == "human_decision" else links
+        for key in (item.source_refs, item.source_refs[::-1]):
+            existing = target.get(key)
+            if existing is not None and existing is not item._authorization:
                 raise TrustError(
                     "MINTED_AUTHORIZATION_BATCH_CONFLICT:"
-                    f"{self.source_refs!r}")
-        mapping[self.source_refs] = self._authorization
+                    f"{item.source_refs!r}")
+        target[item.source_refs] = item._authorization
+    return assess_batch(list(sightings), human_decisions=decisions,
+                        trusted_links=links,
+                        verified_external_ids=verified_external_ids)
 
 
 @dataclass(frozen=True)
@@ -293,5 +316,6 @@ __all__ = [
     "mint_human_decision",
     "mint_trusted_link",
     "attest_verified_ids",
+    "apply_batch",
     "PersonCandidateError",
 ]
