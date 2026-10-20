@@ -40,7 +40,8 @@ def _lineage_of(record, source_file):
     """Return the lineage dict for a record, or None if incomplete."""
     sheet = record.get("source_sheet")
     row = record.get("source_row")
-    if not isinstance(sheet, str) or not sheet:
+    # B-01: whitespace-only strings are NOT lineage — strip-checked.
+    if not isinstance(sheet, str) or not sheet.strip():
         return None
     if not isinstance(row, int) or isinstance(row, bool) or row < 1:
         return None
@@ -51,12 +52,13 @@ def _lineage_of(record, source_file):
 def _index_id(lineage):
     # Identity of a candidate is its source location only. Two records
     # claiming the same (sheet, row) must collide -> duplicate detected.
-    parts = "|".join([
-        INDEX_SCHEMA,
-        lineage["source_file"],
-        lineage["source_sheet"],
-        str(lineage["source_row"]),
-    ])
+    # B-03: canonical JSON array serialization — unambiguous encoding,
+    # so ("a|b","c") and ("a","b|c") can never produce the same input.
+    import json as _json
+    parts = _json.dumps(
+        [INDEX_SCHEMA, lineage["source_file"], lineage["source_sheet"],
+         lineage["source_row"]],
+        ensure_ascii=False, separators=(",", ":"))
     return "article_" + content_hash(parts)[:24]
 
 
@@ -76,7 +78,7 @@ def build_article_index(articles, *, source_file):
     """
     if not isinstance(articles, list):
         raise ArticleIndexError("ARTICLE_RECORDS_LIST_REQUIRED")
-    if not isinstance(source_file, str) or not source_file:
+    if not isinstance(source_file, str) or not source_file.strip():
         raise ArticleIndexError("ARTICLE_SOURCE_FILE_REQUIRED")
     candidates: List[Dict[str, Any]] = []
     rejected: List[Dict[str, Any]] = []
@@ -94,6 +96,16 @@ def build_article_index(articles, *, source_file):
                 "reason": "ARTICLE_NO_LINEAGE",
             })
             continue
+        # B-02: reserve the source location as soon as lineage is
+        # established — BEFORE title validation. A rejected record still
+        # occupies its row; a second record claiming the same row is an
+        # integrity conflict regardless of the first record's fate.
+        index_id = _index_id(lineage)
+        if index_id in seen_ids:
+            raise ArticleIndexError(
+                "ARTICLE_DUPLICATE_SOURCE_ROW:"
+                f"{lineage['source_sheet']}!{lineage['source_row']}")
+        seen_ids.add(index_id)
         title = record.get("title")
         if not isinstance(title, str) or not title.strip():
             rejected.append({
@@ -103,12 +115,6 @@ def build_article_index(articles, *, source_file):
                 "reason": "ARTICLE_NO_TITLE",
             })
             continue
-        index_id = _index_id(lineage)
-        if index_id in seen_ids:
-            raise ArticleIndexError(
-                "ARTICLE_DUPLICATE_SOURCE_ROW:"
-                f"{lineage['source_sheet']}!{lineage['source_row']}")
-        seen_ids.add(index_id)
         candidates.append({
             "index_id": index_id,
             # Verbatim text: no numeric normalization, no guessing.
@@ -149,8 +155,9 @@ def resolve_lineage(candidate):
     source_file = lineage.get("source_file")
     source_sheet = lineage.get("source_sheet")
     source_row = lineage.get("source_row")
-    if (not isinstance(source_file, str) or not source_file
-            or not isinstance(source_sheet, str) or not source_sheet
+    if (not isinstance(source_file, str) or not source_file.strip()
+            or not isinstance(source_sheet, str)
+            or not source_sheet.strip()
             or not isinstance(source_row, int)
             or isinstance(source_row, bool) or source_row < 1):
         raise ArticleIndexError("ARTICLE_LINEAGE_INCOMPLETE")

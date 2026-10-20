@@ -211,3 +211,34 @@ def test_ac25_person_to_unverified_article_to_source(tmp_path):
 def test_person_without_articles_gets_no_associations(tmp_path):
     index = workbook_index(tmp_path)
     assert candidate_articles_for_person(index, '查无此人') == []
+
+
+def test_r2_whitespace_lineage_rejected():
+    """B-01: 空白 sheet/file 不是血缘。"""
+    rec = {"article_id": "WX001", "title": "S", "source_sheet": "   ",
+           "source_row": 2}
+    idx = build_article_index([rec], source_file="synthetic.xlsx")
+    assert idx["candidates"] == []
+    assert idx["rejected"][0]["reason"] == "ARTICLE_NO_LINEAGE"
+    with pytest.raises(ArticleIndexError):
+        build_article_index([rec], source_file="   ")
+
+
+def test_r2_duplicate_escapes_via_rejected_record():
+    """B-02: 被拒记录也占位，同行第二条必须报重复。"""
+    base = {"article_id": "WX001", "source_sheet": "Sheet1", "source_row": 3}
+    with pytest.raises(ArticleIndexError):
+        build_article_index(
+            [{**base, "title": ""},
+             {**base, "article_id": "WX002", "title": "Valid"}],
+            source_file="s.xlsx")
+
+
+def test_r2_index_id_no_delimiter_ambiguity():
+    """B-03: ("a|b","c") 与 ("a","b|c") 不得同 ID。"""
+    def mk(sheet):
+        return [{"article_id": "WX001", "title": "S",
+                 "source_sheet": sheet, "source_row": 2}]
+    a = build_article_index(mk("c"), source_file="a|b")
+    b = build_article_index(mk("b|c"), source_file="a")
+    assert a["candidates"][0]["index_id"] != b["candidates"][0]["index_id"]
