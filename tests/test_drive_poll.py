@@ -152,7 +152,7 @@ def test_poll_tombstones_removed_file(env):
     assert registry["f1"]["verify_status"] == "FILE_REMOVED"
     # Tombstoned files are excluded from search results.
     from cba_kb.drive_search import search_drive_registry
-    res = search_drive_registry(registry, "report")
+    res = search_drive_registry(registry, "report", principal="alice")
     assert res["results"] == []
 
 
@@ -361,10 +361,12 @@ def test_rediscovery_preserves_rights_grant(env):
     source.add_change("a", version="1")
     _poll(source, drive, env)
     # Operator grants rights via the real grant path.
-    grant_rights(env["registry"], env["ledger"], "a", approver="op")
+    grant_rights(env["registry"], env["ledger"], "a", approver="op",
+                 allowed_principals=["alice"])
     registry = json.loads(env["registry"].read_text(encoding="utf-8"))
     assert registry["a"]["rights_status"] == "approved"
-    assert search_drive_registry(registry, "report")["results"]
+    assert search_drive_registry(registry, "report",
+                                 principal="alice")["results"]
     # File modified on Drive -> re-discovery.
     drive.files["a"] = _file_meta("a", version="2")
     source.add_change("a", version="2")
@@ -372,7 +374,7 @@ def test_rediscovery_preserves_rights_grant(env):
     registry = json.loads(env["registry"].read_text(encoding="utf-8"))
     assert registry["a"]["rights_status"] == "approved"
     assert registry["a"]["rights_grant"]["approver"] == "op"
-    out = search_drive_registry(registry, "report")
+    out = search_drive_registry(registry, "report", principal="alice")
     assert [r["file_id"] for r in out["results"]] == ["a"]
 
 

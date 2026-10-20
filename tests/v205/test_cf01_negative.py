@@ -248,3 +248,235 @@ def test_grant_rights_rejects_bad_principals(tmp_path):
     with pytest.raises(ValueError, match="PRINCIPALS"):
         grant_rights(reg_path, ledger, "f1", approver="op-1",
                      allowed_principals=[])
+
+
+# === (d) search_drive_registry: principal-required + fully-excluding ACL ===
+# R2 remediation for Q2 R1 blockers B1 (CRITICAL) + B2 (HIGH).
+# Contract: principal is a required query parameter; every file is
+# authorized for the querying principal BEFORE matching/classification.
+# Files the principal cannot read are entirely invisible: no results,
+# no excluded.details, no review_listing, no counts, no total_considered.
+
+from cba_kb.drive_discovery import ACCESS_VERIFIED  # noqa: E402
+from cba_kb.drive_search import (  # noqa: E402
+    grant_rights as _grant_rights,
+    load_registry as _load_registry,
+    search_drive_registry,
+)
+
+
+def _rs_rec(name, file_id, grant, verify=ACCESS_VERIFIED, reason="OK"):
+    rec = {
+        "name": name,
+        "verify_status": verify,
+        "verify_reason": reason,
+        "rights_status": "approved",
+        "rights_grant": grant,
+    }
+    return rec
+
+
+def _restricted_registry():
+    """Reviewer's B1/B2 reproducer registry: file visible only to alice."""
+    return {
+        "restricted-file-001": _rs_rec(
+            "Confidential acquisition plan", "restricted-file-001",
+            {"approved": True, "approver": "operator",
+             "file_id": "restricted-file-001", "scope": "drive:read",
+             "allowed_principals": ["alice"]}),
+    }
+
+
+def test_regsearch_b1_reviewer_reproducer_zero_leak():
+    """Reviewer's exact B1 construction: guest must learn NOTHING.
+    The serialized response for a guest must equal the response over an
+    empty registry for the same query (no file_id, no name, no counts)."""
+    reg = _restricted_registry()
+    out_guest = search_drive_registry(reg, "Confidential", principal="guest")
+    out_empty = search_drive_registry({}, "Confidential", principal="guest")
+    assert out_guest["results"] == []
+    assert out_guest == out_empty, "unauthorized file shifted the response"
+    leaked = _serialized_contains(out_guest, "restricted-file-001",
+                                  "Confidential acquisition plan")
+    assert leaked == [], f"B1 leakage: {leaked}"
+
+
+def test_regsearch_principal_required():
+    reg = _restricted_registry()
+    with pytest.raises(ValueError, match="SEARCH_PRINCIPAL_REQUIRED"):
+        search_drive_registry(reg, "Confidential")
+    with pytest.raises(ValueError, match="SEARCH_PRINCIPAL_REQUIRED"):
+        search_drive_registry(reg, "Confidential", principal=None)
+    with pytest.raises(ValueError, match="SEARCH_PRINCIPAL_REQUIRED"):
+        search_drive_registry(reg, "Confidential", principal="")
+    with pytest.raises(ValueError, match="SEARCH_PRINCIPAL_REQUIRED"):
+        search_drive_registry(reg, "Confidential", principal="   ")
+    with pytest.raises(ValueError, match="SEARCH_PRINCIPAL_REQUIRED"):
+        search_drive_registry(reg, "Confidential", principal=42)
+
+
+def test_regsearch_unauthorized_does_not_shift_counts():
+    """Unauthorized files must not affect any counter (total or category)."""
+    reg = {
+        "f1": _rs_rec("Falcons report alice", "f1",
+                      _grant("f1", allowed_principals=("alice",))),
+        "f2": _rs_rec("Falcons report bob", "f2",
+                      _grant("f2", allowed_principals=("bob",))),
+    }
+    out = search_drive_registry(reg, "Falcons", principal="alice")
+    assert [r["file_id"] for r in out["results"]] == ["f1"]
+    assert out["total_considered"] == 1
+    assert out["excluded"]["no_match"] == 0
+    out_m = search_drive_registry(reg, "Falcons", principal="mallory")
+    assert out_m == search_drive_registry({}, "Falcons", principal="mallory")
+    out_b = search_drive_registry(reg, "Falcons", principal="bob")
+    assert [r["file_id"] for r in out_b["results"]] == ["f2"]
+
+
+def test_regsearch_verify_failed_no_leak_for_unauthorized():
+    """VERIFY_FAILED diagnostics are visible ONLY to authorized principals."""
+    reg = {
+        "f1": _rs_rec("Falcons ok", "f1",
+                      _grant("f1", allowed_principals=("alice",))),
+        "f2": _rs_rec("Falcons broken", "f2",
+                      _grant("f2", allowed_principals=("bob",)),
+                      verify="VERIFY_FAILED", reason="CHECKSUM_MISMATCH"),
+    }
+    # alice: sees her file; f2's failure diagnostic must not leak to her.
+    out = search_drive_registry(reg, "Falcons", principal="alice",
+                                include_review=True)
+    assert [r["file_id"] for r in out["results"]] == ["f1"]
+    leaked = _serialized_contains(out, "f2", "broken", "CHECKSUM_MISMATCH")
+    assert leaked == [], f"B2 leakage to unauthorized: {leaked}"
+    # bob (authorized): diagnostic visible.
+    out_b = search_drive_registry(reg, "Falcons", principal="bob",
+                                  include_review=True)
+    assert out_b["results"] == []
+    reasons = {d["file_id"]: d["reason"]
+               for d in out_b["excluded"]["details"]}
+    assert reasons.get("f2") == "VERIFY_FAILED:CHECKSUM_MISMATCH"
+    assert [r["file_id"] for r in out_b["review_listing"]] == ["f2"]
+
+
+def test_regsearch_review_required_gated_by_acl():
+    reg = {
+        "f1": _rs_rec("Falcons pending", "f1",
+                      _grant("f1", allowed_principals=("alice",)),
+                      verify="REVIEW_REQUIRED", reason="ACCESS_DENIED"),
+    }
+    out = search_drive_registry(reg, "Falcons", principal="alice",
+                                include_review=True)
+    assert out["results"] == []
+    assert [r["file_id"] for r in out["review_listing"]] == ["f1"]
+    out_m = search_drive_registry(reg, "Falcons", principal="mallory",
+                                  include_review=True)
+    assert out_m == search_drive_registry({}, "Falcons",
+                                           principal="mallory",
+                                           include_review=True)
+
+
+def test_regsearch_revoked_and_missing_grant_invisible():
+    reg = {
+        "f1": _rs_rec("Falcons revoked", "f1",
+                      _grant("f1", allowed_principals=("alice",),
+                             revoked=True)),
+        "f2": {"name": "Falcons no grant", "verify_status": ACCESS_VERIFIED,
+               "verify_reason": "OK", "rights_status": "approved"},
+    }
+    for p in ("alice", "mallory"):
+        out = search_drive_registry(reg, "Falcons", principal=p,
+                                    include_review=True)
+        assert out == search_drive_registry({}, "Falcons", principal=p,
+                                            include_review=True)
+
+
+def test_include_review_cannot_bypass_acl():
+    """include_review=True must not disclose review items to unauthorized."""
+    reg = {
+        "f1": _rs_rec("Falcons alice pending", "f1",
+                      _grant("f1", allowed_principals=("alice",)),
+                      verify="REVIEW_REQUIRED", reason="ACCESS_DENIED"),
+        "f2": _rs_rec("Falcons bob pending", "f2",
+                      _grant("f2", allowed_principals=("bob",)),
+                      verify="REVIEW_REQUIRED", reason="ACCESS_DENIED"),
+    }
+    out = search_drive_registry(reg, "Falcons", principal="alice",
+                                include_review=True)
+    assert [r["file_id"] for r in out["review_listing"]] == ["f1"]
+    assert _serialized_contains(out, "f2", "bob pending") == []
+
+
+def test_regsearch_authorized_positive_control():
+    """Positive control: authorized reads + diagnostics keep working."""
+    reg = _restricted_registry()
+    out = search_drive_registry(reg, "Confidential", principal="alice")
+    assert [r["file_id"] for r in out["results"]] == ["restricted-file-001"]
+    assert out["results"][0]["name"] == "Confidential acquisition plan"
+    assert out["results"][0]["rights_status"] == "approved"
+    assert out["total_considered"] == 1
+
+
+# --- CLI paths: drive-search gains --principal; both paths enforce ACL ------
+
+
+def _write_reg_file(tmp_path, records):
+    import json as _json
+    reg_path = tmp_path / "registry.json"
+    reg_path.write_text(_json.dumps(records, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+    return reg_path
+
+
+def _cli_main(argv):
+    import sys
+    from cba_kb import cli as _cli
+    old = sys.argv
+    sys.argv = argv
+    try:
+        _cli.main()
+    finally:
+        sys.argv = old
+
+
+def test_cli_drive_search_principal_arg_required(tmp_path, capsys):
+    reg_path = _write_reg_file(tmp_path, _restricted_registry())
+    with pytest.raises(SystemExit) as exc:
+        _cli_main(["cba-kb", "drive-search", "--registry", str(reg_path),
+                   "--query", "Confidential"])
+    assert exc.value.code == 2  # argparse: missing required --principal
+
+
+def test_cli_drive_search_enforces_acl(tmp_path, capsys):
+    """Two CLI search paths: guest learns nothing, alice sees her file."""
+    import json as _json
+    reg_path = _write_reg_file(tmp_path, _restricted_registry())
+    idx_path = tmp_path / "index.json"
+    si.save_index(idx_path,
+                  si.build_index(_restricted_registry(),
+                                 texts={"restricted-file-001":
+                                        "synthetic confidential"}))
+    # drive-search as guest
+    _cli_main(["cba-kb", "drive-search", "--registry", str(reg_path),
+               "--query", "Confidential", "--principal", "guest"])
+    out = _json.loads(capsys.readouterr().out)
+    leaked = [n for n in ("restricted-file-001",
+                          "Confidential acquisition plan")
+              if n in _json.dumps(out, ensure_ascii=False)]
+    assert leaked == [] and out["results"] == []
+    # drive-search as alice
+    _cli_main(["cba-kb", "drive-search", "--registry", str(reg_path),
+               "--query", "Confidential", "--principal", "alice"])
+    out_a = _json.loads(capsys.readouterr().out)
+    assert [r["file_id"] for r in out_a["results"]] == ["restricted-file-001"]
+    # drive-search-index as guest
+    _cli_main(["cba-kb", "drive-search-index", "--index", str(idx_path),
+               "--registry", str(reg_path), "--query", "confidential",
+               "--principal", "guest"])
+    out_i = _json.loads(capsys.readouterr().out)
+    assert out_i["results"] == []
+    # drive-search-index as alice
+    _cli_main(["cba-kb", "drive-search-index", "--index", str(idx_path),
+               "--registry", str(reg_path), "--query", "confidential",
+               "--principal", "alice"])
+    out_ia = _json.loads(capsys.readouterr().out)
+    assert [r["file_id"] for r in out_ia["results"]] == ["restricted-file-001"]

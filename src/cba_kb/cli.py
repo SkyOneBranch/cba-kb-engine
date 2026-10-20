@@ -83,6 +83,11 @@ def main():
     q=sub.add_parser('drive-search')
     q.add_argument('--registry',type=Path,required=True)
     q.add_argument('--query',required=True)
+    # CF-01 R2: principal is required; search_drive_registry enforces
+    # per-file ACL and rejects missing/empty principals. This CLI is a
+    # trusted-operator tool: --principal is a declaration, not an
+    # authentication proof (see trust-boundary note in drive_search).
+    q.add_argument('--principal',required=True)
     q.add_argument('--include-review',action='store_true')
     q.add_argument('--mime-prefix',default=None)
     q.add_argument('--limit',type=int,default=50)
@@ -556,7 +561,7 @@ def main():
         elif a.command=='drive-search':
             from .drive_search import load_registry, search_drive_registry
             result=search_drive_registry(
-                load_registry(a.registry), a.query,
+                load_registry(a.registry), a.query, a.principal,
                 include_review=a.include_review, mime_prefix=a.mime_prefix,
                 limit=a.limit)
         elif a.command=='drive-build-index':
