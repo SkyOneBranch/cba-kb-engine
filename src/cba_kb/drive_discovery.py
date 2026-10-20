@@ -442,7 +442,8 @@ def _scope_covers(scope: Any) -> bool:
     return False
 
 
-def _valid_grant_record(obj: Dict[str, Any], grant: Any) -> bool:
+def _valid_grant_record(obj: Dict[str, Any], grant: Any,
+                        principal: Optional[str] = None) -> bool:
     """Strict validation for one grant record. Anything else is not a grant.
 
     A grant is valid only when it is a dict carrying ALL of:
@@ -457,6 +458,14 @@ def _valid_grant_record(obj: Dict[str, Any], grant: Any) -> bool:
       entry — substring lookalikes and non-string values never match.
     ``ACCESS_VERIFIED`` (a content-verification outcome) and a rights grant
     (an authorization decision) are never derived from each other.
+
+    CF-01 per-principal enforcement (fail-closed): when a querying
+    ``principal`` is supplied, the grant is valid for that principal ONLY
+    if the grant names it in ``allowed_principals``. A missing ``allowed``
+    set, a non-collection ``allowed`` set (a bare string would permit
+    substring matching — rejected), or a principal absent from the set all
+    fail closed to False. No ``principal`` supplied -> document-level check
+    only (build/discovery paths carry no query principal).
     """
     if not isinstance(grant, dict):
         return False
@@ -474,11 +483,20 @@ def _valid_grant_record(obj: Dict[str, Any], grant: Any) -> bool:
         return False
     if not _scope_covers(grant.get("scope")):
         return False
+    if principal is not None:
+        if not isinstance(principal, str) or not principal:
+            return False
+        allowed = grant.get("allowed_principals")
+        if not isinstance(allowed, (list, tuple, set, frozenset)):
+            return False
+        if principal not in allowed:
+            return False
     return True
 
 
 def decide_drive_rights(
-    obj: Dict[str, Any], *, grants: Optional[Dict[str, Any]] = None
+    obj: Dict[str, Any], *, grants: Optional[Dict[str, Any]] = None,
+    principal: Optional[str] = None,
 ) -> Tuple[str, str]:
     """DEFAULT-DENY rights decision for a discovered Drive object.
 
@@ -487,10 +505,17 @@ def decide_drive_rights(
     revoked, expired, scope-mismatched, or object-mismatched entries are all
     ("review", "DRIVE_RIGHTS_UNVERIFIED"). Unknown rights are never
     auto-approved, and "no grant system configured" is not a grant.
+
+    CF-01: when ``principal`` is supplied (the query path), the grant must
+    additionally name that principal in ``allowed_principals``; otherwise
+    the decision is ("review", "DRIVE_RIGHTS_UNVERIFIED") — fail-closed.
+    Callers without a query principal (build/discovery/poll) get the
+    document-level decision, unchanged.
     """
     file_id = obj.get("file_id") if isinstance(obj, dict) else None
     grant = (grants or {}).get(file_id) if file_id else None
-    if grant is not None and _valid_grant_record(obj, grant):
+    if grant is not None and _valid_grant_record(obj, grant,
+                                                 principal=principal):
         return "approved", "DRIVE_RIGHTS_GRANTED"
     return "review", "DRIVE_RIGHTS_UNVERIFIED"
 

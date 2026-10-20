@@ -44,12 +44,18 @@ def _write_registry(path, registry):
     return path
 
 
-def _approved_via_grant(tmp_path, file_id="f1", name="Shanghai Falcons report"):
-    """Build a registry + real grant through grant_rights (the production path)."""
+def _approved_via_grant(tmp_path, file_id="f1", name="Shanghai Falcons report",
+                        allowed_principals=("alice",)):
+    """Build a registry + real grant through grant_rights (the production path).
+
+    CF-01 R2: grants are scoped to allowed_principals; queries must pass the
+    same principal for the file to be visible.
+    """
     registry_path = tmp_path / "registry.json"
     ledger_path = tmp_path / "ledger.jsonl"
     _write_registry(registry_path, {file_id: _rec(file_id, name)})
-    result = grant_rights(registry_path, ledger_path, file_id, approver="op-1")
+    result = grant_rights(registry_path, ledger_path, file_id, approver="op-1",
+                          allowed_principals=list(allowed_principals))
     assert result["rights_status"] == "approved"
     registry = json.loads(registry_path.read_text(encoding="utf-8"))
     return registry, ledger_path
@@ -59,17 +65,19 @@ def _approved_via_grant(tmp_path, file_id="f1", name="Shanghai Falcons report"):
 
 def test_search_returns_only_strictly_approved(tmp_path):
     registry, _ = _approved_via_grant(tmp_path)
-    out = search_drive_registry(registry, "Falcons")
+    out = search_drive_registry(registry, "Falcons", principal="alice")
     assert [r["file_id"] for r in out["results"]] == ["f1"]
 
 
 def test_search_default_deny_with_no_grants():
+    # CF-01 R2: a file with no grant is invisible to any principal — it
+    # contributes nothing: no results, no rights_excluded count, no details.
     out = search_drive_registry({"f1": _rec("f1", "Shanghai Falcons report")},
-                                "Falcons")
+                                "Falcons", principal="alice")
     assert out["results"] == []
-    assert out["excluded"]["rights_excluded"] == 1
-    assert out["excluded"]["details"][0]["reason"].startswith(
-        "RIGHTS_EXCLUDED:")
+    assert out["total_considered"] == 0
+    assert out["excluded"]["rights_excluded"] == 0
+    assert out["excluded"]["details"] == []
 
 
 def test_search_evil_grants_are_all_excluded():
@@ -93,36 +101,46 @@ def test_search_evil_grants_are_all_excluded():
         rec = _rec("f1", "Shanghai Falcons report", rights="approved")
         if grant is not None:
             rec["rights_grant"] = grant
-        out = search_drive_registry({"f1": rec}, "Falcons")
+        # CF-01 R2: evil/invalid grants make the file invisible to the
+        # querying principal — never results, never details, never counts.
+        out = search_drive_registry({"f1": rec}, "Falcons", principal="alice")
         assert out["results"] == [], label
-        assert out["excluded"]["rights_excluded"] == 1, label
-        assert "RIGHTS_" in out["excluded"]["details"][0]["reason"], label
+        assert out["total_considered"] == 0, label
+        assert out["excluded"]["rights_excluded"] == 0, label
+        assert out["excluded"]["details"] == [], label
 
 
 def test_search_grant_for_other_file_does_not_transfer():
     rec = _rec("f1", "Shanghai Falcons report", rights="approved")
     rec["rights_grant"] = {"approved": True, "approver": "op", "file_id": "f2",
-                           "scope": "drive:read"}
-    out = search_drive_registry({"f1": rec}, "Falcons")
+                           "scope": "drive:read",
+                           "allowed_principals": ["alice"]}
+    out = search_drive_registry({"f1": rec}, "Falcons", principal="alice")
     assert out["results"] == []
 
 
 def test_excluded_reasons_distinguish_failures():
     """Q2 finding 5: CHECKSUM_MISMATCH vs REVISION_DRIFT must be
-    distinguishable in the output."""
+    distinguishable in the output (for the AUTHORIZED principal)."""
+    def _f(fid, name, reason):
+        rec = _rec(fid, name, verify="VERIFY_FAILED",
+                   reason=reason, rights="approved")
+        rec["rights_grant"] = {"approved": True, "approver": "op",
+                               "file_id": fid, "scope": "drive:read",
+                               "allowed_principals": ["alice"]}
+        return rec
     registry = {
-        "f1": _rec("f1", "Falcons report", verify="VERIFY_FAILED",
-                   reason="CHECKSUM_MISMATCH", rights="approved"),
-        "f2": _rec("f2", "Falcons notes", verify="VERIFY_FAILED",
-                   reason="REVISION_DRIFT", rights="approved"),
+        "f1": _f("f1", "Falcons report", "CHECKSUM_MISMATCH"),
+        "f2": _f("f2", "Falcons notes", "REVISION_DRIFT"),
     }
-    out = search_drive_registry(registry, "Falcons")
+    out = search_drive_registry(registry, "Falcons", principal="alice")
     assert out["results"] == []
     reasons = {d["file_id"]: d["reason"] for d in out["excluded"]["details"]}
     assert reasons == {"f1": "VERIFY_FAILED:CHECKSUM_MISMATCH",
                        "f2": "VERIFY_FAILED:REVISION_DRIFT"}
     # include_review lists failed items with their reasons (never as results)
-    out = search_drive_registry(registry, "Falcons", include_review=True)
+    out = search_drive_registry(registry, "Falcons", principal="alice",
+                                include_review=True)
     listed = {r["file_id"]: r["verify_reason"] for r in out["review_listing"]}
     assert listed == {"f1": "CHECKSUM_MISMATCH", "f2": "REVISION_DRIFT"}
     assert out["results"] == []
@@ -136,10 +154,13 @@ def test_include_review_lists_but_never_returns_review_items(tmp_path):
         "f2": _rec("f2", "Shanghai Falcons notes",
                    verify="REVIEW_REQUIRED", reason="ACCESS_DENIED"),
     })
-    grant_rights(registry_path, ledger_path, "f1", approver="op-1")
-    grant_rights(registry_path, ledger_path, "f2", approver="op-1")
+    grant_rights(registry_path, ledger_path, "f1", approver="op-1",
+                 allowed_principals=["alice"])
+    grant_rights(registry_path, ledger_path, "f2", approver="op-1",
+                 allowed_principals=["alice"])
     registry = json.loads(registry_path.read_text(encoding="utf-8"))
-    out = search_drive_registry(registry, "Falcons", include_review=True)
+    out = search_drive_registry(registry, "Falcons", principal="alice",
+                                include_review=True)
     assert [r["file_id"] for r in out["results"]] == ["f1"]
     assert [r["file_id"] for r in out["review_listing"]] == ["f2"]
     assert out["review_listing"][0]["verify_reason"] == "ACCESS_DENIED"
@@ -156,7 +177,8 @@ def test_search_rejects_empty_query_and_bad_limit():
 
 def test_search_mime_prefix_filter(tmp_path):
     registry, _ = _approved_via_grant(tmp_path)
-    out = search_drive_registry(registry, "Falcons", mime_prefix="image/")
+    out = search_drive_registry(registry, "Falcons", principal="alice",
+                                mime_prefix="image/")
     assert out["results"] == []
     assert out["excluded"]["no_match"] == 1
 
@@ -213,14 +235,15 @@ def test_grant_rights_heals_stale_approval_with_audit(tmp_path):
     rec["rights_reason"] = "DRIVE_RIGHTS_GRANTED"
     rec["rights_grant"] = {"approver": "op", "note": "", "ts": "t"}  # old format
     _write_registry(registry_path, {"f1": rec})
-    result = grant_rights(registry_path, ledger_path, "f1", approver="op-2")
+    result = grant_rights(registry_path, ledger_path, "f1", approver="op-2",
+                          allowed_principals=["alice"])
     assert result["rights_status"] == "approved"
     events = [json.loads(line) for line in
               ledger_path.read_text(encoding="utf-8").splitlines()]
     assert len([e for e in events if e["action"] == "drive_rights_granted"]) == 1
     # Now strictly valid: searchable.
     registry = json.loads(registry_path.read_text(encoding="utf-8"))
-    out = search_drive_registry(registry, "Falcons")
+    out = search_drive_registry(registry, "Falcons", principal="alice")
     assert [r["file_id"] for r in out["results"]] == ["f1"]
 
 
