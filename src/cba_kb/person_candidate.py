@@ -394,6 +394,21 @@ def assess_pair(
             return result(MERGE_ALLOWED, "HUMAN_DECISION_SAME", merged=True)
         return result(DISTINCT, "HUMAN_DECISION_NOT_SAME")
 
+    # R3 (B6, R2-F2): a trusted association must NOT short-circuit the
+    # same-ID contradiction check. Objective identity contradictions
+    # (birth_month etc.) surface as CONFLICT before any trusted-link
+    # merge authorization. (The authorized Human decision above remains
+    # the final arbiter and may resolve such conflicts explicitly.)
+    if trusted_link is not None:
+        _lid = left_s.get("external_id")
+        _rid = right_s.get("external_id")
+        if _lid and _rid and _lid == _rid:
+            _conflicts = _identity_conflicts(left_s, right_s)
+            if _conflicts:
+                return result(
+                    CONFLICT, "CONFLICT_SAME_ID_CONTRADICTORY_FIELDS",
+                    conflict_fields=_conflicts)
+
     # An authorized trusted association permits merge (rule 3, B5).
     if trusted_link is not None:
         if not isinstance(trusted_link, AuthorizedTrustedLink):
@@ -477,6 +492,46 @@ def _index_key(i: int, j: int) -> Tuple[int, int]:
     return (i, j) if i < j else (j, i)
 
 
+def _canonicalize_pair_mapping(mapping, expected_type, name, valid_refs):
+    """R3 (B3/B5, R2-F1): canonicalize AND validate a caller-supplied pair
+    mapping (human_decisions / trusted_links).
+
+    Caller keys may arrive in either orientation; they are canonicalized
+    with _pair_key so a decision keyed ("z#1", "a#1") is found by the
+    canonical ("a#1", "z#1") lookup. Nothing is silently dropped:
+    malformed keys, keys referencing unknown source_refs, duplicate
+    canonical keys with conflicting values, and values of the wrong type
+    (including plain dicts, even ones that would never be matched) all
+    raise PersonCandidateError — fail-closed."""
+    if mapping is None:
+        return {}
+    if not isinstance(mapping, Mapping):
+        raise PersonCandidateError(f"BATCH_{name.upper()}_MUST_BE_MAPPING")
+    ref_set = set(valid_refs)
+    out = {}
+    for raw_key, value in mapping.items():
+        if (not isinstance(raw_key, tuple) or len(raw_key) != 2
+                or not all(isinstance(r, str) and r for r in raw_key)):
+            raise PersonCandidateError(
+                f"BATCH_{name.upper()}_BAD_KEY:{raw_key!r}")
+        if raw_key[0] == raw_key[1]:
+            raise PersonCandidateError(
+                f"BATCH_{name.upper()}_SELF_PAIR:{raw_key!r}")
+        if raw_key[0] not in ref_set or raw_key[1] not in ref_set:
+            raise PersonCandidateError(
+                f"BATCH_{name.upper()}_UNKNOWN_REF:{raw_key!r}")
+        if not isinstance(value, expected_type):
+            raise PersonCandidateError(
+                f"BATCH_{name.upper()}_VALUE_MUST_BE_"
+                f"{expected_type.__name__}:{raw_key!r}")
+        key = _pair_key(raw_key[0], raw_key[1])
+        if key in out and out[key] is not value:
+            raise PersonCandidateError(
+                f"BATCH_{name.upper()}_CONFLICTING_DUPLICATE:{key!r}")
+        out[key] = value
+    return out
+
+
 def assess_batch(
     sightings: List[Mapping[str, Any]],
     *,
@@ -505,8 +560,10 @@ def assess_batch(
         raise PersonCandidateError("BATCH_DUPLICATE_SOURCE_REF")
     verified_ids = _validate_verified_ids(verified_external_ids)
 
-    human_decisions = dict(human_decisions or {})
-    trusted_links = dict(trusted_links or {})
+    human_decisions = _canonicalize_pair_mapping(
+        human_decisions, AuthorizedHumanDecision, "human_decisions", refs)
+    trusted_links = _canonicalize_pair_mapping(
+        trusted_links, AuthorizedTrustedLink, "trusted_links", refs)
 
     parent = list(range(len(validated)))
     edge_verdict: Dict[Tuple[int, int], str] = {}

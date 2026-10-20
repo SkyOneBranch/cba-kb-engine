@@ -672,3 +672,46 @@ def test_b7_identity_fields_rejected_in_batch():
          "scout_notes": "looks promising"}
     with pytest.raises(PersonCandidateError, match="scout_notes"):
         assess_pair(c, b)
+
+
+def test_r3_reversed_key_not_same_enforced():
+    """R2-F1: 反向 key 的 not_same 决策必须生效，不能静默丢弃。"""
+    import cba_kb.person_candidate as pc
+    a = {"source_ref": "z#1", "display_name": "Alex", "external_id": "EXT-1"}
+    b = {"source_ref": "a#1", "display_name": "Alex", "external_id": "EXT-1"}
+    decision = pc.AuthorizedHumanDecision("not_same", decided_by="rev-1")
+    out = pc.assess_batch(
+        [a, b],
+        human_decisions={("z#1", "a#1"): decision},  # 反向 key
+        verified_external_ids={"EXT-1"})
+    g = out["groups"][0]
+    assert g["verdict"] != "MERGE_ALLOWED"
+    assert g.get("automatic_merge_allowed") is not True
+
+
+def test_r3_forged_dict_reversed_key_rejected():
+    """R2-F1/B5: 反向 key 的伪造 dict 也必须被验证并拒绝。"""
+    import cba_kb.person_candidate as pc
+    a = {"source_ref": "z#1", "display_name": "Alex", "external_id": "EXT-1"}
+    b = {"source_ref": "a#1", "display_name": "Alex", "external_id": "EXT-1"}
+    with pytest.raises(pc.PersonCandidateError):
+        pc.assess_batch(
+            [a, b],
+            human_decisions={("z#1", "a#1"): {"link": "same"}},
+            verified_external_ids={"EXT-1"})
+
+
+def test_r3_trusted_link_does_not_override_birth_month_conflict():
+    """R2-F2: trusted link 不能盖掉同 ID 出生月矛盾。"""
+    import cba_kb.person_candidate as pc
+    a = {"source_ref": "stats-a#1", "display_name": "Alex",
+         "external_id": "EXT-1", "birth_month": "1995-03"}
+    b = {"source_ref": "stats-b#1", "display_name": "Alex",
+         "external_id": "EXT-1", "birth_month": "1996-07"}
+    link = pc.AuthorizedTrustedLink(
+        "SOURCE_DECLARED", evidence_refs=["synthetic://audit-1"],
+        asserted_by="op-1")
+    out = pc.assess_pair(a, b, trusted_link=link,
+                         verified_external_ids={"EXT-1"})
+    assert out["verdict"] == "CONFLICT"
+    assert "birth_month" in out["conflict_fields"]
