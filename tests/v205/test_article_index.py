@@ -242,3 +242,27 @@ def test_r2_index_id_no_delimiter_ambiguity():
     a = build_article_index(mk("c"), source_file="a|b")
     b = build_article_index(mk("b|c"), source_file="a")
     assert a["candidates"][0]["index_id"] != b["candidates"][0]["index_id"]
+
+
+def test_r3_index_id_no_normalization_conflation():
+    """B-03/R3: 归一化会混同的坐标必须 ID 不同、同批构建不误报重复。"""
+    def record(sheet):
+        return {"article_id": "WX001", "title": "Synthetic",
+                "source_sheet": sheet, "source_row": 2}
+    def cand(sheet):
+        return build_article_index(
+            [record(sheet)], source_file="synthetic.xlsx"
+        )["candidates"][0]
+    # 全角 vs 半角
+    assert cand("A")["index_id"] != cand("Ａ")["index_id"]
+    # 单空格 vs 双空格
+    assert cand("a b")["index_id"] != cand("a  b")["index_id"]
+    # 同批构建不误报重复
+    idx = build_article_index([record("A"), record("Ａ")],
+                              source_file="synthetic.xlsx")
+    assert len(idx["candidates"]) == 2
+    # 相同坐标仍确定性判重
+    assert cand("A")["index_id"] == cand("A")["index_id"]
+    with pytest.raises(ArticleIndexError):
+        build_article_index([record("A"), record("A")],
+                            source_file="synthetic.xlsx")

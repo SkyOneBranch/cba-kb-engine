@@ -54,12 +54,18 @@ def _index_id(lineage):
     # claiming the same (sheet, row) must collide -> duplicate detected.
     # B-03: canonical JSON array serialization — unambiguous encoding,
     # so ("a|b","c") and ("a","b|c") can never produce the same input.
+    # R3: hash the RAW UTF-8 bytes — do NOT route through
+    # document_lane.content_hash, whose text normalization (NFKC +
+    # whitespace folding) would conflate distinct coordinates such as
+    # sheet "A" vs "Ａ" (fullwidth) or "a b" vs "a  b".
+    import hashlib as _hashlib
     import json as _json
     parts = _json.dumps(
         [INDEX_SCHEMA, lineage["source_file"], lineage["source_sheet"],
          lineage["source_row"]],
         ensure_ascii=False, separators=(",", ":"))
-    return "article_" + content_hash(parts)[:24]
+    digest = _hashlib.sha256(parts.encode("utf-8")).hexdigest()
+    return "article_" + digest[:24]
 
 
 def build_article_index(articles, *, source_file):
