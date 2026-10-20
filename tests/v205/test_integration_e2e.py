@@ -121,7 +121,7 @@ def test_attested_verified_ids_enable_merge():
     out = pc.assess_pair(
         _sighting("a#1", external_id="EXT-1"),
         _sighting("b#1", external_id="EXT-1"),
-        verified_external_ids=attestation.external_ids)
+        verified_external_ids=trust.attested_ids(attestation))
     assert out["verdict"] == "MERGE_ALLOWED"
 
 
@@ -220,6 +220,29 @@ def test_r4_no_reconstruction_or_mutation_route():
     # 审计以副本外发：改副本不影响原件
     minted.audit["operator"] = "tampered"
     assert minted.audit["operator"] == "synthetic-operator-1"
+
+
+def test_r5_wrappers_are_final_and_consumption_is_exact_typed():
+    """B1/R5: __class__ 替换路线——子类化本身被禁，消费点精确类型校验。"""
+    ctx = _ctx()
+    # 三个包装类全部禁止子类化（审查员的 Rebound* 类定义即失败）
+    for base in (trust.MintedAuthorization,
+                 trust.TrustedOperatorContext,
+                 trust.VerifiedIdAttestation):
+        with pytest.raises(TypeError):
+            type("Rebound", (base,), {"__slots__": ()})
+    # 正向路径不受影响
+    minted = trust.mint_human_decision(
+        ctx, left_ref="a#1", right_ref="b#1", link="same",
+        evidence_refs=["synthetic://r"])
+    out = trust.apply_batch(
+        [minted], [_sighting("a#1"), _sighting("b#1")])
+    assert out["groups"][0]["verdict"] == "MERGE_ALLOWED"
+    att = trust.attest_verified_ids(ctx, ["EXT-1"],
+                                    verification_ref="chk-1")
+    assert trust.attested_ids(att) == frozenset({"EXT-1"})
+    with pytest.raises(trust.TrustError):
+        trust.attested_ids({"external_ids": {"FORGED"}})
 
 
 def test_r2_verified_id_audit_ids_are_distinct():

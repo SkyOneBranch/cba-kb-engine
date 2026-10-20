@@ -77,6 +77,9 @@ class TrustedOperatorContext:
 
     __slots__ = ("_operator", "_established_via")
 
+    def __init_subclass__(cls, **kwargs):  # final: no subclass substitution
+        raise TypeError("TrustedOperatorContext is final")
+
     def __init__(self, operator: str, *, established_via: str,
                  _token: object = None) -> None:
         if _token is not _MINT_TOKEN:
@@ -124,17 +127,23 @@ class MintedAuthorization:
     first. This keeps the binding attached to the authorization for its
     whole life on the sanctioned path.
 
-    Controlled construction (B1/R4): this is deliberately NOT a
+    Controlled construction (B1/R4+R5): this is deliberately NOT a
     dataclass and exposes no reconstruction route — the binding lives
     in private slots behind read-only properties, construction
-    requires the module-private mint token, and the audit is handed
-    out as a copy. ``dataclasses.replace()``-style rebinding and
-    attribute assignment therefore fail closed. (In-boundary code can
-    still reach privates — the module docstring's honest boundary
-    applies.)
+    requires the module-private mint token, the audit is handed out as
+    a copy, the class is final (``__init_subclass__`` raises), and
+    every consumption point in this module exact-type-checks the
+    wrapper and reads the private binding rather than the public
+    properties. ``dataclasses.replace()``-style rebinding, attribute
+    assignment, and ``__class__`` substitution therefore fail closed.
+    (In-boundary code can still reach privates — the module
+    docstring's honest boundary applies.)
     """
 
     __slots__ = ("_authorization", "_kind", "_source_refs", "_audit")
+
+    def __init_subclass__(cls, **kwargs):  # final (B1/R5)
+        raise TypeError("MintedAuthorization is final")
 
     def __init__(self, authorization: Any, *, kind: str,
                  source_refs: Tuple[str, str], audit: Dict[str, Any],
@@ -174,6 +183,10 @@ class MintedAuthorization:
         source_refs must equal the bound pair (either orientation);
         anything else -> TrustError, and assess_pair is never called.
         """
+        if type(self) is not MintedAuthorization:
+            raise TrustError(
+                "MINTED_AUTHORIZATION_TYPE_SUBSTITUTED:exact wrapper "
+                "type required")
         from .person_candidate import assess_pair
         self._check_pair(left_sighting.get("source_ref"),
                          right_sighting.get("source_ref"))
@@ -204,18 +217,23 @@ def apply_batch(minted: Iterable[MintedAuthorization],
     decisions: Dict[Tuple[str, str], Any] = {}
     links: Dict[Tuple[str, str], Any] = {}
     for item in minted:
-        if not isinstance(item, MintedAuthorization):
+        # Exact-type + private-state consumption (B1/R5): a wrapper
+        # whose class was substituted (e.g. via __class__ reassignment
+        # to a property-overriding subclass) is rejected outright, and
+        # the binding is read from the private slots — never from the
+        # dynamically dispatchable public properties.
+        if type(item) is not MintedAuthorization:
             raise TrustError(
-                "APPLY_BATCH_REQUIRES_MINTED:raw authorizations and "
-                "plain dicts are not accepted here")
-        target = decisions if item.kind == "human_decision" else links
-        for key in (item.source_refs, item.source_refs[::-1]):
+                "APPLY_BATCH_REQUIRES_MINTED:raw authorizations, "
+                "plain dicts and substituted wrappers are not accepted")
+        target = decisions if item._kind == "human_decision" else links
+        for key in (item._source_refs, item._source_refs[::-1]):
             existing = target.get(key)
             if existing is not None and existing is not item._authorization:
                 raise TrustError(
                     "MINTED_AUTHORIZATION_BATCH_CONFLICT:"
-                    f"{item.source_refs!r}")
-        target[item.source_refs] = item._authorization
+                    f"{item._source_refs!r}")
+        target[item._source_refs] = item._authorization
     return assess_batch(list(sightings), human_decisions=decisions,
                         trusted_links=links,
                         verified_external_ids=verified_external_ids)
@@ -230,6 +248,9 @@ class VerifiedIdAttestation:
     """
 
     __slots__ = ("_external_ids", "_audit")
+
+    def __init_subclass__(cls, **kwargs):  # final (B1/R5)
+        raise TypeError("VerifiedIdAttestation is final")
 
     def __init__(self, external_ids: FrozenSet[str], *,
                  audit: Dict[str, Any], _token: object = None) -> None:
@@ -250,12 +271,26 @@ class VerifiedIdAttestation:
 
 
 def _require_context(ctx: Any) -> TrustedOperatorContext:
-    if not isinstance(ctx, TrustedOperatorContext):
+    if type(ctx) is not TrustedOperatorContext:
         raise TrustError(
             "TRUSTED_CONTEXT_REQUIRED:operator context must come from "
             "establish_operator_context(); caller-supplied dicts/strings "
-            "are self-declarations and establish nothing")
+            "and substituted wrappers establish nothing")
     return ctx
+
+
+def attested_ids(attestation: VerifiedIdAttestation) -> FrozenSet[str]:
+    """The sanctioned way to consume an attestation's ID set (B1/R5).
+
+    Exact-type check, then reads the private state — a wrapper whose
+    class was substituted to override the public ``external_ids``
+    property is rejected instead of believed.
+    """
+    if type(attestation) is not VerifiedIdAttestation:
+        raise TrustError(
+            "ATTESTATION_TYPE_SUBSTITUTED:exact attestation type "
+            "required")
+    return attestation._external_ids
 
 
 def _require_pair(left_ref: Any, right_ref: Any) -> Tuple[str, str]:
@@ -375,6 +410,7 @@ __all__ = [
     "mint_human_decision",
     "mint_trusted_link",
     "attest_verified_ids",
+    "attested_ids",
     "apply_batch",
     "PersonCandidateError",
 ]
