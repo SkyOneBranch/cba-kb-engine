@@ -47,7 +47,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, Iterable, Mapping, Optional, Tuple
 
 from .person_candidate import (
@@ -69,12 +68,14 @@ class TrustedOperatorContext:
     """Operator identity established by the controlled environment.
 
     Constructible only via :func:`establish_operator_context` (a
-    module-private token is required). This is a convention guard
-    against accidental or data-driven construction, not a security
-    proof — see the module docstring's honest boundary.
+    module-private token is required), with read-only state: neither
+    direct construction, attribute assignment, nor dataclass-style
+    reconstruction can substitute another operator. This is a
+    convention guard against accidental or data-driven construction,
+    not a security proof — see the module docstring's honest boundary.
     """
 
-    __slots__ = ("operator", "established_via")
+    __slots__ = ("_operator", "_established_via")
 
     def __init__(self, operator: str, *, established_via: str,
                  _token: object = None) -> None:
@@ -82,8 +83,16 @@ class TrustedOperatorContext:
             raise TrustError(
                 "TRUSTED_CONTEXT_DIRECT_CONSTRUCTION:use "
                 "establish_operator_context()")
-        self.operator = operator
-        self.established_via = established_via
+        self._operator = operator
+        self._established_via = established_via
+
+    @property
+    def operator(self) -> str:
+        return self._operator
+
+    @property
+    def established_via(self) -> str:
+        return self._established_via
 
 
 def establish_operator_context(
@@ -105,7 +114,6 @@ def establish_operator_context(
         _token=_MINT_TOKEN)
 
 
-@dataclass(frozen=True)
 class MintedAuthorization:
     """An authorization bound to one pair of source_refs, plus its audit.
 
@@ -114,20 +122,49 @@ class MintedAuthorization:
     :func:`apply_batch` (batch, mappings built and consumed inside the
     trust module) — both verify the target pair against the bound pair
     first. This keeps the binding attached to the authorization for its
-    whole life on the sanctioned path. (In-boundary code can still
-    reach privates — the module docstring's honest boundary applies.)
+    whole life on the sanctioned path.
+
+    Controlled construction (B1/R4): this is deliberately NOT a
+    dataclass and exposes no reconstruction route — the binding lives
+    in private slots behind read-only properties, construction
+    requires the module-private mint token, and the audit is handed
+    out as a copy. ``dataclasses.replace()``-style rebinding and
+    attribute assignment therefore fail closed. (In-boundary code can
+    still reach privates — the module docstring's honest boundary
+    applies.)
     """
 
-    _authorization: Any  # AuthorizedHumanDecision | AuthorizedTrustedLink
-    kind: str  # "human_decision" | "trusted_link"
-    source_refs: Tuple[str, str]
-    audit: Dict[str, Any]
+    __slots__ = ("_authorization", "_kind", "_source_refs", "_audit")
+
+    def __init__(self, authorization: Any, *, kind: str,
+                 source_refs: Tuple[str, str], audit: Dict[str, Any],
+                 _token: object = None) -> None:
+        if _token is not _MINT_TOKEN:
+            raise TrustError(
+                "MINTED_AUTHORIZATION_DIRECT_CONSTRUCTION:use "
+                "mint_human_decision()/mint_trusted_link()")
+        self._authorization = authorization
+        self._kind = kind
+        self._source_refs = tuple(source_refs)
+        self._audit = dict(audit)
+
+    @property
+    def kind(self) -> str:
+        return self._kind
+
+    @property
+    def source_refs(self) -> Tuple[str, str]:
+        return self._source_refs
+
+    @property
+    def audit(self) -> Dict[str, Any]:
+        return dict(self._audit)
 
     def _check_pair(self, ref_a: Any, ref_b: Any) -> None:
-        if {ref_a, ref_b} != set(self.source_refs):
+        if {ref_a, ref_b} != set(self._source_refs):
             raise TrustError(
                 "MINTED_AUTHORIZATION_PAIR_MISMATCH:"
-                f"bound to {self.source_refs!r}")
+                f"bound to {self._source_refs!r}")
 
     def apply_pair(self, left_sighting: Mapping[str, Any],
                    right_sighting: Mapping[str, Any], *,
@@ -184,12 +221,32 @@ def apply_batch(minted: Iterable[MintedAuthorization],
                         verified_external_ids=verified_external_ids)
 
 
-@dataclass(frozen=True)
 class VerifiedIdAttestation:
-    """A verified external-ID set with its verification provenance."""
+    """A verified external-ID set with its verification provenance.
 
-    external_ids: FrozenSet[str]
-    audit: Dict[str, Any]
+    Controlled construction (token-gated, read-only) for the same
+    reason as MintedAuthorization: a reconstructed attestation with a
+    substituted ID set would forge verified provenance.
+    """
+
+    __slots__ = ("_external_ids", "_audit")
+
+    def __init__(self, external_ids: FrozenSet[str], *,
+                 audit: Dict[str, Any], _token: object = None) -> None:
+        if _token is not _MINT_TOKEN:
+            raise TrustError(
+                "VERIFIED_ID_ATTESTATION_DIRECT_CONSTRUCTION:use "
+                "attest_verified_ids()")
+        self._external_ids = frozenset(external_ids)
+        self._audit = dict(audit)
+
+    @property
+    def external_ids(self) -> FrozenSet[str]:
+        return self._external_ids
+
+    @property
+    def audit(self) -> Dict[str, Any]:
+        return dict(self._audit)
 
 
 def _require_context(ctx: Any) -> TrustedOperatorContext:
@@ -255,9 +312,10 @@ def mint_human_decision(
     decision = AuthorizedHumanDecision(
         link, decided_by=ctx.operator, evidence_refs=evidence)
     return MintedAuthorization(
-        _authorization=decision, kind="human_decision", source_refs=refs,
+        decision, kind="human_decision", source_refs=refs,
         audit=_audit("human_decision", ctx, link, evidence,
-                     extra={"source_refs": list(refs)}))
+                     extra={"source_refs": list(refs)}),
+        _token=_MINT_TOKEN)
 
 
 def mint_trusted_link(
@@ -270,9 +328,10 @@ def mint_trusted_link(
     trusted = AuthorizedTrustedLink(
         method, evidence_refs=evidence, asserted_by=ctx.operator)
     return MintedAuthorization(
-        _authorization=trusted, kind="trusted_link", source_refs=refs,
+        trusted, kind="trusted_link", source_refs=refs,
         audit=_audit("trusted_link", ctx, method, evidence,
-                     extra={"source_refs": list(refs)}))
+                     extra={"source_refs": list(refs)}),
+        _token=_MINT_TOKEN)
 
 
 def attest_verified_ids(
@@ -303,7 +362,7 @@ def attest_verified_ids(
         extra={"verification_ref": verification_ref.strip(),
                "external_ids": sorted(set(ids))})
     return VerifiedIdAttestation(
-        external_ids=frozenset(ids), audit=audit)
+        frozenset(ids), audit=audit, _token=_MINT_TOKEN)
 
 
 __all__ = [

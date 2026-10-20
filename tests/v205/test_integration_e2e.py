@@ -193,6 +193,35 @@ def test_r3_batch_spend_through_wrapper_only():
             [{"link": "same"}], [_sighting("a#1"), _sighting("b#1")])
 
 
+def test_r4_no_reconstruction_or_mutation_route():
+    """B1/R4: dataclasses.replace 重绑定、属性赋值、直接构造全部关闭。"""
+    import dataclasses
+
+    ctx = _ctx()
+    minted = trust.mint_human_decision(
+        ctx, left_ref="a#1", right_ref="b#1", link="same",
+        evidence_refs=["synthetic://r"])
+    with pytest.raises(TypeError):
+        dataclasses.replace(minted, source_refs=("c#1", "d#1"))
+    with pytest.raises(AttributeError):
+        minted.source_refs = ("c#1", "d#1")
+    with pytest.raises(AttributeError):
+        ctx.operator = "forged"
+    with pytest.raises(trust.TrustError):
+        trust.MintedAuthorization(
+            minted, kind="human_decision",
+            source_refs=("c#1", "d#1"), audit={})
+    att = trust.attest_verified_ids(ctx, ["EXT-1"],
+                                    verification_ref="chk-1")
+    with pytest.raises(TypeError):
+        dataclasses.replace(att, external_ids=frozenset({"FORGED"}))
+    with pytest.raises(AttributeError):
+        att.external_ids = frozenset({"FORGED"})
+    # 审计以副本外发：改副本不影响原件
+    minted.audit["operator"] = "tampered"
+    assert minted.audit["operator"] == "synthetic-operator-1"
+
+
 def test_r2_verified_id_audit_ids_are_distinct():
     """B2: 不同 ID 集合的 attestation 审计 ID 必须不同；相同输入确定一致。"""
     ctx = _ctx()
