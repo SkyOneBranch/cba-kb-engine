@@ -338,51 +338,137 @@ def check_test_identities(base_ids, pr_ids):
     return modified
 
 
-def check_integrity_baseline():
-    """rev5 P0-3（保留）：测试文件完整性基线 + 双边可信重算。
+def parse_merge_base(payload):
+    """纯函数：从 compare API 响应提取 merge-base SHA（非法 -> None）。
 
-    - base 侧：base checkout 本地（base 版扫描器 + 文件哈希，可信）；
-    - PR 侧：git fetch PR head → 校验 FETCH_HEAD == HEAD_SHA（防核验中被更新）
-      → worktree 只读挂载（不执行 PR 代码）→ base 版扫描器扫描 + 文件哈希。
-    - 删除/类型改变阻断；普通内容修改允许（rev11 G-04）；计数比对为二级信号。
+    调用方对 None 必须 fail-closed。单独成纯函数以便 gate_selftest
+    覆盖正反用例（#211）。
     """
-    base_m = scan_metrics("tests")
-    base_shas = test_file_shas("tests")
-    ok(f"base 基线：{base_m['test_funcs']} funcs / {len(base_shas)} 测试文件")
-    base_ids = {rel: git_blob_identity(".", f"tests/{rel}")
-                for rel in sorted(base_shas)}
-    wt = "/tmp/pr-head-scan"
+    if not isinstance(payload, dict):
+        return None
+    mb = payload.get("merge_base_commit")
+    if not isinstance(mb, dict):
+        return None
+    sha = mb.get("sha")
+    return sha if is_sha40(sha) else None
+
+
+def api_merge_base():
+    """经 GitHub compare API 取得 (BASE_SHA...HEAD_SHA) 的 merge-base。
+
+    BASE_SHA 是事件给出的 base 分支当前 tip；compare 的 merge-base 与
+    tip 无关，只取决于双边历史的共同祖先。响应不可靠 -> fail-closed。
+    """
+    data = gh_api(f"/repos/{REPO}/compare/{BASE_SHA}...{HEAD_SHA}")
+    mb = parse_merge_base(data)
+    if mb is None:
+        fail("MERGE_BASE_UNAVAILABLE：compare API 未返回可靠 merge-base"
+             "（历史不可达或已分叉），阻断")
+    return mb
+
+
+def _git(args, cwd="."):
+    return subprocess.run(["git", "-C", cwd] + args,
+                          capture_output=True, text=True, check=False)
+
+
+def _rev_parse(ref):
+    p = _git(["rev-parse", ref])
+    out = p.stdout.strip()
+    return out if p.returncode == 0 and is_sha40(out) else None
+
+
+def _ensure_full_history():
+    """可信 job 的 checkout 可能为浅克隆（depth=1）：本地复算 merge-base
+    需要完整历史；取不到完整历史 -> fail-closed（#211 Human 要求）。"""
+    p = _git(["rev-parse", "--is-shallow-repository"])
+    if p.returncode == 0 and p.stdout.strip() == "true":
+        u = _git(["fetch", "--unshallow", "origin"])
+        if u.returncode != 0:
+            fail("MERGE_BASE_HISTORY_UNAVAILABLE：无法补全 Git 历史"
+                 "（unshallow 失败），阻断")
+
+
+def resolve_merge_base_verified():
+    """计算并交叉核验 merge-base，返回其 SHA。
+
+    双路独立得出同一值才放行：① GitHub compare API（服务端全历史
+    计算）；② 本地 git merge-base（补全历史后复算）。任一缺失或不
+    一致 -> fail-closed。双边 tip 同时与事件/API 已校验的 BASE_SHA /
+    HEAD_SHA 绑定，防止取错 ref。
+    """
+    mb_api = api_merge_base()
+    for refspec, want, label in (
+            (f"pull/{PR_NUMBER}/head:refs/gate/pr-head", HEAD_SHA, "PR head"),
+            (f"{BASE_REF}:refs/gate/base-tip", BASE_SHA, "base tip")):
+        p = _git(["fetch", "origin", refspec])
+        if p.returncode != 0:
+            fail(f"MERGE_BASE_FETCH_FAILED：拉取 {label} 失败："
+                 f"{p.stderr.strip()[:200]}")
+        got = _rev_parse(refspec.split(":", 1)[1])
+        if got != want:
+            fail(f"MERGE_BASE_REF_MISMATCH：{label} 本地 {got} != 期望 "
+                 f"{want}，阻断")
+    _ensure_full_history()
+    p = _git(["merge-base", "refs/gate/pr-head", "refs/gate/base-tip"])
+    mb_local = p.stdout.strip() if p.returncode == 0 else None
+    if not is_sha40(mb_local or ""):
+        fail("MERGE_BASE_UNAVAILABLE：本地复算 merge-base 失败"
+             "（无共同祖先或历史不完整），阻断")
+    if mb_local != mb_api:
+        fail(f"MERGE_BASE_MISMATCH：API {mb_api} != 本地复算 "
+             f"{mb_local}，阻断")
+    ok(f"merge-base 核验通过：{mb_api}（compare API 与本地复算一致，"
+       f"双边 tip 已绑定）")
+    return mb_api
+
+
+def check_integrity_baseline():
+    """rev5 P0-3（保留）＋ #211 根因修复：测试完整性基线 + 双边可信重算。
+
+    - 基线侧：PR 与 base 的真实 merge-base（resolve_merge_base_verified
+      双路核验并输出 SHA）只读 worktree —— 不再用 current main tip 做
+      基线。旧口径下，分支切出后兄弟 PR 先行合并进 main 的新测试文件
+      会在 PR head 上"不存在"，被误判为本 PR 删除（#204/#205/#206/
+      #210 四度复现）。merge-base 口径下：文件在 merge-base 存在、
+      PR head 不存在，才是本 PR 的删除。
+    - PR 侧：PR head 只读 worktree（不执行 PR 代码），HEAD_SHA 绑定
+      已由 resolve_merge_base_verified 的 ref 校验完成。
+    - 扫描器与本脚本均来自 base checkout（可信层），PR 侧只提供被扫
+      目录，检查器本身不可被 PR 修改后执行。
+    - 删除/类型改变阻断；普通内容修改允许（rev11 G-04）；计数比对
+      为二级信号。
+    """
+    mb_sha = resolve_merge_base_verified()
+    mb_wt = "/tmp/merge-base-scan"
+    head_wt = "/tmp/pr-head-scan"
     try:
-        p1 = subprocess.run(
-            ["git", "fetch", "origin", f"pull/{PR_NUMBER}/head", "--depth=1"],
-            capture_output=True, text=True, check=False,
-        )
-        if p1.returncode != 0:
-            fail(f"获取 PR head 失败：{p1.stderr.strip()[:200]}")
-        p1b = subprocess.run(
-            ["git", "rev-parse", "FETCH_HEAD"],
-            capture_output=True, text=True, check=False,
-        )
-        if p1b.stdout.strip() != HEAD_SHA:
-            fail("FETCH_HEAD 与 HEAD_SHA 不一致（PR 在核验中被更新），请重跑")
-        p2 = subprocess.run(
-            ["git", "worktree", "add", "--detach", wt, "FETCH_HEAD"],
-            capture_output=True, text=True, check=False,
-        )
-        if p2.returncode != 0:
-            fail(f"挂载 PR head 失败：{p2.stderr.strip()[:200]}")
-        pr_m = scan_metrics(os.path.join(wt, "tests"))
+        for wt, ref in ((mb_wt, mb_sha), (head_wt, "refs/gate/pr-head")):
+            p = subprocess.run(
+                ["git", "worktree", "add", "--detach", wt, ref],
+                capture_output=True, text=True, check=False)
+            if p.returncode != 0:
+                fail(f"挂载只读 worktree 失败（{ref}）："
+                     f"{p.stderr.strip()[:200]}")
+        base_m = scan_metrics(os.path.join(mb_wt, "tests"))
+        base_shas = test_file_shas(os.path.join(mb_wt, "tests"))
+        ok(f"merge-base 基线：{base_m['test_funcs']} funcs / "
+           f"{len(base_shas)} 测试文件（merge-base {mb_sha}）")
+        base_ids = {rel: git_blob_identity(mb_wt, f"tests/{rel}")
+                    for rel in sorted(base_shas)}
+        pr_m = scan_metrics(os.path.join(head_wt, "tests"))
         # A1 P3 回归修复（保留）：PR 侧身份必须在 worktree 移除前采集。
-        pr_ids = {rel: git_blob_identity(wt, f"tests/{rel}")
+        pr_ids = {rel: git_blob_identity(head_wt, f"tests/{rel}")
                   for rel in sorted(base_shas)}
     finally:
-        subprocess.run(["git", "worktree", "remove", "--force", wt],
-                       capture_output=True, check=False)
+        for wt in (mb_wt, head_wt):
+            subprocess.run(["git", "worktree", "remove", "--force", wt],
+                           capture_output=True, check=False)
     ok(f"PR head 实测：{pr_m['test_funcs']} funcs")
     modified = check_test_identities(base_ids, pr_ids)
     # Q2-141-H02/LOW01：诚实表述——本检查只保证"未删除、未改类型"，
     # 不保证"内容一致"。内容修改允许，但必须显著报告供 Human 审查。
-    ok(f"测试文件删除/类型检查通过：{len(base_shas)} 个 base 测试文件"
+    ok(f"测试文件删除/类型检查通过：{len(base_shas)} 个 merge-base 测试文件"
        f"存在且类型一致")
     if modified:
         print("TEST_MODIFICATIONS_REQUIRE_HUMAN_REVIEW：以下测试文件内容被修改"
