@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from cba_kb.document_lane import content_hash, normalize_text
+from cba_kb.document_lane import normalize_text
 
 INDEX_SCHEMA = "article_index_v1"
 
