@@ -715,3 +715,15 @@ def test_r3_trusted_link_does_not_override_birth_month_conflict():
                          verified_external_ids={"EXT-1"})
     assert out["verdict"] == "CONFLICT"
     assert "birth_month" in out["conflict_fields"]
+
+
+def test_r4_forged_dict_link_on_conflict_path_raises():
+    """R3-F1: 冲突路径上的伪造 dict link 也必须抛错，不能静默返回 CONFLICT。"""
+    import cba_kb.person_candidate as pc
+    a = {"source_ref": "stats-a#1", "display_name": "Alex",
+         "external_id": "EXT-1", "birth_month": "1995-03"}
+    b = {"source_ref": "stats-b#1", "display_name": "Alex",
+         "external_id": "EXT-1", "birth_month": "1996-07"}
+    with pytest.raises(pc.PersonCandidateError):
+        pc.assess_pair(a, b, trusted_link={"method": "SOURCE_DECLARED"},
+                       verified_external_ids={"EXT-1"})

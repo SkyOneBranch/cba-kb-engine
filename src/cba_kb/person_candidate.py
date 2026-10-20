@@ -394,12 +394,22 @@ def assess_pair(
             return result(MERGE_ALLOWED, "HUMAN_DECISION_SAME", merged=True)
         return result(DISTINCT, "HUMAN_DECISION_NOT_SAME")
 
-    # R3 (B6, R2-F2): a trusted association must NOT short-circuit the
-    # same-ID contradiction check. Objective identity contradictions
-    # (birth_month etc.) surface as CONFLICT before any trusted-link
-    # merge authorization. (The authorized Human decision above remains
-    # the final arbiter and may resolve such conflicts explicitly.)
+    # An authorized trusted association permits merge (rule 3, B5).
+    # R4 (R3-F1): type validation comes FIRST — a forged plain-dict link
+    # must raise on every path, including the conflict path below; it must
+    # never be silently consumed.
     if trusted_link is not None:
+        if not isinstance(trusted_link, AuthorizedTrustedLink):
+            raise PersonCandidateError(
+                "TRUSTED_LINK_UNTRUSTED_CHANNEL:plain declarations are "
+                "not trusted links; an AuthorizedTrustedLink from the "
+                "trusted upstream is required (T2-8 wiring pending)")
+        # R3 (B6, R2-F2): a trusted association must NOT short-circuit
+        # the same-ID contradiction check. Objective identity
+        # contradictions (birth_month etc.) surface as CONFLICT before
+        # any trusted-link merge authorization. (The authorized Human
+        # decision above remains the final arbiter and may resolve such
+        # conflicts explicitly.)
         _lid = left_s.get("external_id")
         _rid = right_s.get("external_id")
         if _lid and _rid and _lid == _rid:
@@ -408,14 +418,6 @@ def assess_pair(
                 return result(
                     CONFLICT, "CONFLICT_SAME_ID_CONTRADICTORY_FIELDS",
                     conflict_fields=_conflicts)
-
-    # An authorized trusted association permits merge (rule 3, B5).
-    if trusted_link is not None:
-        if not isinstance(trusted_link, AuthorizedTrustedLink):
-            raise PersonCandidateError(
-                "TRUSTED_LINK_UNTRUSTED_CHANNEL:plain declarations are "
-                "not trusted links; an AuthorizedTrustedLink from the "
-                "trusted upstream is required (T2-8 wiring pending)")
         return result(MERGE_ALLOWED, "TRUSTED_ASSOCIATION", merged=True)
 
     left_id = left_s.get("external_id")
