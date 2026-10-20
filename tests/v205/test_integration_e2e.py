@@ -245,6 +245,30 @@ def test_r5_wrappers_are_final_and_consumption_is_exact_typed():
         trust.attested_ids({"external_ids": {"FORGED"}})
 
 
+def test_r6_consumption_reads_private_state_only():
+    """B1/R6: 类级描述符替换（monkey-patch 公开属性）不得影响铸造归属。"""
+    ctx = _ctx()
+    orig_operator = trust.TrustedOperatorContext.operator
+    orig_via = trust.TrustedOperatorContext.established_via
+    try:
+        trust.TrustedOperatorContext.operator = property(
+            lambda self: "mallory")
+        trust.TrustedOperatorContext.established_via = property(
+            lambda self: "forged-channel")
+        minted = trust.mint_human_decision(
+            ctx, left_ref="a#1", right_ref="b#1", link="same",
+            evidence_refs=["synthetic://r"])
+        assert minted.audit["operator"] == "synthetic-operator-1"
+        assert minted.audit["established_via"] == "environment"
+        linked = trust.mint_trusted_link(
+            ctx, left_ref="a#1", right_ref="b#1",
+            method="SOURCE_DECLARED", evidence_refs=["synthetic://r"])
+        assert linked.audit["operator"] == "synthetic-operator-1"
+    finally:
+        trust.TrustedOperatorContext.operator = orig_operator
+        trust.TrustedOperatorContext.established_via = orig_via
+
+
 def test_r2_verified_id_audit_ids_are_distinct():
     """B2: 不同 ID 集合的 attestation 审计 ID 必须不同；相同输入确定一致。"""
     ctx = _ctx()

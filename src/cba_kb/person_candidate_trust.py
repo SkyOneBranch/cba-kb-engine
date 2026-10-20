@@ -192,7 +192,7 @@ class MintedAuthorization:
                          right_sighting.get("source_ref"))
         kwargs: Dict[str, Any] = {
             "verified_external_ids": verified_external_ids}
-        if self.kind == "human_decision":
+        if self._kind == "human_decision":
             kwargs["human_decision"] = self._authorization
         else:
             kwargs["trusted_link"] = self._authorization
@@ -321,10 +321,14 @@ def _audit(kind: str, ctx: TrustedOperatorContext, detail: str,
     # distinguishes this authorization — including the bound refs or the
     # attested ID set — is part of the hashed content, so distinct
     # authorizations never share an audit_id.
+    # Consumption reads PRIVATE state only (B1/R6): the public
+    # properties are display conveniences; if a class-level descriptor
+    # were replaced (monkey-patching), minted provenance must still
+    # reflect the operator established at context creation.
     record = {
         "kind": kind,
-        "operator": ctx.operator,
-        "established_via": ctx.established_via,
+        "operator": ctx._operator,
+        "established_via": ctx._established_via,
         "detail": detail,
         "evidence_refs": list(evidence_refs),
     }
@@ -345,7 +349,7 @@ def mint_human_decision(
     refs = _require_pair(left_ref, right_ref)
     evidence = _require_evidence(evidence_refs)
     decision = AuthorizedHumanDecision(
-        link, decided_by=ctx.operator, evidence_refs=evidence)
+        link, decided_by=ctx._operator, evidence_refs=evidence)
     return MintedAuthorization(
         decision, kind="human_decision", source_refs=refs,
         audit=_audit("human_decision", ctx, link, evidence,
@@ -361,7 +365,7 @@ def mint_trusted_link(
     refs = _require_pair(left_ref, right_ref)
     evidence = _require_evidence(evidence_refs)
     trusted = AuthorizedTrustedLink(
-        method, evidence_refs=evidence, asserted_by=ctx.operator)
+        method, evidence_refs=evidence, asserted_by=ctx._operator)
     return MintedAuthorization(
         trusted, kind="trusted_link", source_refs=refs,
         audit=_audit("trusted_link", ctx, method, evidence,
