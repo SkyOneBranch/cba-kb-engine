@@ -107,24 +107,58 @@ def establish_operator_context(
 
 @dataclass(frozen=True)
 class MintedAuthorization:
-    """An authorization object plus its binding and audit record."""
+    """An authorization bound to one pair of source_refs, plus its audit.
 
-    authorization: Any  # AuthorizedHumanDecision | AuthorizedTrustedLink
+    The wrapped authorization object is NOT handed out (B1): it can
+    only be spent through :meth:`apply_pair` / :meth:`put_into_batch`,
+    which verify the target pair against the bound pair first. This
+    keeps the binding attached to the authorization for its whole life
+    on the sanctioned path. (In-boundary code can still reach privates
+    — the module docstring's honest boundary applies.)
+    """
+
+    _authorization: Any  # AuthorizedHumanDecision | AuthorizedTrustedLink
+    kind: str  # "human_decision" | "trusted_link"
     source_refs: Tuple[str, str]
     audit: Dict[str, Any]
 
-    def for_pair(self, ref_a: str, ref_b: str) -> Any:
-        """Return the authorization only for its bound pair of refs.
-
-        Orientation-free: (a, b) and (b, a) are the same pair. Any other
-        pair -> TrustError; a minted decision must never drift onto a
-        pair it was not made for.
-        """
+    def _check_pair(self, ref_a: Any, ref_b: Any) -> None:
         if {ref_a, ref_b} != set(self.source_refs):
             raise TrustError(
                 "MINTED_AUTHORIZATION_PAIR_MISMATCH:"
                 f"bound to {self.source_refs!r}")
-        return self.authorization
+
+    def apply_pair(self, left_sighting: Mapping[str, Any],
+                   right_sighting: Mapping[str, Any], *,
+                   verified_external_ids: Optional[Iterable[str]] = None):
+        """Spend this authorization on the two sightings it was minted
+        for, via person_candidate.assess_pair. The sightings' own
+        source_refs must equal the bound pair (either orientation);
+        anything else -> TrustError, and assess_pair is never called.
+        """
+        from .person_candidate import assess_pair
+        self._check_pair(left_sighting.get("source_ref"),
+                         right_sighting.get("source_ref"))
+        kwargs: Dict[str, Any] = {
+            "verified_external_ids": verified_external_ids}
+        if self.kind == "human_decision":
+            kwargs["human_decision"] = self._authorization
+        else:
+            kwargs["trusted_link"] = self._authorization
+        return assess_pair(left_sighting, right_sighting, **kwargs)
+
+    def put_into_batch(self, mapping: Dict[Tuple[str, str], Any]) -> None:
+        """Insert this authorization into a batch decisions/links map
+        under its bound pair. Refuses to overwrite a different object
+        already present under either orientation of the pair.
+        """
+        for key in (self.source_refs, self.source_refs[::-1]):
+            existing = mapping.get(key)
+            if existing is not None and existing is not self._authorization:
+                raise TrustError(
+                    "MINTED_AUTHORIZATION_BATCH_CONFLICT:"
+                    f"{self.source_refs!r}")
+        mapping[self.source_refs] = self._authorization
 
 
 @dataclass(frozen=True)
@@ -165,17 +199,22 @@ def _require_evidence(evidence_refs: Any) -> Tuple[str, ...]:
     return refs
 
 
-def _audit(kind: str, ctx: TrustedOperatorContext,
-           refs: Tuple[str, str], detail: str,
-           evidence_refs: Tuple[str, ...]) -> Dict[str, Any]:
+def _audit(kind: str, ctx: TrustedOperatorContext, detail: str,
+           evidence_refs: Tuple[str, ...],
+           extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    # The audit_id hashes the COMPLETE record (B2): every field that
+    # distinguishes this authorization — including the bound refs or the
+    # attested ID set — is part of the hashed content, so distinct
+    # authorizations never share an audit_id.
     record = {
         "kind": kind,
         "operator": ctx.operator,
         "established_via": ctx.established_via,
-        "source_refs": list(refs),
         "detail": detail,
         "evidence_refs": list(evidence_refs),
     }
+    if extra:
+        record.update(extra)
     canonical = json.dumps(record, ensure_ascii=False, sort_keys=True,
                            separators=(",", ":"))
     record["audit_id"] = (
@@ -193,8 +232,9 @@ def mint_human_decision(
     decision = AuthorizedHumanDecision(
         link, decided_by=ctx.operator, evidence_refs=evidence)
     return MintedAuthorization(
-        authorization=decision, source_refs=refs,
-        audit=_audit("human_decision", ctx, refs, link, evidence))
+        _authorization=decision, kind="human_decision", source_refs=refs,
+        audit=_audit("human_decision", ctx, link, evidence,
+                     extra={"source_refs": list(refs)}))
 
 
 def mint_trusted_link(
@@ -207,8 +247,9 @@ def mint_trusted_link(
     trusted = AuthorizedTrustedLink(
         method, evidence_refs=evidence, asserted_by=ctx.operator)
     return MintedAuthorization(
-        authorization=trusted, source_refs=refs,
-        audit=_audit("trusted_link", ctx, refs, method, evidence))
+        _authorization=trusted, kind="trusted_link", source_refs=refs,
+        audit=_audit("trusted_link", ctx, method, evidence,
+                     extra={"source_refs": list(refs)}))
 
 
 def attest_verified_ids(
@@ -233,11 +274,11 @@ def attest_verified_ids(
     ids = tuple(external_ids)
     if not ids or any(not isinstance(i, str) or not i.strip() for i in ids):
         raise TrustError("VERIFIED_IDS_INVALID:non-empty ids required")
-    audit = _audit("verified_ids", ctx, ("", ""), verification_ref.strip(),
-                   (verification_ref.strip(),))
-    audit.pop("source_refs")
-    audit["verification_ref"] = verification_ref.strip()
-    audit["external_id_count"] = len(set(ids))
+    audit = _audit(
+        "verified_ids", ctx, verification_ref.strip(),
+        (verification_ref.strip(),),
+        extra={"verification_ref": verification_ref.strip(),
+               "external_ids": sorted(set(ids))})
     return VerifiedIdAttestation(
         external_ids=frozenset(ids), audit=audit)
 

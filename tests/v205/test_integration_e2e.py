@@ -95,9 +95,8 @@ def test_minted_trusted_link_merges():
     minted = trust.mint_trusted_link(
         ctx, left_ref="stats#1", right_ref="article#1",
         method="SOURCE_DECLARED", evidence_refs=["synthetic://audit-1"])
-    out = pc.assess_pair(
-        _sighting("stats#1"), _sighting("article#1"),
-        trusted_link=minted.for_pair("article#1", "stats#1"))
+    out = minted.apply_pair(
+        _sighting("article#1"), _sighting("stats#1"))  # 反向亦可
     assert out["verdict"] == "MERGE_ALLOWED"
     assert minted.audit["operator"] == "synthetic-operator-1"
     assert minted.audit["audit_id"].startswith("audit_")
@@ -108,10 +107,9 @@ def test_minted_not_same_is_cannot_link():
     minted = trust.mint_human_decision(
         ctx, left_ref="a#1", right_ref="b#1", link="not_same",
         evidence_refs=["synthetic://review-1"])
-    out = pc.assess_pair(
+    out = minted.apply_pair(
         _sighting("a#1", external_id="EXT-1"),
         _sighting("b#1", external_id="EXT-1"),
-        human_decision=minted.for_pair("a#1", "b#1"),
         verified_external_ids={"EXT-1"})
     assert out["verdict"] == "DISTINCT"
 
@@ -155,7 +153,41 @@ def test_minting_requires_evidence_and_bound_pair():
         ctx, left_ref="a#1", right_ref="b#1", link="same",
         evidence_refs=["synthetic://r"])
     with pytest.raises(trust.TrustError):
-        minted.for_pair("a#1", "c#1")
+        minted.apply_pair(_sighting("a#1"), _sighting("c#1"))
+
+
+def test_r2_pair_binding_cannot_be_spent_cross_pair():
+    """B1: 铸造的决定只能花在绑定 pair 上（经包装器消费）。"""
+    ctx = _ctx()
+    minted = trust.mint_human_decision(
+        ctx, left_ref="a#1", right_ref="b#1", link="same",
+        evidence_refs=["synthetic://r"])
+    with pytest.raises(trust.TrustError):
+        minted.apply_pair(_sighting("c#1"), _sighting("d#1"))
+    # batch 插入绑定 pair，且与既有不同对象冲突时拒绝
+    batch_map = {}
+    minted.put_into_batch(batch_map)
+    other = trust.mint_human_decision(
+        ctx, left_ref="b#1", right_ref="a#1", link="not_same",
+        evidence_refs=["synthetic://r2"])
+    with pytest.raises(trust.TrustError):
+        other.put_into_batch(batch_map)
+    out = pc.assess_batch(
+        [_sighting("a#1"), _sighting("b#1")], human_decisions=batch_map)
+    assert out["groups"][0]["verdict"] == "MERGE_ALLOWED"
+
+
+def test_r2_verified_id_audit_ids_are_distinct():
+    """B2: 不同 ID 集合的 attestation 审计 ID 必须不同；相同输入确定一致。"""
+    ctx = _ctx()
+    a1 = trust.attest_verified_ids(ctx, ["EXT-1"],
+                                   verification_ref="chk-1")
+    a2 = trust.attest_verified_ids(ctx, ["EXT-2", "EXT-3"],
+                                   verification_ref="chk-1")
+    a1_again = trust.attest_verified_ids(ctx, ["EXT-1"],
+                                         verification_ref="chk-1")
+    assert a1.audit["audit_id"] != a2.audit["audit_id"]
+    assert a1.audit["audit_id"] == a1_again.audit["audit_id"]
 
 
 def test_plain_dict_authorizations_still_rejected():
