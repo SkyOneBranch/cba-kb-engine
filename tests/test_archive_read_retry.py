@@ -22,6 +22,22 @@ class AuthorizationError(Exception):
     status_code = 403
 
 
+class _ApiHandle:
+    """Identity-hashable api stand-in.
+
+    types.SimpleNamespace defines __eq__ without __hash__, so it cannot
+    be put in a set(); a plain class instance keeps default identity
+    hashing, which is exactly what the transport-identity assertions
+    need. Only files() is used by the Drive read paths under test.
+    """
+
+    def __init__(self, files_fn):
+        self._files_fn = files_fn
+
+    def files(self):
+        return self._files_fn()
+
+
 class ArchiveDrive(Drive):
     """In-memory Drive exercising the real list/ensure/download read paths."""
 
@@ -47,7 +63,7 @@ class ArchiveDrive(Drive):
             update=self._update,
             list=self._list,
         )
-        return SimpleNamespace(files=lambda: files)
+        return _ApiHandle(lambda: files)
 
     def _build_clients(self):
         self.transport_builds += 1
@@ -59,7 +75,14 @@ class ArchiveDrive(Drive):
 
     def _read(self, file_id):
         self.reads.append(file_id)
-        self.read_transports.append(id(self.api))
+        # Record the api OBJECT itself (strong reference), never id().
+        # _build_clients() replaces self.api and retains no old api, so
+        # CPython could free the old object and reuse its id for a new
+        # transport, making len(set(ids)) undercount distinct transports
+        # (6 vs 7 in the 40-key resume scenario). Holding the object
+        # keeps it alive, so set() counts distinct objects by identity
+        # and a fresh transport can never be mistaken for a stale one.
+        self.read_transports.append(self.api)
         if self.faults:
             fault = self.faults.pop(0)
             if fault is not None:
@@ -304,6 +327,62 @@ def test_archive_resume_with_transient_faults_creates_no_duplicates():
     assert d.faults_raised >= 4  # transient faults were exercised during resume
     assert d.transport_builds == d.faults_raised
     assert len(set(d.read_transports)) == d.faults_raised + 1
+
+
+def test_archive_read_retry_id_reuse_regression():
+    """Regression for the id()-reuse flake in the 40-key resume scenario.
+
+    Each retry must use a fresh transport object, and the recorded
+    transports must be distinguishable by identity, not by a recycled
+    integer id. Two layers, kept distinct:
+
+    (a) Deterministic contract check (added for Issue #217 clause 4):
+    recorded transports must be transport OBJECTS, never id() integers.
+    On unfixed code _read appends id(self.api), so this assertion fails
+    on the first trial, by assertion, regardless of allocator reuse.
+    After the fix _read appends the api object itself, so it passes.
+
+    (b) Allocator-dependent set check (retained): looping over fresh
+    ArchiveDrive instances, the set-cardinality assertion fails on
+    unfixed code only whenever CPython reuses a freed api object's id
+    for a later transport (6 vs 7 in the original test).
+    """
+    for _trial in range(20):
+        d = ArchiveDrive()
+        keys = ['k%d' % i for i in range(40)]
+        for key in keys:
+            d.add_archive_object('folder', key, b'payload-' + key.encode())
+        index = d.index_cba_keys('folder')
+        faults = []
+        for i in range(len(keys)):
+            if i % 7 == 0:
+                faults.append(BrokenPipeError('fault %d' % i))
+            faults.append(None)
+        d.faults = faults
+        for i, key in enumerate(keys):
+            d.ensure('folder', key, 'candidate_%d' % i, 'text/plain',
+                     b'payload-' + key.encode(), index=index)
+        assert d.created == [] and d.calls == []
+        assert d.faults_raised >= 4
+        assert d.transport_builds == d.faults_raised
+        assert len(d.reads) == 40 + d.faults_raised
+        # Deterministic contract check: recorded transports must be
+        # transport objects with a files() read path, never id()
+        # integers. On unfixed code every entry is an int, so this
+        # fails by assertion on the first trial; it is not an
+        # import, syntax, environment, or allocator-luck failure.
+        assert d.read_transports, 'no transports recorded'
+        assert all(not isinstance(t, int) for t in d.read_transports), \
+            'read_transports must record transport objects, not id() ints'
+        assert all(hasattr(t, 'files') for t in d.read_transports)
+        # set() counts by value for ints and by identity for objects, so
+        # this is the allocator-dependent assertion: on unfixed code it
+        # fails whenever a freed api id is reused (6 vs 7); after the
+        # fix the recorded objects are retained, so the set is stable.
+        assert len(set(d.read_transports)) == d.faults_raised + 1
+        distinct = list(set(d.read_transports))
+        assert all(a is not b for i, a in enumerate(distinct)
+                   for b in distinct[i + 1:])
 
 
 def test_transient_read_failure_never_increments_archive_object_count():
