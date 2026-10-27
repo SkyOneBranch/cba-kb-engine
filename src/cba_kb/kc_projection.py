@@ -37,7 +37,8 @@ import math
 import re
 from typing import Any, Callable, Dict, List, Optional
 
-from .stats import validate_stats_record
+from .stats import (DEFAULT_COMPETITION, PROVIDER_CBA_OFFICIAL,
+                    validate_stats_record)
 
 GRAINS = frozenset({
     "STATS", "IDENTITY", "CANONICAL_FACT", "DOCUMENT",
@@ -98,11 +99,18 @@ def validate_metric_value(metric: str, value: Any, unit: str) -> Dict[str, Any]:
 
 def typed_result(*, caller_grain: str, authoritative_grain: str,
                  payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Authoritative grain wins; a caller-supplied grain can never spoof it."""
+    """Authoritative grain wins; a caller-supplied grain can never spoof it.
+
+    Q2-fix (PR #216 round 1): the authoritative grain is applied AFTER
+    the payload is copied, so a payload ``grain`` key (DOCUMENT, CLAIM,
+    or any other) is discarded, never allowed to overwrite it. The
+    caller_grain argument is accepted for call-site context only and
+    never influences the result grain.
+    """
     if authoritative_grain not in GRAINS:
         raise KcError(f"INVALID_GRAIN:{authoritative_grain}")
-    result = {"grain": authoritative_grain}
-    result.update(payload)
+    result = dict(payload)
+    result["grain"] = authoritative_grain
     return result
 
 
@@ -125,17 +133,50 @@ def stats_key(*, player_uid: str, provider: str, competition: str,
 
 def query_stats(records: List[Dict[str, Any]], *, player_uid: str,
                 season: str, match_type: str, scope: str, metric: str,
-                team_id: Optional[str] = None) -> Dict[str, Any]:
+                team_id: Optional[str] = None,
+                provider: str = PROVIDER_CBA_OFFICIAL,
+                competition: str = DEFAULT_COMPETITION) -> Dict[str, Any]:
     """Exact-key Stats lookup. No fallback across season, match_type,
-    scope, team or player. Missing dimension -> UNKNOWN, never a guess."""
+    scope, team, player, provider or competition. Missing dimension ->
+    UNKNOWN, never a guess.
+
+    Q2-fix (PR #216 round 1): provider and competition are explicit
+    query dimensions, matching the full binding in ``stats_key``. The
+    defaults are the canonical binding (CBA_OFFICIAL / CBA), NOT a
+    silent fallback: a record whose raw provider/competition differs
+    from the requested binding is skipped BEFORE canonical validation,
+    so a mixed corpus can never produce a false CONFLICT, a
+    cross-provider fallback, or a validation crash from the
+    non-matching record. An explicit non-canonical binding returns
+    UNKNOWN immediately, without validating non-canonical records:
+    the canonical validator admits exactly CBA_OFFICIAL / CBA, so
+    such a binding is provably empty and no verified record can match
+    it. After validation the binding is re-checked on the validated
+    record as defence in depth. Existing callers that omit these
+    arguments therefore still get exactly the canonical binding they
+    previously got implicitly.
+    """
     if scope not in ("WHOLE_SEASON", "TEAM_SPLIT"):
         raise KcError(f"INVALID_SCOPE:{scope}")
     if scope == "TEAM_SPLIT" and not team_id:
         return {"status": "UNKNOWN", "grain": "STATS",
                 "reason": "TEAM_SPLIT_REQUIRES_TEAM_ID"}
+    if provider != PROVIDER_CBA_OFFICIAL or competition != DEFAULT_COMPETITION:
+        return {"status": "UNKNOWN", "grain": "STATS",
+                "reason": "NON_CANONICAL_PROVIDER_COMPETITION_BINDING"}
     matches = []
     for record in records:
+        if not isinstance(record, dict):
+            continue
+        if record.get("provider") != provider:
+            continue
+        if record.get("competition") != competition:
+            continue
         validated = validate_stats_record(record)
+        if validated.get("provider") != provider:
+            continue
+        if validated.get("competition") != competition:
+            continue
         if validated["player_uid"] != player_uid:
             continue
         if validated["season"] != season:
@@ -221,6 +262,14 @@ def resolve_identity(players: List[Dict[str, Any]],
             return {"status": "UNKNOWN", "grain": "IDENTITY",
                     "candidates": [], "relation": "UNDECIDED",
                     "reason": "NO_APPROVED_ALIAS_BINDING"}
+        if len(candidates) > 1:
+            # Q2-fix (PR #216 round 1): a multi-owner approved alias is
+            # ambiguous exactly like a multi-candidate canonical name.
+            # It must return ALL candidates with CLARIFICATION_REQUIRED
+            # and relation UNDECIDED, never RESOLVED to a single pick.
+            return {"status": "CLARIFICATION_REQUIRED", "grain": "IDENTITY",
+                    "candidates": candidates, "relation": "UNDECIDED",
+                    "reason": "MULTIPLE_APPROVED_ALIAS_BINDINGS"}
         return {"status": "RESOLVED", "grain": "IDENTITY",
                 "candidates": candidates, "relation": "SINGLE_CANDIDATE"}
     if query_kind == "name":
@@ -402,11 +451,22 @@ def search_projection(projection: Dict[str, Any],
 
 # ------------------------------------------------------------ UID slices
 def route_uid_slices(records: List[Dict[str, Any]], *, player_uid: str,
-                     expected_keys: Optional[Any] = None) -> Dict[str, Any]:
+                     expected_keys: Optional[Any] = None,
+                     expected_counts: Optional[Dict[Any, int]] = None) -> Dict[str, Any]:
     """UID -> season/match_type/scope slices, each with an explicit
     completeness/end marker. A slice whose declared total exceeds its
     rows, or an expected slice that is absent, is PARTIAL, never silent
-    truncation."""
+    truncation.
+
+    Q2-fix (PR #216 round 1): ``expected_counts`` is an authoritative
+    slice catalog (key -> expected row count, e.g. derived from a
+    manifest/snapshot, not an ad-hoc caller guess). Keys may be
+    3-tuples (season, match_type, scope) or 4-tuples including the
+    TEAM_SPLIT team_id. An absent slice or a row-count mismatch is
+    reported in ``count_mismatches`` and makes the result PARTIAL, so
+    an omitted or duplicated record is detected even when no
+    caller-supplied ``expected_keys`` set would have caught it.
+    """
     slices: Dict[Any, Dict[str, Any]] = {}
     for record in records:
         validated = validate_stats_record(record)
@@ -440,10 +500,33 @@ def route_uid_slices(records: List[Dict[str, Any]], *, player_uid: str,
             if key not in present:
                 missing.append(key)
         missing = sorted(missing, key=str)
-    complete = not missing and all(s["complete"] for s in out)
+    count_mismatches = []
+    if expected_counts is not None:
+        rows_by_full: Dict[Any, int] = {}
+        rows_by_triple: Dict[Any, int] = {}
+        for sl in out:
+            full_key = (sl["season"], sl["match_type"], sl["scope"],
+                        sl["team_id"])
+            triple_key = (sl["season"], sl["match_type"], sl["scope"])
+            rows_by_full[full_key] = rows_by_full.get(full_key, 0) + len(sl["rows"])
+            rows_by_triple[triple_key] = rows_by_triple.get(triple_key, 0) + len(sl["rows"])
+        for key, expected in sorted(expected_counts.items(), key=str):
+            if len(key) == 4:
+                actual = rows_by_full.get(key, 0)
+            else:
+                actual = rows_by_triple.get(key, 0)
+            if actual != expected:
+                count_mismatches.append({"key": key, "expected": expected,
+                                         "actual": actual})
+                if actual == 0 and key not in missing:
+                    missing.append(key)
+        missing = sorted(missing, key=str)
+    complete = (not missing and not count_mismatches
+                and all(s["complete"] for s in out))
     return {"status": "COMPLETE" if complete else "PARTIAL",
             "complete": complete, "end_marker": complete,
-            "slices": out, "missing": missing}
+            "slices": out, "missing": missing,
+            "count_mismatches": count_mismatches}
 
 
 # ------------------------------------------------------------ cross-source
