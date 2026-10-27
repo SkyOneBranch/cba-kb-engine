@@ -93,14 +93,14 @@ def test_q2fix_query_stats_provider_competition_are_exact_dimensions(fx):
     other["metrics"] = dict(canonical["metrics"], points_per_game=99.0)
     records = [canonical, other]
 
-    # Default (canonical) binding must return the canonical value only:
-    # no false CONFLICT, no cross-fallback to 99.0.
-    default = query_stats(records, player_uid=A, season=SEASON,
-                          match_type="REGULAR", scope="WHOLE_SEASON",
-                          metric="points_per_game")
-    assert default["status"] == "OK" and default["value"] == 12.5
-    assert default["key"]["provider"] == "CBA_OFFICIAL"
-    assert default["key"]["competition"] == "CBA"
+    # Q2 round-2 change (disclosed): there is NO default binding any
+    # more. Omitting provider/competition must NOT return the canonical
+    # value — it raises TypeError before any lookup. The canonical
+    # value is obtained only via the explicit binding below.
+    with pytest.raises(TypeError):
+        query_stats(records, player_uid=A, season=SEASON,
+                    match_type="REGULAR", scope="WHOLE_SEASON",
+                    metric="points_per_game")
 
     # Explicit canonical binding agrees.
     explicit = query_stats(records, player_uid=A, season=SEASON,
@@ -130,7 +130,7 @@ def test_q2fix_query_stats_missing_provider_dimension_is_not_a_match(fx):
     stripped.pop("competition", None)
     result = query_stats([stripped], player_uid=A, season=SEASON,
                          match_type="REGULAR", scope="WHOLE_SEASON",
-                         metric="points_per_game")
+                         metric="points_per_game", provider="CBA_OFFICIAL", competition="CBA")
     assert result["status"] == "UNKNOWN"
 
 

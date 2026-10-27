@@ -56,7 +56,7 @@ def fx():
 def test_e1a_exact_regular_whole_points(fx):
     r = query_stats(fx["stats_records"], player_uid=A, season=SEASON,
                     match_type="REGULAR", scope="WHOLE_SEASON",
-                    metric="points_per_game")
+                    metric="points_per_game", provider="CBA_OFFICIAL", competition="CBA")
     assert r["status"] == "OK" and r["grain"] == "STATS"
     assert r["value"] == 12.5
     assert r["key"]["player_uid"] == A
@@ -70,10 +70,10 @@ def test_e1a_exact_regular_whole_points(fx):
 def test_e1b_regular_and_playoff_are_parallel_not_merged(fx):
     reg = query_stats(fx["stats_records"], player_uid=A, season=SEASON,
                       match_type="REGULAR", scope="WHOLE_SEASON",
-                      metric="points_per_game")
+                      metric="points_per_game", provider="CBA_OFFICIAL", competition="CBA")
     po = query_stats(fx["stats_records"], player_uid=A, season=SEASON,
                      match_type="PLAYOFF", scope="WHOLE_SEASON",
-                     metric="points_per_game")
+                     metric="points_per_game", provider="CBA_OFFICIAL", competition="CBA")
     assert (reg["value"], po["value"]) == (12.5, 18.0)
     assert reg["key"]["match_type"] != po["key"]["match_type"]
     assert reg["source_record_id"] != po["source_record_id"]
@@ -85,23 +85,23 @@ def test_e1_no_silent_fallback_to_other_season_or_player(fx):
     # explicitly by its own season key.
     assert query_stats(fx["stats_records"], player_uid=A, season="2023-2024",
                        match_type="REGULAR", scope="WHOLE_SEASON",
-                       metric="points_per_game")["status"] == "UNKNOWN"
+                       metric="points_per_game", provider="CBA_OFFICIAL", competition="CBA")["status"] == "UNKNOWN"
     assert query_stats(fx["stats_records"], player_uid=A, season="2024-2025",
                        match_type="REGULAR", scope="WHOLE_SEASON",
-                       metric="points_per_game")["value"] == 9.0
+                       metric="points_per_game", provider="CBA_OFFICIAL", competition="CBA")["value"] == 9.0
     assert query_stats(fx["stats_records"], player_uid=B, season=SEASON,
                        match_type="REGULAR", scope="WHOLE_SEASON",
-                       metric="points_per_game")["value"] == 7.0
+                       metric="points_per_game", provider="CBA_OFFICIAL", competition="CBA")["value"] == 7.0
     assert query_stats(fx["stats_records"], player_uid=A, season=SEASON,
                        match_type="PLAYOFF", scope="WHOLE_SEASON",
-                       metric="points_per_game")["value"] != 12.5
+                       metric="points_per_game", provider="CBA_OFFICIAL", competition="CBA")["value"] != 12.5
 
 
 # ---------------------------------------------------------------- E2 scope / null
 def test_e2a_whole_is_not_derived_from_splits(fx):
     whole = query_stats(fx["stats_records"], player_uid=A, season=SEASON,
                         match_type="REGULAR", scope="WHOLE_SEASON",
-                        metric="games_played")
+                        metric="games_played", provider="CBA_OFFICIAL", competition="CBA")
     assert whole["value"] == 40
     # Removing the WHOLE record must NOT let splits manufacture a whole:
     # splits still answer separately, whole answers UNKNOWN.
@@ -110,13 +110,13 @@ def test_e2a_whole_is_not_derived_from_splits(fx):
                              and r["match_type"] == "REGULAR")]
     assert query_stats(without_whole, player_uid=A, season=SEASON,
                        match_type="REGULAR", scope="WHOLE_SEASON",
-                       metric="games_played")["status"] == "UNKNOWN"
+                       metric="games_played", provider="CBA_OFFICIAL", competition="CBA")["status"] == "UNKNOWN"
     t1 = query_stats(fx["stats_records"], player_uid=A, season=SEASON,
                      match_type="REGULAR", scope="TEAM_SPLIT",
-                     metric="points_per_game", team_id="fixture_team_T1")
+                     metric="points_per_game", team_id="fixture_team_T1", provider="CBA_OFFICIAL", competition="CBA")
     t2 = query_stats(fx["stats_records"], player_uid=A, season=SEASON,
                      match_type="REGULAR", scope="TEAM_SPLIT",
-                     metric="points_per_game", team_id="fixture_team_T2")
+                     metric="points_per_game", team_id="fixture_team_T2", provider="CBA_OFFICIAL", competition="CBA")
     assert (t1["value"], t2["value"]) == (10.0, 15.0)
     assert t1["source_record_id"] != t2["source_record_id"]
 
@@ -124,7 +124,7 @@ def test_e2a_whole_is_not_derived_from_splits(fx):
 def test_e2a_team_split_requires_team_id(fx):
     r = query_stats(fx["stats_records"], player_uid=A, season=SEASON,
                     match_type="REGULAR", scope="TEAM_SPLIT",
-                    metric="points_per_game")
+                    metric="points_per_game", provider="CBA_OFFICIAL", competition="CBA")
     assert r["status"] == "UNKNOWN"
     assert "TEAM_SPLIT" in r["reason"]
 
@@ -132,10 +132,10 @@ def test_e2a_team_split_requires_team_id(fx):
 def test_e2b_zero_is_zero_null_is_never_zero(fx):
     blocks = query_stats(fx["stats_records"], player_uid=A, season=SEASON,
                          match_type="REGULAR", scope="WHOLE_SEASON",
-                         metric="blocks_per_game")
+                         metric="blocks_per_game", provider="CBA_OFFICIAL", competition="CBA")
     steals = query_stats(fx["stats_records"], player_uid=A, season=SEASON,
                          match_type="REGULAR", scope="WHOLE_SEASON",
-                         metric="steals_per_game")
+                         metric="steals_per_game", provider="CBA_OFFICIAL", competition="CBA")
     assert blocks["value"] == 0 and blocks["status"] == "OK"
     assert steals["value"] is None and steals["status"] == "UNKNOWN"
     assert steals["value"] != 0 or steals["value"] is None  # never coerced
@@ -192,7 +192,7 @@ def test_e3a_top5_limit_is_a_partial_page_not_a_complete_answer(fx):
 def test_e3b_cross_source_grains_stay_separate_and_causal_unknown(fx):
     stats = query_stats(fx["stats_records"], player_uid=A, season=SEASON,
                         match_type="REGULAR", scope="WHOLE_SEASON",
-                        metric="points_per_game")
+                        metric="points_per_game", provider="CBA_OFFICIAL", competition="CBA")
     proj = build_target_projection(
         source_objects=fx["source_objects"],
         target_domain="fixture_target",
@@ -243,7 +243,7 @@ def test_e4b_claim_conflict_does_not_pollute_stats(fx):
     assert len(claims["conflicting_claim_ids"]) == 2
     stats = query_stats(fx["stats_records"], player_uid=A, season=SEASON,
                         match_type="REGULAR", scope="WHOLE_SEASON",
-                        metric="points_per_game")
+                        metric="points_per_game", provider="CBA_OFFICIAL", competition="CBA")
     assert stats["status"] == "OK" and stats["value"] == 12.5
 
 
@@ -396,7 +396,7 @@ def test_end_to_end_call_chain_fixture_to_answer(fx):
     assert ident["candidates"] == [A]
     stats = query_stats(fx["stats_records"], player_uid=ident["candidates"][0],
                         season=SEASON, match_type="REGULAR",
-                        scope="WHOLE_SEASON", metric="points_per_game")
+                        scope="WHOLE_SEASON", metric="points_per_game", provider="CBA_OFFICIAL", competition="CBA")
     passage = route_passages(proj["passages"], alias="测试甲",
                              topic_tokens=["罚球", "训练"])["candidates"][0]
     ans = answer_cross_source(fact=fx["fact"], stats_result=stats,

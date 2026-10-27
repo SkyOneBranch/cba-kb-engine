@@ -133,28 +133,27 @@ def stats_key(*, player_uid: str, provider: str, competition: str,
 
 def query_stats(records: List[Dict[str, Any]], *, player_uid: str,
                 season: str, match_type: str, scope: str, metric: str,
-                team_id: Optional[str] = None,
-                provider: str = PROVIDER_CBA_OFFICIAL,
-                competition: str = DEFAULT_COMPETITION) -> Dict[str, Any]:
+                provider: str, competition: str,
+                team_id: Optional[str] = None) -> Dict[str, Any]:
     """Exact-key Stats lookup. No fallback across season, match_type,
     scope, team, player, provider or competition. Missing dimension ->
     UNKNOWN, never a guess.
 
-    Q2-fix (PR #216 round 1): provider and competition are explicit
-    query dimensions, matching the full binding in ``stats_key``. The
-    defaults are the canonical binding (CBA_OFFICIAL / CBA), NOT a
-    silent fallback: a record whose raw provider/competition differs
-    from the requested binding is skipped BEFORE canonical validation,
-    so a mixed corpus can never produce a false CONFLICT, a
-    cross-provider fallback, or a validation crash from the
-    non-matching record. An explicit non-canonical binding returns
-    UNKNOWN immediately, without validating non-canonical records:
-    the canonical validator admits exactly CBA_OFFICIAL / CBA, so
-    such a binding is provably empty and no verified record can match
-    it. After validation the binding is re-checked on the validated
-    record as defence in depth. Existing callers that omit these
-    arguments therefore still get exactly the canonical binding they
-    previously got implicitly.
+    Q2-fix (PR #216 round 2): provider and competition are REQUIRED
+    keyword-only arguments with NO defaults, matching the full binding
+    in ``stats_key`` and the frozen no-silent-default invariant.
+    Omitting either raises TypeError at call time, before any lookup,
+    so a caller can never silently obtain the canonical binding: the
+    canonical binding (CBA_OFFICIAL / CBA) must be passed explicitly.
+    A record whose raw provider/competition differs from the requested
+    binding is skipped BEFORE canonical validation, so a mixed corpus
+    can never produce a false CONFLICT, a cross-provider fallback, or
+    a validation crash from the non-matching record. An explicit
+    non-canonical binding returns UNKNOWN immediately, without
+    validating non-canonical records: the canonical validator admits
+    exactly CBA_OFFICIAL / CBA, so such a binding is provably empty
+    and no verified record can match it. After validation the binding
+    is re-checked on the validated record as defence in depth.
     """
     if scope not in ("WHOLE_SEASON", "TEAM_SPLIT"):
         raise KcError(f"INVALID_SCOPE:{scope}")
