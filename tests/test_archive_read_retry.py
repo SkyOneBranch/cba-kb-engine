@@ -334,10 +334,18 @@ def test_archive_read_retry_id_reuse_regression():
 
     Each retry must use a fresh transport object, and the recorded
     transports must be distinguishable by identity, not by a recycled
-    integer id. Looping over fresh ArchiveDrive instances makes the
-    allocator-dependent failure reproducible instead of a lucky pass:
-    on unfixed code this fails whenever CPython reuses a freed api
-    object's id for a later transport.
+    integer id. Two layers, kept distinct:
+
+    (a) Deterministic contract check (added for Issue #217 clause 4):
+    recorded transports must be transport OBJECTS, never id() integers.
+    On unfixed code _read appends id(self.api), so this assertion fails
+    on the first trial, by assertion, regardless of allocator reuse.
+    After the fix _read appends the api object itself, so it passes.
+
+    (b) Allocator-dependent set check (retained): looping over fresh
+    ArchiveDrive instances, the set-cardinality assertion fails on
+    unfixed code only whenever CPython reuses a freed api object's id
+    for a later transport (6 vs 7 in the original test).
     """
     for _trial in range(20):
         d = ArchiveDrive()
@@ -358,6 +366,15 @@ def test_archive_read_retry_id_reuse_regression():
         assert d.faults_raised >= 4
         assert d.transport_builds == d.faults_raised
         assert len(d.reads) == 40 + d.faults_raised
+        # Deterministic contract check: recorded transports must be
+        # transport objects with a files() read path, never id()
+        # integers. On unfixed code every entry is an int, so this
+        # fails by assertion on the first trial; it is not an
+        # import, syntax, environment, or allocator-luck failure.
+        assert d.read_transports, 'no transports recorded'
+        assert all(not isinstance(t, int) for t in d.read_transports), \
+            'read_transports must record transport objects, not id() ints'
+        assert all(hasattr(t, 'files') for t in d.read_transports)
         # set() counts by value for ints and by identity for objects, so
         # this is the allocator-dependent assertion: on unfixed code it
         # fails whenever a freed api id is reused (6 vs 7); after the
