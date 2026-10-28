@@ -102,11 +102,14 @@ def render_markdown_table(slice_dict: Dict[str, Any]) -> str:
 
 def render_passage_doc(passage: Dict[str, Any], *,
                        evidence_verified: bool = False) -> str:
-    """Passage text-doc candidate rendering: title, excerpt, revision,
-    locator, digest, and an explicit end marker line. The caller must
-    assert evidence_verified=True — i.e. the passage evidence was
-    verified (text + digest) before rendering — otherwise this raises
-    instead of stamping an unverified passage as complete."""
+    """INTERNAL primitive: passage text-doc candidate rendering:
+    title, excerpt, revision, locator, digest, and an explicit end
+    marker line. The caller must assert evidence_verified=True —
+    otherwise this raises instead of stamping an unverified passage as
+    complete. The flag is trusted ONLY when set by
+    kc_consume.ConsumeSession.render_verified() after its own
+    verification; a caller-set True is not a consumer trust signal.
+    Consumer rendering must go through kc_consume.render_verified()."""
     if evidence_verified is not True:
         raise KcRenderError("PASSAGE_EVIDENCE_NOT_VERIFIED")
     lines = [

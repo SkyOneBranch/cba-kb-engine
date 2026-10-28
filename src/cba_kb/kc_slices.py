@@ -82,7 +82,12 @@ def build_slice(records: List[Dict[str, Any]], *, player_uid: str,
     provider and competition have NO defaults: omitting either raises
     TypeError before any lookup. The requested player_uid must be in
     authorized_ids, else the slice is refused (PLAYER_NOT_AUTHORIZED)
-    before any record is read.
+    before any record is read. That refusal code and the EMPTY return
+    for an authorized-but-missing key are INTERNAL diagnostics: they
+    distinguish unauthorized from nonexistent, so they are NOT the
+    consumer surface. The consumer surface is
+    kc_consume.ConsumeSession.consume_slice(), which translates both
+    outcomes into one identical uniform result.
 
     Residual risk (Q2 round 1, NOTE): a non-canonical
     provider/competition combination currently returns EMPTY,

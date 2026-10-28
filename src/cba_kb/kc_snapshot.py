@@ -156,8 +156,13 @@ def build_snapshot(*, entries: List[Dict[str, Any]], target_domain: str,
                    engine_candidate: str, build_code: str,
                    simulated_published_state: str = "SIMULATED_PUBLISHED"
                    ) -> Snapshot:
-    """Build an immutable snapshot. Entry validation is fail-closed:
-    a bad SHA-256, authority, or rights value is a build failure."""
+    """INTERNAL primitive: build an immutable snapshot from
+    caller-supplied entries. Entry validation is fail-closed: a bad
+    SHA-256, authority, or rights value is a build failure. A raw
+    build_snapshot() result is not by itself a consumer-trusted
+    snapshot: consumer trust requires binding through
+    kc_consume.ConsumeSession.bind_current() (digest recomputed,
+    target checked) and the entry's citation/answer paths."""
     plain = []
     for entry in entries:
         item = _plain_entry(entry)

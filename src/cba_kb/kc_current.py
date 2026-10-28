@@ -19,18 +19,52 @@ now resolves the staged identifier against a snapshot registry
 snapshot digest with validate_snapshot(), and checks the target domain.
 Without any registry it FAILS (fail-closed) — it never falls back to
 prefix-only checking.
+
+Route A (Q2 round 2 FAIL response, rule B): validate() binds the
+validated digest and a deep copy of the validated content; commit()
+recomputes against the current registry content and refuses on any
+mismatch, wrong target, or registry replacement. Validation proves
+the state at validation time only — never a later, mutated state.
 """
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 from typing import Any, Callable, Dict, Optional
 
-from .kc_projection import KcError
+from .kc_projection import KcError, canonical_json
 from .kc_snapshot import validate_snapshot
 
 
 class KcCurrentError(KcError):
     """Fail-closed current-pointer contract violation."""
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, tuple):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_jsonable(v) for v in value]
+    return value
+
+
+def _canonical_state(snapshot: Any) -> bytes:
+    """Canonical bytes of a snapshot's full content, for
+    validate-to-commit comparison. Dict snapshots are compared
+    field-for-field; frozen dataclass snapshots are compared via
+    their field mapping (they cannot mutate in place, so the digest
+    check below is their binding)."""
+    if isinstance(snapshot, dict):
+        return canonical_json(_jsonable(snapshot))
+    try:
+        plain = dataclasses.asdict(snapshot)
+    except (TypeError, ValueError):
+        plain = {k: getattr(snapshot, k) for k in dir(snapshot)
+                 if not k.startswith("_")}
+    return canonical_json(_jsonable(plain))
 
 
 class SimulatedCurrentStore:
@@ -47,6 +81,22 @@ class SimulatedCurrentStore:
         self._current: Optional[str] = None
         self._seq = 0
         self._registry: Dict[str, Any] = {}
+        # Route A (rule B): validate() binds the validated digest,
+        # the validated content (deep copy), and the registry mapping
+        # used. commit() recomputes against the CURRENT registry
+        # content and refuses on any mismatch — a dict mutated after
+        # validation, a registry entry replaced after validation, a
+        # wrong target, or a missing entry can no longer commit.
+        self._validated_id: Optional[str] = None
+        self._validated_copy: Any = None
+        self._validated_registry: Optional[Dict[str, Any]] = None
+        self._validated_digest: Optional[str] = None
+
+    def _clear_validation(self) -> None:
+        self._validated_id = None
+        self._validated_copy = None
+        self._validated_registry = None
+        self._validated_digest = None
 
     def register(self, snapshot: Any) -> str:
         """Register a snapshot object (or dict) by its snapshot_id so
@@ -61,6 +111,8 @@ class SimulatedCurrentStore:
         return sid
 
     def stage(self, snapshot_id: str) -> None:
+        # Staging a new id invalidates any prior validation binding.
+        self._clear_validation()
         self._staged = snapshot_id
         self.state = "STAGED"
 
@@ -75,35 +127,86 @@ class SimulatedCurrentStore:
         if (not isinstance(staged, str) or not staged
                 or not staged.startswith("kc-snapshot:")):
             self.state = "FAILED"
+            self._clear_validation()
             raise KcCurrentError("STAGED_SNAPSHOT_INVALID")
         registry = snapshots if snapshots is not None else self._registry
         if not registry:
             self.state = "FAILED"
+            self._clear_validation()
             raise KcCurrentError("STAGED_SNAPSHOT_NO_REGISTRY")
         snap = registry.get(staged)
         if snap is None:
             self.state = "FAILED"
+            self._clear_validation()
             raise KcCurrentError("STAGED_SNAPSHOT_NOT_REGISTERED")
         if validate_snapshot(snap)["valid"] is not True:
             self.state = "FAILED"
+            self._clear_validation()
             raise KcCurrentError("STAGED_SNAPSHOT_DIGEST_INVALID")
         if isinstance(snap, dict):
             domain = snap.get("target_domain")
+            digest = snap.get("content_sha256")
         else:
             domain = getattr(snap, "target_domain", None)
+            digest = getattr(snap, "content_sha256", None)
         if domain != self.target_domain:
             self.state = "FAILED"
+            self._clear_validation()
             raise KcCurrentError("STAGED_SNAPSHOT_TARGET_MISMATCH")
+        # Bind validation to this exact content and registry mapping.
+        self._validated_id = staged
+        self._validated_registry = registry
+        self._validated_copy = copy.deepcopy(snap)
+        self._validated_digest = digest
         self.state = "VALIDATED"
         return {"valid": True, "snapshot_id": staged}
 
     def commit(self) -> Dict[str, Any]:
         if self.state != "VALIDATED" or self._staged is None:
             raise KcCurrentError("COMMIT_REQUIRES_VALIDATED_STAGE")
+        # Revalidate against the CURRENT registry content: a dict
+        # mutated after validate(), a registry entry replaced after
+        # validate(), a digest change, or a target change all refuse
+        # here — validation proves nothing about a later state.
+        staged = self._staged
+        registry = self._validated_registry
+        if registry is None or self._validated_id != staged:
+            self.state = "FAILED"
+            self._clear_validation()
+            raise KcCurrentError("COMMIT_VALIDATION_STALE")
+        current = registry.get(staged)
+        if current is None:
+            self.state = "FAILED"
+            self._clear_validation()
+            raise KcCurrentError("COMMIT_VALIDATION_MISSING")
+        if _canonical_state(current) != _canonical_state(
+                self._validated_copy):
+            self.state = "FAILED"
+            self._clear_validation()
+            raise KcCurrentError("COMMIT_VALIDATION_STALE")
+        if validate_snapshot(current)["valid"] is not True:
+            self.state = "FAILED"
+            self._clear_validation()
+            raise KcCurrentError("COMMIT_VALIDATION_DIGEST_INVALID")
+        if isinstance(current, dict):
+            domain = current.get("target_domain")
+            digest = current.get("content_sha256")
+        else:
+            domain = getattr(current, "target_domain", None)
+            digest = getattr(current, "content_sha256", None)
+        if domain != self.target_domain:
+            self.state = "FAILED"
+            self._clear_validation()
+            raise KcCurrentError("COMMIT_VALIDATION_TARGET_MISMATCH")
+        if digest != self._validated_digest:
+            self.state = "FAILED"
+            self._clear_validation()
+            raise KcCurrentError("COMMIT_VALIDATION_STALE")
         self._current = self._staged
         self._staged = None
         self.state = "CURRENT"
         self._seq += 1
+        self._clear_validation()
         return self.observed_receipt()
 
     def read_current(self) -> Optional[str]:

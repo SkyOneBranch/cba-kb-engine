@@ -67,8 +67,14 @@ def verify_passage_text(passage: Dict[str, Any],
 
 def cite_verbatim(passage: Dict[str, Any],
                   source_text: str) -> Dict[str, Any]:
-    """Verbatim citation, or UNKNOWN with no text. A failed verification
-    never yields a partial or paraphrased quote presented as verbatim."""
+    """INTERNAL primitive: verbatim citation, or UNKNOWN with no text.
+    A failed verification never yields a partial or paraphrased quote
+    presented as verbatim. This checks text/digest only — it does NOT
+    check snapshot membership, source authorization, or evidence-chain
+    binding. Consumer citation must go through
+    kc_consume.ConsumeSession.consume_citation(), which gates all of
+    those; a raw cite_verbatim() result is never a trusted consumer
+    citation on its own."""
     if verify_passage_text(passage, source_text):
         return {"status": "OK", "grain": "DOCUMENT",
                 "verbatim": passage["text"],

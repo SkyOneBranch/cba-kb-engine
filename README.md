@@ -129,6 +129,12 @@ live query service:
 - **Permission-first views** (`kc_visibility`): a reader only ever
   sees material they are authorized for; something they may not
   see looks exactly the same as something that does not exist.
+- **Unified consumption entry** (`kc_consume`, Route A): the only
+  consumer-trusted surface. Raw builders are internal primitives;
+  only entry-verified outputs (authorization, digest, snapshot and
+  receipt binding re-checked by the entry, not trusted from caller
+  flags) count as consumer results, and only entry-verified
+  artifacts render.
 
 What this does **not** mean yet: these are offline implementations
 tested on synthetic (made-up) examples. They are **not** verified on
@@ -137,15 +143,27 @@ stays NOT_VERIFIED until it is separately authorized and run. Nothing
 here claims a P0 pass, a real Drive test pass, or a production
 release.
 
-Known limits after independent Q2 round 1 (FAIL) and repair round 1:
-the Q2 blockers were fixed in code — snapshot IDs now bind full slice
-payloads, snapshot digests cover every manifest field except the two
-self-hash fields, current-pointer validation resolves registered
-snapshots (digest + target domain) and fails closed without a registry,
-markdown/text completeness requires a terminal marker, catalog and
-passage rendering refuse incomplete/unverified input, and every
-exported builder requires an authorized ID set. Remaining residual
-risks: upstream pagination completeness is proven only over supplied
-pages, and falsification evidence for brand-new modules partly rests
-on interface-delta fallbacks (labelled honestly in the tests).
-Real-client verification stays NOT_VERIFIED as above.
+Known limits after independent Q2 round 2 (FAIL) and the Route A
+repair: round 1 closed the snapshot-ID payload binding (B1) and full
+manifest digest coverage (B2); round 2 found B3–B7 only partially
+closed and raised five new blockers (raw construction/citation paths
+bypassing authorization, unauthorized-vs-nonexistent distinguishable
+on raw slice paths, validate-to-commit not atomically bound,
+evidence-chain verification not gating citation, Claim guard not
+invoked by any integrated path). The Route A repair answers with one
+unified entry (`kc_consume`): raw builders are internal primitives
+and their outputs are not consumer-trusted; only entry-verified
+outputs are. Unauthorized-vs-nonexistent uniformity holds ON THE
+ENTRY surface — raw primitive error codes (for example
+PLAYER_NOT_AUTHORIZED vs EMPTY) remain internal diagnostics and are
+not consumer surfaces. The entry proves consistency with
+session-registered state (recomputed digests, registry membership,
+snapshot/receipt/build bindings); it does NOT prove real Drive
+authorization, producer-source authenticity, ACL eligibility, or
+upstream pagination completeness, which stay NOT_VERIFIED as above.
+Remaining residual risks: upstream pagination completeness is proven
+only over supplied pages; within-process session tokens are capability
+records, not cryptographic authentication; and falsification evidence
+for the brand-new entry partly rests on interface-delta tests
+(labelled honestly in the tests) paired with behavioral
+demonstrations of the raw-primitive gaps.

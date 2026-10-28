@@ -5,8 +5,13 @@ The authorized ID set is applied BEFORE any consumer-visible surface
 (catalog, index, count, summary, path, diagnostic) is built — by
 target_first_view/query_visible in this module, and (repair round 1)
 as a required argument of the PR-B builders in kc_slices, kc_passages,
-and kc_snapshot, so no exported builder can be invoked on raw
-collections. F-02:
+and kc_snapshot. Narrowing (Route A, Q2 round 2 FAIL response): the
+required argument constrains the builders that take it, but the raw
+builders remain directly callable, so builder-level filtering alone is
+NOT the consumer trust boundary. The consumer boundary is
+kc_consume.ConsumeSession, which translates every consumer surface
+(including raw distinguishing outcomes) into uniform results and
+refuses unverified artifacts. F-02:
 an unauthorized-existing object and a non-existent object return the
 IDENTICAL uniform not-found result — no leaked count, title, ID, or
 path. Instruction-like source text is DATA and is never executed.
@@ -113,7 +118,11 @@ def refuse_claim_merge(fact: Dict[str, Any], claim: Dict[str, Any]) -> None:
     through this guard and be refused. This function always raises:
     its existence is the choke point, and the raise is the enforcement.
     The Fact is never modified (the raise happens before any write,
-    and this function performs no write at all)."""
+    and this function performs no write at all). Route A: the guard is
+    invoked on the integrated path by
+    kc_consume.ConsumeSession.consume_answer() for every
+    fact-colliding claim; the refusal is recorded in the answer's
+    claim layer, and the claim is reported only there."""
     fact_id = fact.get("fact_id", "unknown") if isinstance(fact, dict) \
         else "unknown"
     raise ValueError(
