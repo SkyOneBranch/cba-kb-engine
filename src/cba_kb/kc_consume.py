@@ -146,7 +146,7 @@ def _content_digest(payload: Dict[str, Any]) -> str:
 
 
 class ConsumeSession:
-    """One controlled consumption session: one target domain, three
+    """One controlled consumption session — one target domain, three
     authorized sets (players, sources, objects), one bound current
     snapshot, one registered authorized-passage set, one session
     token. All consumer outputs are produced through its methods."""
@@ -244,7 +244,7 @@ class ConsumeSession:
             "verification": {
                 "verified_by": "kc_consume",
                 "entry": entry,
-                "session_id": self.session_id,
+                "session_id": str(self.session_id),
                 "content_digest": _content_digest(payload),
                 "snapshot_id": sid,
                 "simulated": True,

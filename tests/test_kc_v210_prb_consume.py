@@ -357,7 +357,7 @@ def test_entry_citation_refuses_unregistered_source(fx):
     mod = _entry_or_fail()
     session, snap, passage, chain = _bound_session(mod, fx)
     # Valid digest, authorized-looking source, but never registered
-    # with this session: not a member of the authorized source set.
+    # with this session — not a member of the authorized source set.
     other = build_routed_passage(
         source_id="fixture_doc_D1", revision="rev-1", locator="P3",
         text=QUOTE, player_uid=A, aliases=["测试甲"],
