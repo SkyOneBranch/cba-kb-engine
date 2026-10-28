@@ -42,13 +42,21 @@ def _unit(metric: str) -> str:
 
 def entity_candidates(players: List[Dict[str, Any]],
                       aliases: List[Dict[str, Any]], *, query: str,
-                      query_kind: str) -> Dict[str, Any]:
+                      query_kind: str,
+                      authorized_ids: Any) -> Dict[str, Any]:
     """Approved-alias / canonical-name -> ALL visible UID candidates.
 
     Delegates to Slice A resolve_identity: a multi-candidate name or
     alias returns every candidate with CLARIFICATION_REQUIRED, never a
-    single most-similar pick and never an auto-merge.
+    single most-similar pick and never an auto-merge. Players and
+    aliases are filtered by authorized_ids FIRST: a UID outside the
+    authorized set never appears in candidates, so within the
+    authorized view an unauthorized UID is indistinguishable from a
+    non-existent one (F-02).
     """
+    allowed = set(authorized_ids)
+    players = [p for p in players if p.get("player_uid") in allowed]
+    aliases = [a for a in aliases if a.get("player_uid") in allowed]
     result = resolve_identity(players, aliases, query=query,
                               query_kind=query_kind)
     return {
@@ -65,18 +73,28 @@ def entity_candidates(players: List[Dict[str, Any]],
 def build_slice(records: List[Dict[str, Any]], *, player_uid: str,
                 season: str, match_type: str, scope: str,
                 provider: str, competition: str,
+                authorized_ids: Any,
                 team_id: Optional[str] = None) -> Dict[str, Any]:
     """One query-ready slice for an exact key. Lookup is completed
     (complete/end_marker True) even when the slice is EMPTY; an empty
     slice means no verified record for the exact key, never a guess.
 
     provider and competition have NO defaults: omitting either raises
-    TypeError before any lookup.
+    TypeError before any lookup. The requested player_uid must be in
+    authorized_ids, else the slice is refused (PLAYER_NOT_AUTHORIZED)
+    before any record is read.
+
+    Residual risk (Q2 round 1, NOTE): a non-canonical
+    provider/competition combination currently returns EMPTY,
+    indistinguishable from a valid-but-empty key; no provider vocabulary
+    yet distinguishes invalid dimensions from empty results.
     """
     if scope not in ("WHOLE_SEASON", "TEAM_SPLIT"):
         raise KcSliceError(f"INVALID_SCOPE:{scope}")
     if scope == "TEAM_SPLIT" and not team_id:
         raise KcSliceError("TEAM_SPLIT_REQUIRES_TEAM_ID")
+    if player_uid not in set(authorized_ids):
+        raise KcSliceError("PLAYER_NOT_AUTHORIZED")
     base = {
         "player_uid": player_uid, "provider": provider,
         "competition": competition, "season": season,
@@ -131,10 +149,12 @@ def build_slice(records: List[Dict[str, Any]], *, player_uid: str,
 def build_slice_catalog(records: List[Dict[str, Any]], *, player_uid: str,
                         expected_keys: List[Tuple[Any, ...]],
                         provider: str,
-                        competition: str) -> Dict[str, Any]:
+                        competition: str,
+                        authorized_ids: Any) -> Dict[str, Any]:
     """Catalog of declared slices. An expected slice with no verified
     record is listed in ``missing`` and makes the catalog PARTIAL with
-    end_marker False — never a silent omission."""
+    end_marker False — never a silent omission. The player_uid
+    authorization rule of build_slice applies to every slice."""
     slices = []
     missing = []
     for key in expected_keys:
@@ -142,7 +162,8 @@ def build_slice_catalog(records: List[Dict[str, Any]], *, player_uid: str,
         team = key[3] if len(key) > 3 else None
         sl = build_slice(records, player_uid=player_uid, season=season,
                          match_type=match_type, scope=scope, team_id=team,
-                         provider=provider, competition=competition)
+                         provider=provider, competition=competition,
+                         authorized_ids=authorized_ids)
         sl = dict(sl, slice_key=(season, match_type, scope, team))
         slices.append(sl)
         if sl["status"] == "EMPTY":

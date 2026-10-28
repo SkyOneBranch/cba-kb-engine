@@ -60,7 +60,7 @@ def test_passage_doc_carries_excerpt_revision_locator_digest(fx):
     passage = {"source_id": "fixture_doc_D1", "revision": "rev-1",
                "locator": "P3", "text": QUOTE, "digest": "f" * 64,
                "title": "授权中文采访"}
-    text = render_passage_doc(passage)
+    text = render_passage_doc(passage, evidence_verified=True)
     assert QUOTE in text and "rev-1" in text and "P3" in text
     assert "f" * 64 in text
     assert check_completeness(text, kind="text") is True
@@ -91,8 +91,41 @@ def test_measurement_protocol_covers_required_checks_and_is_not_verified():
 
 def test_catalog_rendering_carries_end_marker(fx):
     catalog = {"catalog_version": 1, "snapshot_id": "kc-snapshot:abc",
-               "slices": [_slice(fx)]}
+               "slices": [_slice(fx)], "complete": True, "end_marker": True}
     text = render_catalog(catalog)
     parsed = json.loads(text)
     assert parsed["end_marker"] is True
     assert parsed["catalog_version"] == 1
+
+
+# ---- Repair round 1: terminal-marker enforcement (R4) ----
+# These fail behaviorally on pre-repair code: the old parser accepts an
+# embedded marker, the old catalog renderer stamps completion, and the
+# old passage renderer appends a marker without any verification.
+
+def test_embedded_marker_in_body_is_not_terminal_proof(fx):
+    text = ("# Title\n\nBody mentions end_marker: true in passing.\n\n"
+            "Content ends here with NO terminal marker line.\n")
+    with pytest.raises(KcRenderError):
+        parse_rendered(text, kind="markdown")
+    assert check_completeness(text, kind="markdown") is False
+    good = render_markdown_table(_slice(fx)) + "\n\n"
+    assert check_completeness(good, kind="markdown") is True
+
+
+def test_incomplete_catalog_rendering_is_refused(fx):
+    with pytest.raises(KcRenderError):
+        render_catalog({"catalog_version": 1, "complete": False,
+                        "end_marker": False})
+    with pytest.raises(KcRenderError):
+        render_catalog({"catalog_version": 1})
+
+
+def test_passage_doc_requires_explicit_evidence_verification(fx):
+    passage = {"source_id": "fixture_doc_D1", "revision": "rev-1",
+               "locator": "P3", "text": QUOTE, "digest": "f" * 64,
+               "title": "授权中文采访"}
+    with pytest.raises(KcRenderError):
+        render_passage_doc(passage)
+    text = render_passage_doc(passage, evidence_verified=True)
+    assert QUOTE in text and "rev-1" in text and "P3" in text

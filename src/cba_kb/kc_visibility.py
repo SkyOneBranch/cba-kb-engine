@@ -2,7 +2,11 @@
 only.
 
 The authorized ID set is applied BEFORE any consumer-visible surface
-(catalog, index, count, summary, path, diagnostic) is built. F-02:
+(catalog, index, count, summary, path, diagnostic) is built — by
+target_first_view/query_visible in this module, and (repair round 1)
+as a required argument of the PR-B builders in kc_slices, kc_passages,
+and kc_snapshot, so no exported builder can be invoked on raw
+collections. F-02:
 an unauthorized-existing object and a non-existent object return the
 IDENTICAL uniform not-found result — no leaked count, title, ID, or
 path. Instruction-like source text is DATA and is never executed.
@@ -100,3 +104,17 @@ def treat_as_data(text: str) -> Dict[str, Any]:
                            for p in _INSTRUCTION_PATTERNS)
     return {"kind": "DATA", "text": text, "executed": False,
             "action_taken": "NONE", "instruction_like": instruction_like}
+
+
+def refuse_claim_merge(fact: Dict[str, Any], claim: Dict[str, Any]) -> None:
+    """F-01 guard (repair round 1): Claims resolve in a separate
+    namespace and are NEVER merged into a Fact. There is no legal
+    Claim-to-Fact application, so any code path attempting one must go
+    through this guard and be refused. This function always raises:
+    its existence is the choke point, and the raise is the enforcement.
+    The Fact is never modified (the raise happens before any write,
+    and this function performs no write at all)."""
+    fact_id = fact.get("fact_id", "unknown") if isinstance(fact, dict) \
+        else "unknown"
+    raise ValueError(
+        f"CLAIM_MERGE_INTO_FACT_REFUSED:{fact_id}")

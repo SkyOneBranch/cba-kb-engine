@@ -128,3 +128,12 @@ python scripts/run_cleanroom_smoke.py --output .cleanroom/ci-smoke
 真实 ChatGPT Web + Google Drive 客户端上验证——真实客户端检查
 在另行授权并实际执行前仍为 NOT_VERIFIED。这里不宣称 P0 通过、
 真实 Drive 测试通过或生产发布。
+
+独立 Q2 首轮（FAIL）与修复轮 1 之后的已知限度：Q2 阻断项已在代码
+中修复——快照 ID 现绑定完整切片载荷、快照摘要覆盖除两个自哈希
+字段外的全部清单字段、当前指针校验解析已注册快照（摘要＋目标
+域）且无注册表时 fail-closed、Markdown/文本完整性要求末尾标记、
+目录与段落渲染拒绝不完整/未核验输入、全部导出构造器都要求授权
+ID 集。剩余残余风险：上游分页完整性仅在已提供页面范围内得到证
+明；全新模块的证伪证据部分依赖接口差异回退（测试中已如实标
+注）。真实客户端验证如上仍为 NOT_VERIFIED。

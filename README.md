@@ -136,3 +136,16 @@ the real ChatGPT Web + Google Drive client — that real-client check
 stays NOT_VERIFIED until it is separately authorized and run. Nothing
 here claims a P0 pass, a real Drive test pass, or a production
 release.
+
+Known limits after independent Q2 round 1 (FAIL) and repair round 1:
+the Q2 blockers were fixed in code — snapshot IDs now bind full slice
+payloads, snapshot digests cover every manifest field except the two
+self-hash fields, current-pointer validation resolves registered
+snapshots (digest + target domain) and fails closed without a registry,
+markdown/text completeness requires a terminal marker, catalog and
+passage rendering refuse incomplete/unverified input, and every
+exported builder requires an authorized ID set. Remaining residual
+risks: upstream pagination completeness is proven only over supplied
+pages, and falsification evidence for brand-new modules partly rests
+on interface-delta fallbacks (labelled honestly in the tests).
+Real-client verification stays NOT_VERIFIED as above.

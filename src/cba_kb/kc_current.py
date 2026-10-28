@@ -12,6 +12,13 @@ question, the snapshot authorized for this target, legally published in
 the SIMULATED sense, and observable by this offline client at question
 time — never main-latest, never original-modification-latest, never
 chat-memory-latest.
+
+Repair round 1 (Q2 FAIL response): SimulatedCurrentStore.validate()
+now resolves the staged identifier against a snapshot registry
+(registered via register(), or passed explicitly), verifies the
+snapshot digest with validate_snapshot(), and checks the target domain.
+Without any registry it FAILS (fail-closed) — it never falls back to
+prefix-only checking.
 """
 
 from __future__ import annotations
@@ -19,6 +26,7 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, Optional
 
 from .kc_projection import KcError
+from .kc_snapshot import validate_snapshot
 
 
 class KcCurrentError(KcError):
@@ -27,7 +35,10 @@ class KcCurrentError(KcError):
 
 class SimulatedCurrentStore:
     """Offline pointer store. States: EMPTY -> STAGED -> VALIDATED ->
-    CURRENT, or FAILED. A commit is only possible from VALIDATED."""
+    CURRENT, or FAILED. A commit is only possible from VALIDATED.
+    Validation resolves the staged identifier against a snapshot
+    registry: the snapshot must exist in the registry, its digest must
+    validate, and its target domain must equal this store's domain."""
 
     def __init__(self, *, target_domain: str):
         self.target_domain = target_domain
@@ -35,17 +46,54 @@ class SimulatedCurrentStore:
         self._staged: Optional[str] = None
         self._current: Optional[str] = None
         self._seq = 0
+        self._registry: Dict[str, Any] = {}
+
+    def register(self, snapshot: Any) -> str:
+        """Register a snapshot object (or dict) by its snapshot_id so
+        validate() can resolve it. Returns the registered ID."""
+        if isinstance(snapshot, dict):
+            sid = snapshot.get("snapshot_id")
+        else:
+            sid = getattr(snapshot, "snapshot_id", None)
+        if not isinstance(sid, str) or not sid:
+            raise KcCurrentError("REGISTERED_SNAPSHOT_HAS_NO_ID")
+        self._registry[sid] = snapshot
+        return sid
 
     def stage(self, snapshot_id: str) -> None:
         self._staged = snapshot_id
         self.state = "STAGED"
 
-    def validate(self) -> Dict[str, Any]:
+    def validate(self, *, snapshots: Optional[Dict[str, Any]] = None
+                 ) -> Dict[str, Any]:
+        """Resolve the staged identifier against the registry (the
+        explicitly passed mapping, else this store's own registry).
+        Fail-closed at every step: a missing registry, an unregistered
+        ID, a digest failure, or a target-domain mismatch all set FAILED
+        and raise. Prefix shape alone never validates."""
         staged = self._staged
         if (not isinstance(staged, str) or not staged
                 or not staged.startswith("kc-snapshot:")):
             self.state = "FAILED"
             raise KcCurrentError("STAGED_SNAPSHOT_INVALID")
+        registry = snapshots if snapshots is not None else self._registry
+        if not registry:
+            self.state = "FAILED"
+            raise KcCurrentError("STAGED_SNAPSHOT_NO_REGISTRY")
+        snap = registry.get(staged)
+        if snap is None:
+            self.state = "FAILED"
+            raise KcCurrentError("STAGED_SNAPSHOT_NOT_REGISTERED")
+        if validate_snapshot(snap)["valid"] is not True:
+            self.state = "FAILED"
+            raise KcCurrentError("STAGED_SNAPSHOT_DIGEST_INVALID")
+        if isinstance(snap, dict):
+            domain = snap.get("target_domain")
+        else:
+            domain = getattr(snap, "target_domain", None)
+        if domain != self.target_domain:
+            self.state = "FAILED"
+            raise KcCurrentError("STAGED_SNAPSHOT_TARGET_MISMATCH")
         self.state = "VALIDATED"
         return {"valid": True, "snapshot_id": staged}
 

@@ -5,6 +5,12 @@ connector. Readability is NOT_VERIFIED until separately authorized
 Phase-2 measurement (see MEASUREMENT_PROTOCOL). A rendering without
 its end marker is an explicit error, never a silent truncation: the
 parser raises instead of returning partial content as complete.
+
+Repair round 1 (Q2 FAIL response): the markdown/text check now
+requires the marker as the LAST non-empty line (an embedded occurrence
+no longer counts); render_catalog raises on incomplete input instead
+of stamping it complete; render_passage_doc requires the caller to
+assert evidence_verified=True, otherwise it raises.
 """
 
 from __future__ import annotations
@@ -94,9 +100,15 @@ def render_markdown_table(slice_dict: Dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def render_passage_doc(passage: Dict[str, Any]) -> str:
+def render_passage_doc(passage: Dict[str, Any], *,
+                       evidence_verified: bool = False) -> str:
     """Passage text-doc candidate rendering: title, excerpt, revision,
-    locator, digest, and an explicit end marker line."""
+    locator, digest, and an explicit end marker line. The caller must
+    assert evidence_verified=True — i.e. the passage evidence was
+    verified (text + digest) before rendering — otherwise this raises
+    instead of stamping an unverified passage as complete."""
+    if evidence_verified is not True:
+        raise KcRenderError("PASSAGE_EVIDENCE_NOT_VERIFIED")
     lines = [
         "# %s" % passage.get("title", passage["source_id"]),
         "",
@@ -113,9 +125,13 @@ def render_passage_doc(passage: Dict[str, Any]) -> str:
 
 
 def render_catalog(catalog: Dict[str, Any]) -> str:
-    """Catalog candidate rendering. The rendering itself is complete
-    (it renders the whole catalog dict given); slice-level completeness
-    remains the slices' own end markers."""
+    """Catalog candidate rendering. The input must already be complete
+    (complete True AND end_marker True); anything else raises instead
+    of being stamped complete. Slice-level completeness remains the
+    slices' own end markers."""
+    if catalog.get("complete") is not True \
+            or catalog.get("end_marker") is not True:
+        raise KcRenderError("CATALOG_NOT_COMPLETE")
     rendered = dict(catalog)
     rendered["rendering_kind"] = "json_catalog"
     rendered["readability"] = READABILITY_STATUS
@@ -127,14 +143,18 @@ def render_catalog(catalog: Dict[str, Any]) -> str:
 def parse_rendered(text: str, *, kind: str) -> Dict[str, Any]:
     """Parse a rendering and enforce its end marker. A missing or
     false end marker raises KcRenderError — partial content is never
-    returned as complete."""
+    returned as complete. For markdown/text, the marker must be the
+    LAST non-empty line, exactly "end_marker: true": an occurrence
+    embedded in body text does not count."""
     if kind == "json":
         parsed = json.loads(text)
         if parsed.get("end_marker") is not True:
             raise KcRenderError("RENDERING_END_MARKER_MISSING")
         return parsed
     if kind in ("markdown", "text"):
-        if "end_marker: true" not in text:
+        nonempty = [line.strip() for line in text.splitlines()
+                    if line.strip()]
+        if not nonempty or nonempty[-1] != "end_marker: true":
             raise KcRenderError("RENDERING_END_MARKER_MISSING")
         return {"end_marker": True}
     raise KcRenderError(f"UNKNOWN_RENDERING_KIND:{kind}")

@@ -69,7 +69,9 @@ def test_collection_completes_across_pages_before_ranking(fx):
     routed = _routed(fx)
     pages = [routed[0:20], routed[20:40], routed[40:]]
     collected = collect_candidates(pages, alias="测试甲",
-                                   topic_tokens=["罚球", "训练"])
+                                   topic_tokens=["罚球", "训练"],
+                                   authorized_ids={q["source_id"]
+                                                   for q in routed})
     assert collected["complete"] is True
     assert collected["end_marker"] is True
     assert collected["total_pages"] == 3
@@ -81,7 +83,9 @@ def test_incomplete_collection_is_never_read_as_complete(fx):
     pages = [{"passages": routed[0:20], "end_marker": True},
              {"passages": routed[20:40], "end_marker": False}]
     collected = collect_candidates(pages, alias="测试甲",
-                                   topic_tokens=["罚球"])
+                                   topic_tokens=["罚球"],
+                                   authorized_ids={q["source_id"]
+                                                   for q in routed})
     assert collected["complete"] is False
     assert collected["end_marker"] is False
     first = first_complete_set(collected, limit=5)
@@ -92,7 +96,9 @@ def test_incomplete_collection_is_never_read_as_complete(fx):
 def test_top5_first_complete_set_contains_target(fx):
     routed = _routed(fx)
     collected = collect_candidates([routed], alias="测试甲",
-                                   topic_tokens=["罚球", "训练"])
+                                   topic_tokens=["罚球", "训练"],
+                                   authorized_ids={q["source_id"]
+                                                   for q in routed})
     first = first_complete_set(collected, limit=5)
     assert first["complete"] is True and first["end_marker"] is True
     assert len(first["candidates"]) == 5
@@ -104,7 +110,9 @@ def test_file_id_ordered_truncation_would_drop_target(fx):
     by_id = sorted(routed, key=lambda p: p["source_id"])[:5]
     assert TARGET not in [c["source_id"] for c in by_id]
     collected = collect_candidates([routed], alias="测试甲",
-                                   topic_tokens=["罚球", "训练"])
+                                   topic_tokens=["罚球", "训练"],
+                                   authorized_ids={q["source_id"]
+                                                   for q in routed})
     first = first_complete_set(collected, limit=5)
     assert TARGET in [c["source_id"] for c in first["candidates"]]
 
@@ -121,3 +129,107 @@ def test_evidence_chain_requires_all_links(fx):
         evidence_chain(receipt_id="receipt-1", snapshot_id="",
                        build_version="build-1", source_digest="0" * 64,
                        authorization_basis="SIMULATED_TARGET_SCOPE")
+
+
+# ---- Repair round 1: authorization filtering (R5) + chain verification (R6)
+# For R5, the same repair-falsification bridge as the slices tests: a
+# TypeError on the new authorized_ids call falls back to the old call,
+# whose leak then fails the assertion behaviorally. For R6, the new
+# verify function is absent pre-repair, so the bridge asserts False
+# with the gap documented; the behavioral proof for the old gap is the
+# A6 attack reproduction (inconsistent chain constructed successfully).
+
+def test_collect_excludes_unauthorized_passages(fx):
+    routed = _routed(fx)
+    intruder = build_routed_passage(
+        source_id="fixture_doc_SECRET", revision="rev-1", locator="P1",
+        text=QUOTE, player_uid="fixture_player_X",
+        aliases=["测试甲"], title="secret",
+        authorized_url="fixture://authorized-copy/fixture_doc_SECRET")
+    pages = [[intruder] + routed]
+    authorized = {q["source_id"] for q in routed}
+    try:
+        collected = collect_candidates(pages, alias="测试甲",
+                                       topic_tokens=["罚球", "训练"],
+                                       authorized_ids=authorized)
+    except TypeError:
+        collected = collect_candidates(pages, alias="测试甲",
+                                       topic_tokens=["罚球", "训练"])
+        assert "fixture_doc_SECRET" not in [
+            c["source_id"] for c in collected["candidates"]], (
+            "pre-repair collection leaks unauthorized passages")
+        return
+    assert "fixture_doc_SECRET" not in [
+        c["source_id"] for c in collected["candidates"]]
+    assert collected["complete"] is True
+
+
+def _chain_setup(fx):
+    from cba_kb.kc_snapshot import build_snapshot
+    passage = _routed(fx)[0]
+    snap = build_snapshot(
+        entries=[{"entry_id": "entry-stats", "sha256": "a" * 64,
+                  "authority": "canonical", "rights": "public",
+                  "source_id": "fixture_stats"}],
+        target_domain="fixture_target", capabilities=["stats"],
+        build_provenance="simulated-build-1",
+        build_time="2026-10-28T00:00:00+00:00",
+        data_release="SIMULATED_DATA_RELEASE_1",
+        engine_candidate="SIMULATED_ENGINE_CANDIDATE_1",
+        build_code="SIMULATED_BUILD_CODE_1")
+    chain = evidence_chain(receipt_id="receipt-1",
+                           snapshot_id=snap.snapshot_id,
+                           build_version="build-1",
+                           source_digest=passage["digest"],
+                           authorization_basis="SIMULATED_TARGET_SCOPE")
+    return passage, snap, chain
+
+
+def test_verify_evidence_chain_accepts_consistent_chain(fx):
+    try:
+        from cba_kb.kc_passages import verify_evidence_chain
+    except ImportError:
+        assert False, ("pre-repair code has no chain verification "
+                       "(inconsistent chains accepted, see A6)")
+    passage, snap, chain = _chain_setup(fx)
+    result = verify_evidence_chain(chain, passage=passage, snapshot=snap)
+    assert result["valid"] is True
+
+
+def test_verify_evidence_chain_rejects_wrong_snapshot(fx):
+    try:
+        from cba_kb.kc_passages import verify_evidence_chain
+    except ImportError:
+        assert False, ("pre-repair code has no chain verification "
+                       "(inconsistent chains accepted, see A6)")
+    passage, snap, chain = _chain_setup(fx)
+    bad = dict(chain, snapshot_id="kc-snapshot:other")
+    with pytest.raises(ValueError):
+        verify_evidence_chain(bad, passage=passage, snapshot=snap)
+
+
+def test_verify_evidence_chain_rejects_wrong_digest_and_tampered_passage(fx):
+    try:
+        from cba_kb.kc_passages import verify_evidence_chain
+    except ImportError:
+        assert False, ("pre-repair code has no chain verification "
+                       "(inconsistent chains accepted, see A6)")
+    passage, snap, chain = _chain_setup(fx)
+    bad = dict(chain, source_digest="0" * 64)
+    with pytest.raises(ValueError):
+        verify_evidence_chain(bad, passage=passage, snapshot=snap)
+    tampered = dict(passage, digest="0" * 64)
+    with pytest.raises(ValueError):
+        verify_evidence_chain(chain, passage=tampered, snapshot=snap)
+
+
+def test_verify_evidence_chain_rejects_empty_basis(fx):
+    try:
+        from cba_kb.kc_passages import verify_evidence_chain
+    except ImportError:
+        assert False, ("pre-repair code has no chain verification "
+                       "(inconsistent chains accepted, see A6)")
+    passage, snap, chain = _chain_setup(fx)
+    bad = dict(chain, authorization_basis="")
+    with pytest.raises(ValueError):
+        verify_evidence_chain(bad, passage=passage, snapshot=snap)

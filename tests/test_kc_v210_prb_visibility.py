@@ -95,3 +95,32 @@ def test_instruction_like_text_is_data_never_executed():
     assert treated["executed"] is False
     assert treated["action_taken"] == "NONE"
     assert treated["text"] == text
+
+
+# ---- Repair round 1: Claim-merge guard (R7a) ----
+# The guard is absent pre-repair, so the import fails; that failure is
+# documented here (not presented as behavioral falsification) and the
+# behavioral proof for the old gap is the self-check record: no
+# Claim-application path existed to attack, and no guard refused one.
+
+def test_refuse_claim_merge_raises_and_fact_unchanged(fx):
+    try:
+        from cba_kb.kc_visibility import refuse_claim_merge
+    except ImportError:
+        assert False, "pre-repair code has no Claim-merge guard"
+    fact_before = dict(fx["fact"])
+    with pytest.raises(ValueError):
+        refuse_claim_merge(fx["fact"],
+                           {"team_id": "OTHER_TEAM",
+                            "claim_text": "conflicting claim"})
+    assert fx["fact"] == fact_before
+
+
+def test_claim_resolution_shares_no_mutable_state_with_fact(fx):
+    from cba_kb.kc_projection import resolve_claims
+    fact_before = dict(fx["fact"])
+    claims = resolve_claims(fx["claims"])
+    assert claims is not fx["fact"]
+    assert "fact" not in claims
+    claims["probe"] = "mutation"
+    assert fx["fact"] == fact_before
