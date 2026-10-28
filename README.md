@@ -104,3 +104,113 @@ These are directions for improvement, **not a committed scope or release date**.
 The repository provides a **Public Engine**. Real private material is operated separately in a user's **Private Instance** under applicable permissions and law. Code uses [Apache-2.0](LICENSE), docs use [CC BY 4.0](DATA_LICENSE.md), and synthetic fixtures use [CC0-1.0](DATA_LICENSE.md). Third-party reporting and photographs retain their owners' rights; see [third-party data](THIRD_PARTY_DATA.md).
 
 **Make basketball research easier to verify—not just more confident-sounding.**
+
+## v2.1.0 PR-B (in development, offline and synthetic only)
+
+This work adds the building blocks for answering questions from
+already-published, already-authorized material — without running a
+live query service:
+
+- **Query-ready slices** (`kc_slices`): find a player's records by
+  exact season, competition, match type, and scope, with the full
+  lookup key shown. Missing details are rejected, never guessed.
+- **Passages** (`kc_passages`): find interview or document quotes
+  with their source, revision, and location, and check the quote
+  against the source before repeating it word for word.
+- **Snapshots and manifests** (`kc_snapshot`): bundle a set of
+  records into a versioned, checkable package that can be rebuilt
+  exactly the same way again.
+- **Current pointer (simulated)** (`kc_current`): practise the
+  "which version is current right now?" check offline, including
+  what happens when a version changes or permission is removed.
+- **Candidate renderings** (`kc_render`): small JSON, table, and
+  text formats for the material above, plus a checklist of what a
+  real connector measurement would still need to prove.
+- **Permission-first views** (`kc_visibility`): a reader only ever
+  sees material they are authorized for; something they may not
+  see looks exactly the same as something that does not exist.
+- **Unified consumption entry** (`kc_consume`, Route A + directed
+  repair): the only consumer-trusted surface. Raw builders are
+  internal primitives; a consumer result must pass the entry's
+  re-checked authorization, digest, snapshot-manifest membership,
+  receipt/build binding, and (for answers) Fact binding — not caller
+  flags. The session current is a validated commit plus observed
+  readback, never a retained caller object. Rendering additionally
+  requires the record's producer to match the requested kind, and
+  passage rendering re-checks snapshot membership; rendering also
+  revalidates current authorization at render time (passage source,
+  slice/catalog player, answer Fact UID and Document source, and
+  the answer STATS grain's own digest-protected
+  subject_player_uid — so a STATS field is no longer renderable
+  after revocation even when no other answer grain identifies the
+  player).
+
+What this does **not** mean yet: these are offline implementations
+tested on synthetic (made-up) examples. They are **not** verified on
+the real ChatGPT Web + Google Drive client — that real-client check
+stays NOT_VERIFIED until it is separately authorized and run. Nothing
+here claims a P0 pass, a real Drive test pass, or a production
+release.
+
+Known limits after independent Q2 round 2 (FAIL) and the Route A
+repair: round 1 closed the snapshot-ID payload binding (B1) and full
+manifest digest coverage (B2); round 2 found B3–B7 only partially
+closed and raised five new blockers (raw construction/citation paths
+bypassing authorization, unauthorized-vs-nonexistent distinguishable
+on raw slice paths, validate-to-commit not atomically bound,
+evidence-chain verification not gating citation, Claim guard not
+invoked by any integrated path). The Route A repair answers with one
+unified entry (`kc_consume`): raw builders are internal primitives
+and their outputs are not consumer-trusted; only entry-verified
+outputs are. Unauthorized-vs-nonexistent uniformity holds ON THE
+ENTRY surface — raw primitive error codes (for example
+PLAYER_NOT_AUTHORIZED vs EMPTY) remain internal diagnostics and are
+not consumer surfaces. The entry proves consistency with
+session-registered state (recomputed digests, registry membership,
+snapshot/receipt/build bindings); it does NOT prove real Drive
+authorization, producer-source authenticity, ACL eligibility, or
+upstream pagination completeness, which stay NOT_VERIFIED as above.
+Remaining residual risks: upstream pagination completeness is proven
+only over supplied pages; within-process session tokens are capability
+records, not cryptographic authentication; and falsification evidence
+for the brand-new entry partly rests on interface-delta tests
+(labelled honestly in the tests) paired with behavioral
+demonstrations of the raw-primitive gaps.
+
+Independent Q2 round 3 (FAIL — the third consecutive FAIL, which
+stopped the automatic patch cycle) found the Route A entry still
+incomplete in five ways: session registration alone could confer
+citation trust (the bound snapshot's entries did not gate
+membership); catalog and passage surfaces were not uniformly
+leak-free; answers trusted a caller-supplied Fact; session Current
+could detach from committed state; and rendering checked digest and
+session but not kind or provenance. The directed repair in this PR
+answers exactly those five points on the existing call chains:
+citations and passage rendering now check the snapshot-bound source
+manifest; catalogs with no verifiable record and passage failures of
+every cause return the uniform consumer result (diagnostics stay
+internal); answers accept a Fact only when its UID, season, a
+verified slice whose content digest is in the bound snapshot's
+manifest, committed snapshot, and a source that is itself a source_id
+in the bound snapshot's manifest and in the authorized sources bind
+to the answer; session
+Current is a validated commit plus observed readback, recomputed on
+every use; and rendering binds records to their producer kind with
+passage membership re-checked and current authorization revalidated
+at render time. What the entry proves, precisely:
+consistency with the committed snapshot and the session's authorized
+sets under the five checks above. It does NOT prove: producer-source
+authenticity beyond session-registered state; Fact field-level
+authenticity beyond the UID/season/slice-digest/snapshot/
+source-membership bindings (for example team_id against a
+WHOLE_SEASON slice); real
+Drive authorization, ACL eligibility, revocation timing, or upstream
+pagination completeness; or any real-client (P0/production) behavior
+— all stay NOT_VERIFIED. Directed repair 3 (the round-5 Q2's single
+residual) closes the answer STATS-grain render authorization: the
+STATS grain now carries a digest-protected subject_player_uid
+inside its own payload, revalidated at render time whenever the
+STATS status is OK, whatever the other grains say; rewriting that
+subject breaks the stored content-digest check (the digest covers
+the whole payload), rather than merely editing a mutable
+verification record.
