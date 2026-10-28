@@ -139,7 +139,11 @@ live query service:
   requires the record's producer to match the requested kind, and
   passage rendering re-checks snapshot membership; rendering also
   revalidates current authorization at render time (passage source,
-  slice/catalog player, answer Fact UID and Document source).
+  slice/catalog player, answer Fact UID and Document source, and
+  the answer STATS grain's own digest-protected
+  subject_player_uid — so a STATS field is no longer renderable
+  after revocation even when no other answer grain identifies the
+  player).
 
 What this does **not** mean yet: these are offline implementations
 tested on synthetic (made-up) examples. They are **not** verified on
@@ -199,10 +203,14 @@ sets under the five checks above. It does NOT prove: producer-source
 authenticity beyond session-registered state; Fact field-level
 authenticity beyond the UID/season/slice-digest/snapshot/
 source-membership bindings (for example team_id against a
-WHOLE_SEASON slice); render-time revalidation of an answer's STATS
-grain, which carries no player identity in the payload (its rendering
-is gated by the answer's identifiable Fact/Document grains whenever
-those grains are authoritative); real
+WHOLE_SEASON slice); real
 Drive authorization, ACL eligibility, revocation timing, or upstream
 pagination completeness; or any real-client (P0/production) behavior
-— all stay NOT_VERIFIED.
+— all stay NOT_VERIFIED. Directed repair 3 (the round-5 Q2's single
+residual) closes the answer STATS-grain render authorization: the
+STATS grain now carries a digest-protected subject_player_uid
+inside its own payload, revalidated at render time whenever the
+STATS status is OK, whatever the other grains say; rewriting that
+subject breaks the stored content-digest check (the digest covers
+the whole payload), rather than merely editing a mutable
+verification record.

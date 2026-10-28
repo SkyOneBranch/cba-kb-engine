@@ -525,6 +525,11 @@ class ConsumeSession:
         snapshot's manifest, bound to a committed snapshot, and
         carrying a source that is itself a source_id in the bound
         snapshot's manifest and in the session's authorized sources.
+        The STATS grain likewise carries its subject (this query's
+        player_uid) inside the grain, hence inside the
+        digest-covered payload, so render_verified can revalidate
+        the STATS subject against the current authorized set even
+        when no other grain identifies the player.
         A merely truthy source proves nothing, and an "OK" slice
         computed from caller-supplied records proves nothing by
         itself. Otherwise the Fact layer is the uniform UNKNOWN,
@@ -543,6 +548,24 @@ class ConsumeSession:
             stats_layer = query_slice_metric(sliced["payload"], metric)
         else:
             stats_layer = dict(sliced)
+        # Directed repair 3: the STATS grain carries its subject.
+        # The grain was computed for exactly this query's player_uid,
+        # so that UID is recorded inside the grain itself — inside
+        # the payload, hence inside the bytes _wrap's content_digest
+        # covers and render_verified recomputes. Rewriting the
+        # subject on a genuine artifact (or swapping it between
+        # artifacts) therefore breaks the stored-digest check at
+        # render time; the identity is deliberately NOT carried in
+        # the verification record, where a rewrite would be
+        # undetectable. Only an OK grain (one carrying a real metric
+        # value) gets a subject: UNKNOWN/UNIFORM grains disclose
+        # nothing and need no subject. render_verified revalidates
+        # this subject against the current authorized set whenever
+        # the STATS grain is OK, whatever the other grains say.
+        if isinstance(stats_layer, dict) \
+                and stats_layer.get("status") == "OK":
+            stats_layer = dict(stats_layer)
+            stats_layer["subject_player_uid"] = player_uid
         # Fact authority (directed repair 2): the supplied dict is
         # authoritative only if it binds to this verified answer AND
         # to the bound snapshot. Source membership: the source must
@@ -711,12 +734,16 @@ class ConsumeSession:
         # fields are covered by the content-digest check above, so
         # they cannot be rewritten without breaking the digest,
         # while a verification-record-only identity would be
-        # forgeable. An answer's STATS grain carries no player
-        # identity in the payload, so it has no revalidatable
-        # identity of its own; its rendering is gated by the
-        # answer's identifiable grains (Fact UID, Document source)
-        # whenever those grains are authoritative — see the
-        # evidence note's stated residual.
+        # forgeable. Directed repair 3 extends this to the answer's
+        # STATS grain, which previously had no revalidatable
+        # identity: consume_answer now records the grain's subject
+        # (the query's player_uid) inside the STATS grain itself,
+        # hence inside the digest-covered payload. The STATS check
+        # below runs FIRST in the answer branch and applies
+        # whenever the STATS grain is OK, whatever the other grains
+        # say, under its own code so its firing is independently
+        # observable; a grain without a subject (e.g. produced
+        # before this repair) fails closed.
         if kind == "passage":
             if payload.get("source_id") not in self.authorized_sources:
                 raise KcConsumeError("ARTIFACT_SOURCE_NOT_AUTHORIZED")
@@ -732,6 +759,13 @@ class ConsumeSession:
                         "ARTIFACT_PLAYER_NOT_AUTHORIZED")
         elif kind == "answer":
             grains = payload.get("grains", {})
+            stats_layer = grains.get("STATS", {})
+            if isinstance(stats_layer, dict) \
+                    and stats_layer.get("status") == "OK" \
+                    and stats_layer.get("subject_player_uid") not in \
+                    self.authorized_players:
+                raise KcConsumeError(
+                    "ARTIFACT_STATS_SUBJECT_NOT_AUTHORIZED")
             fact_layer = grains.get("CANONICAL_FACT", {})
             if isinstance(fact_layer, dict) \
                     and "player_uid" in fact_layer \

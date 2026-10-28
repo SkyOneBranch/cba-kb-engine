@@ -952,3 +952,120 @@ def test_directed2_render_refuses_revoked_answer_player(fx):
     session.authorized_players.discard(A)
     with pytest.raises(mod.KcConsumeError):
         session.render_verified(out, kind="answer")
+
+
+# ------------------------------------------------------- DIRECTED REPAIR 3
+# (round-5 FAIL response — the single STATS-only render residual.
+# Each revocation negative fails on the 3bc76c0e code because render
+# returns the answer instead of refusing; the tamper test is a
+# post-fix mechanism guard for the digest bar (it fails on the
+# 3bc76c0e code on the missing subject field, NOT as behavioral
+# falsification — the behavioral falsification is the revocation
+# tests below, which fail with DID NOT RAISE). The positive test
+# asserts the new binding exists and renders while authorized.)
+
+def _stats_only_answer(mod, fx, session, snap, passage, chain):
+    """Integrated answer whose ONLY OK grain is STATS: the Fact fails
+    source membership (fixture URI source, absent from the manifest),
+    the citation fails on text mismatch, the Stats slice is valid."""
+    return session.consume_answer(
+        records=fx["stats_records"], player_uid=A, season=SEASON,
+        match_type="REGULAR", scope="WHOLE_SEASON",
+        provider=PROVIDER, competition=COMPETITION,
+        metric="points_per_game", fact=fx["fact"], passage=passage,
+        source_text="mismatched text that cannot verify",
+        chain=chain, claims=[])
+
+
+def test_directed3_answer_refuses_revoked_stats_only_player(fx):
+    # Round-5 counterexample verbatim: Fact UNKNOWN (no UID),
+    # Document not OK (no source check fires), STATS OK carrying the
+    # metric — after the player is revoked, rendering must refuse
+    # via the STATS subject binding, not emit the metric.
+    mod = _entry_or_fail()
+    session, snap, passage, chain = _bound_session(mod, fx)
+    out = _stats_only_answer(mod, fx, session, snap, passage, chain)
+    grains = out["payload"]["grains"]
+    assert grains["CANONICAL_FACT"] == dict(mod.UNIFORM_NOT_FOUND)
+    assert grains["DOCUMENT"]["status"] != "OK"
+    assert grains["STATS"]["status"] == "OK"
+    assert grains["STATS"]["value"] == 12.5
+    session.authorized_players.discard(A)
+    with pytest.raises(mod.KcConsumeError,
+                       match="ARTIFACT_STATS_SUBJECT_NOT_AUTHORIZED"):
+        session.render_verified(out, kind="answer")
+
+
+def test_directed3_answer_refuses_revoked_player_stats_ok_document_ok(
+        fx):
+    # The STATS check must fire even when another grain is present
+    # and OK: Fact UNKNOWN (no UID fires), Document OK with its
+    # source still authorized (no source check fires) — only the
+    # STATS subject binding can refuse after the player is revoked.
+    mod = _entry_or_fail()
+    session, snap, passage, chain = _bound_session(mod, fx)
+    out = session.consume_answer(
+        **_answer_args(mod, fx, session, snap, passage, chain,
+                       fx["fact"], []))
+    grains = out["payload"]["grains"]
+    assert grains["CANONICAL_FACT"] == dict(mod.UNIFORM_NOT_FOUND)
+    assert grains["DOCUMENT"]["status"] == "OK"
+    assert grains["STATS"]["status"] == "OK"
+    session.authorized_players.discard(A)
+    with pytest.raises(mod.KcConsumeError,
+                       match="ARTIFACT_STATS_SUBJECT_NOT_AUTHORIZED"):
+        session.render_verified(out, kind="answer")
+
+
+def test_directed3_answer_refuses_revoked_player_stats_ok_fact_ok(fx):
+    # Combined case: every grain OK, player revoked. The STATS check
+    # runs first in the answer branch, so the refusal carries the
+    # STATS code even though the Fact branch would also refuse —
+    # proving the STATS binding is not skipped when other grains
+    # are present. (Pre-fix this fails on the wrong refusal code:
+    # the Fact branch refuses with ARTIFACT_PLAYER_NOT_AUTHORIZED.)
+    mod = _entry_or_fail()
+    session, snap, passage, chain = _bound_session(mod, fx)
+    out = session.consume_answer(
+        **_answer_args(mod, fx, session, snap, passage, chain,
+                       _bound_fact(fx), []))
+    grains = out["payload"]["grains"]
+    assert grains["CANONICAL_FACT"]["player_uid"] == A
+    assert grains["DOCUMENT"]["status"] == "OK"
+    assert grains["STATS"]["status"] == "OK"
+    session.authorized_players.discard(A)
+    with pytest.raises(mod.KcConsumeError,
+                       match="ARTIFACT_STATS_SUBJECT_NOT_AUTHORIZED"):
+        session.render_verified(out, kind="answer")
+
+
+def test_directed3_answer_refuses_tampered_stats_subject(fx):
+    # Digest bar: the subject lives inside the STATS grain, which is
+    # inside the digest-covered payload. Rewriting it to a
+    # still-authorized player (B) — so authorization alone would
+    # pass — must still be refused, and the refusal reason must be
+    # the digest check, not authorization. (A mutable verification
+    # record carrying the identity would NOT refuse here.)
+    mod = _entry_or_fail()
+    session, snap, passage, chain = _bound_session(mod, fx)
+    session.authorized_players.add(B)
+    out = _stats_only_answer(mod, fx, session, snap, passage, chain)
+    stats = out["payload"]["grains"]["STATS"]
+    assert stats["subject_player_uid"] == A
+    tampered = copy.deepcopy(out)
+    tampered["payload"]["grains"]["STATS"]["subject_player_uid"] = B
+    with pytest.raises(mod.KcConsumeError,
+                       match="ARTIFACT_DIGEST_MISMATCH"):
+        session.render_verified(tampered, kind="answer")
+
+
+def test_directed3_stats_only_answer_renders_while_authorized(fx):
+    # Positive: a STATS-only answer renders while authorized, with
+    # its subject binding intact.
+    mod = _entry_or_fail()
+    session, snap, passage, chain = _bound_session(mod, fx)
+    out = _stats_only_answer(mod, fx, session, snap, passage, chain)
+    assert out["payload"]["grains"]["STATS"]["subject_player_uid"] == A
+    rendered = session.render_verified(out, kind="answer")
+    assert "12.5" in rendered
+    assert "end_marker" in rendered
