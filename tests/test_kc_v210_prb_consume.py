@@ -20,6 +20,19 @@ Falsification labelling (honest, per test):
 
 All fixtures are clean-room synthetic. All artifacts SIMULATED.
 No real Drive UAT, no P0 claim, no production claim.
+
+Directed repair (round-3 FAIL response): the tests appended at the end
+of this file are BEHAVIORAL counterexamples — each fails on the
+9a850953 code because the current code returns, wraps, or refuses the
+wrong thing on a real call chain (a trusted citation for a
+non-member passage, a wrapped catalog for an authorized-but-empty
+player, a copied unverified Fact, a binding that follows a mutated
+caller object, a rendered passage from a passage-only wrapper).
+The answer-render end-to-end test is a PIN (it passes pre- and
+post-fix) and is labelled as such. The _bound_session fixture was
+corrected so the bound snapshot actually contains the cited Document
+source; the updated passage-render test reflects the corrected
+contract (passage rendering requires citation verification).
 """
 
 import copy
@@ -132,11 +145,25 @@ def _routed_target(fx):
 
 def _bound_session(mod, fx):
     """Session with a validated current snapshot and the D1 passage
-    registered. Returns (session, snapshot, passage, chain)."""
+    registered. Returns (session, snapshot, passage, chain).
+
+    Fixture correction (directed repair): the bound snapshot's entries
+    now actually contain the cited Document source (entry-doc-D1 with
+    the passage digest), so the snapshot-bound manifest includes it.
+    The previous fixture bound a stats-only snapshot while citing an
+    independently registered Document passage — that encoded the
+    round-3 membership bug, not a valid positive case."""
     session = _session(mod)
-    snap = build_snapshot(**_snapshot_kwargs())
-    session.bind_current(snap)
     passage = _routed_target(fx)
+    stats_entry = {"entry_id": "entry-stats", "sha256": "a" * 64,
+                   "authority": "canonical", "rights": "public",
+                   "source_id": "fixture_stats"}
+    doc_entry = {"entry_id": "entry-doc-D1", "sha256": passage["digest"],
+                 "authority": "canonical", "rights": "public",
+                 "source_id": "fixture_doc_D1"}
+    snap = build_snapshot(**_snapshot_kwargs(
+        entries=[stats_entry, doc_entry]))
+    session.bind_current(snap)
     session.register_passages([passage])
     binding = session.current_binding()
     from cba_kb.kc_passages import evidence_chain
@@ -205,6 +232,16 @@ def test_entry_catalog_unauthorized_equals_nonexistent(fx):
         expected_keys=[key], provider=PROVIDER, competition=COMPETITION)
     assert unauthorized == nonexistent
     assert unauthorized["status"] == "UNKNOWN"
+    # Demanding case (directed repair): an AUTHORIZED player with no
+    # verifiable record for any expected key must return the identical
+    # uniform result — not a wrapped catalog with a missing list.
+    missing_key = ("2023-2024", "REGULAR", "WHOLE_SEASON", None)
+    authorized_missing = session.consume_catalog(
+        fx["stats_records"], player_uid=A,
+        expected_keys=[missing_key], provider=PROVIDER,
+        competition=COMPETITION)
+    assert authorized_missing == unauthorized
+    assert authorized_missing["status"] == "UNKNOWN"
 
 
 def test_entry_citation_failures_indistinguishable(fx):
@@ -534,11 +571,220 @@ def test_entry_render_refuses_partial_catalog(fx):
 def test_entry_passage_render_requires_entry_verification(fx):
     mod = _entry_or_fail()
     session, snap, passage, chain = _bound_session(mod, fx)
-    verified_passage = session.consume_passage(passage)
-    rendered = session.render_verified(verified_passage, kind="passage")
+    # Contract correction (directed repair): passage rendering
+    # requires CITATION verification, not a consume_passage wrapper
+    # alone. A citation-verified artifact renders; a passage-only
+    # wrapper is refused for kind="passage".
+    cited = session.consume_citation(passage=passage, source_text=QUOTE,
+                                     chain=chain)
+    assert cited["payload"]["status"] == "OK"
+    rendered = session.render_verified(cited, kind="passage")
     assert QUOTE in rendered
     assert "end_marker: true" in rendered
+    verified_passage = session.consume_passage(passage)
+    with pytest.raises(mod.KcConsumeError):
+        session.render_verified(verified_passage, kind="passage")
     # The same passage object, unwrapped (raw primitive output shape),
     # is refused by the consumer render path.
     with pytest.raises(mod.KcConsumeError):
         session.render_verified(passage, kind="passage")
+
+
+# ------------------------------------------------------- DIRECTED REPAIR
+# (round-3 FAIL response — behavioral counterexamples, one per defect)
+
+def _answer_args(mod, fx, session, snap, passage, chain, fact, claims):
+    return dict(records=fx["stats_records"], player_uid=A,
+                season=SEASON, match_type="REGULAR",
+                scope="WHOLE_SEASON", provider=PROVIDER,
+                competition=COMPETITION, metric="points_per_game",
+                fact=fact, passage=passage, source_text=QUOTE,
+                chain=chain, claims=claims)
+
+
+def test_directed_citation_requires_snapshot_membership(fx):
+    mod = _entry_or_fail()
+    session, snap, passage, chain = _bound_session(mod, fx)
+    # Outsider: digest-valid and source-authorized in THIS session,
+    # but absent from the bound snapshot's entries. Registration
+    # succeeds — that alone must not confer trusted status.
+    outsider_session = _session(
+        mod, authorized_sources={"fixture_doc_D1",
+                                 "fixture_doc_OUTSIDER"})
+    outsider_session.bind_current(snap)
+    outsider = build_routed_passage(
+        source_id="fixture_doc_OUTSIDER", revision="rev-1", locator="P9",
+        text=QUOTE, player_uid=A, aliases=["测试甲"],
+        title="outsider",
+        authorized_url="fixture://authorized-copy/fixture_doc_OUTSIDER")
+    assert outsider_session.register_passages([outsider]) == 1
+    from cba_kb.kc_passages import evidence_chain
+    binding = outsider_session.current_binding()
+    outsider_chain = evidence_chain(
+        receipt_id=binding["receipt_binding"],
+        snapshot_id=snap.snapshot_id,
+        build_version=snap.build_code,
+        source_digest=outsider["digest"],
+        authorization_basis=binding["authorization_basis"])
+    cited = outsider_session.consume_citation(
+        passage=outsider, source_text=QUOTE, chain=outsider_chain)
+    assert cited == dict(mod.UNIFORM_CITATION_UNKNOWN)
+    passed = outsider_session.consume_passage(outsider)
+    assert passed == dict(mod.UNIFORM_CITATION_UNKNOWN)
+    with pytest.raises(mod.KcConsumeError):
+        outsider_session.render_verified(passed, kind="passage")
+
+
+def test_directed_passage_failures_uniform(fx):
+    mod = _entry_or_fail()
+    session, snap, passage, chain = _bound_session(mod, fx)
+    unknown = dict(mod.UNIFORM_CITATION_UNKNOWN)
+    # (a) Valid digest, authorized-looking source, never registered.
+    unregistered = build_routed_passage(
+        source_id="fixture_doc_D1", revision="rev-2", locator="P3",
+        text=QUOTE, player_uid=A, aliases=["测试甲"],
+        title="fixture_doc_D1",
+        authorized_url="fixture://authorized-copy/fixture_doc_D1")
+    # (b) Registered while authorized, then authorization removed:
+    # the source-authorization failure cause, distinctly.
+    session2 = _session(
+        mod, authorized_sources={"fixture_doc_D1",
+                                 "fixture_doc_OUTSIDER"})
+    session2.bind_current(snap)
+    outsider = build_routed_passage(
+        source_id="fixture_doc_OUTSIDER", revision="rev-1", locator="P9",
+        text=QUOTE, player_uid=A, aliases=["测试甲"],
+        title="outsider",
+        authorized_url="fixture://authorized-copy/fixture_doc_OUTSIDER")
+    assert session2.register_passages([outsider]) == 1
+    session2.authorized_sources.discard("fixture_doc_OUTSIDER")
+    # (c) Citation with a forged chain: already uniform pre-fix (pin
+    # within this test); the passage causes above are the new behavior.
+    from cba_kb.kc_passages import evidence_chain
+    forged = evidence_chain(
+        receipt_id="forged-receipt", snapshot_id=snap.snapshot_id,
+        build_version=snap.build_code, source_digest=passage["digest"],
+        authorization_basis="SIMULATED_TARGET_SCOPE")
+    results = [
+        session.consume_passage(unregistered),
+        session2.consume_passage(outsider),
+        session.consume_citation(passage=passage, source_text=QUOTE,
+                                 chain=forged),
+    ]
+    assert all(r == unknown for r in results)
+    # No distinguishing diagnostic leaks into any consumer result.
+    assert "PASSAGE_NOT_REGISTERED_MEMBER" not in str(results)
+    assert "PASSAGE_SOURCE_NOT_AUTHORIZED" not in str(results)
+
+
+def test_directed_answer_rejects_unbound_fact_uid(fx):
+    mod = _entry_or_fail()
+    session, snap, passage, chain = _bound_session(mod, fx)
+    bad_fact = dict(fx["fact"], player_uid="fixture_player_UNAUTHORIZED")
+    out = session.consume_answer(
+        **_answer_args(mod, fx, session, snap, passage, chain,
+                       bad_fact, []))
+    assert out["payload"]["grains"]["CANONICAL_FACT"] == \
+        dict(mod.UNIFORM_NOT_FOUND)
+
+
+def test_directed_answer_rejects_fact_season_mismatch(fx):
+    mod = _entry_or_fail()
+    session, snap, passage, chain = _bound_session(mod, fx)
+    bad_fact = dict(fx["fact"], season="2023-2024")
+    out = session.consume_answer(
+        **_answer_args(mod, fx, session, snap, passage, chain,
+                       bad_fact, []))
+    assert out["payload"]["grains"]["CANONICAL_FACT"] == \
+        dict(mod.UNIFORM_NOT_FOUND)
+
+
+def test_directed_answer_rejects_fact_without_verified_slice(fx):
+    mod = _entry_or_fail()
+    session, snap, passage, chain = _bound_session(mod, fx)
+    norec = "fixture_player_NOREC"
+    session2 = _session(mod, authorized_players={A, norec})
+    session2.bind_current(snap)
+    session2.register_passages([passage])
+    fact_norec = {"fact_id": "fixture_fact_NOREC", "player_uid": norec,
+                  "season": SEASON, "team_id": "fixture_team_T2",
+                  "kind": "REGISTRATION",
+                  "source": "fixture://canonical-registration"}
+    out = session2.consume_answer(
+        records=fx["stats_records"], player_uid=norec, season=SEASON,
+        match_type="REGULAR", scope="WHOLE_SEASON",
+        provider=PROVIDER, competition=COMPETITION,
+        metric="points_per_game", fact=fact_norec, passage=passage,
+        source_text=QUOTE, chain=chain, claims=[])
+    assert out["payload"]["grains"]["CANONICAL_FACT"] == \
+        dict(mod.UNIFORM_NOT_FOUND)
+
+
+def test_directed_binding_ignores_caller_mutation(fx):
+    mod = _entry_or_fail()
+    session = _session(mod)
+    snap = build_snapshot(**_snapshot_kwargs())
+    snap_d = _snapshot_dict_of(snap)
+    session.bind_current(snap_d)
+    original_sid = snap.snapshot_id
+    # Attack: mutate the caller's dict AFTER binding.
+    snap_d["snapshot_id"] = "kc-snapshot:attacker"
+    binding = session.current_binding()
+    assert binding["snapshot_id"] == original_sid
+    assert session._store.read_current() == original_sid
+
+
+def test_directed_store_swap_clears_binding(fx):
+    mod = _entry_or_fail()
+    session, snap, passage, chain = _bound_session(mod, fx)
+    assert session.current_binding()["snapshot_id"] == snap.snapshot_id
+    # Attack: swap in a different store after binding. The old
+    # binding must not survive detached from committed state.
+    session.attach_store(SimulatedCurrentStore(target_domain=TARGET))
+    with pytest.raises(mod.KcConsumeError):
+        session.current_binding()
+
+
+def test_directed_commit_refuses_registry_mapping_replacement():
+    snap = build_snapshot(**_snapshot_kwargs())
+    store = SimulatedCurrentStore(target_domain=TARGET)
+    snap_d = _snapshot_dict_of(snap)
+    store.register(snap_d)
+    store.stage(snap.snapshot_id)
+    store.validate()
+    assert store.state == "VALIDATED"
+    # Attack: replace the registry mapping object itself (same
+    # content, new identity) after validation.
+    store._registry = {snap.snapshot_id: _snapshot_dict_of(snap)}
+    with pytest.raises(KcCurrentError):
+        store.commit()
+    assert store.state == "FAILED"
+
+
+def test_directed_render_refuses_kind_mismatch(fx):
+    mod = _entry_or_fail()
+    session, snap, passage, chain = _bound_session(mod, fx)
+    sliced = session.consume_slice(
+        fx["stats_records"], player_uid=A, season=SEASON,
+        match_type="REGULAR", scope="WHOLE_SEASON",
+        provider=PROVIDER, competition=COMPETITION)
+    with pytest.raises(mod.KcConsumeError):
+        session.render_verified(sliced, kind="passage")
+    cited = session.consume_citation(passage=passage, source_text=QUOTE,
+                                     chain=chain)
+    assert cited["payload"]["status"] == "OK"
+    with pytest.raises(mod.KcConsumeError):
+        session.render_verified(cited, kind="slice_markdown")
+
+
+def test_directed_answer_renders_end_to_end(fx):
+    # PIN (passes pre- and post-fix): a full consume_answer artifact
+    # renders through kind="answer". Not falsification evidence.
+    mod = _entry_or_fail()
+    session, snap, passage, chain = _bound_session(mod, fx)
+    out = session.consume_answer(
+        **_answer_args(mod, fx, session, snap, passage, chain,
+                       fx["fact"], []))
+    rendered = session.render_verified(out, kind="answer")
+    assert "CANONICAL_FACT" in rendered
+    assert "end_marker" in rendered

@@ -25,6 +25,14 @@ validated digest and a deep copy of the validated content; commit()
 recomputes against the current registry content and refuses on any
 mismatch, wrong target, or registry replacement. Validation proves
 the state at validation time only — never a later, mutated state.
+
+Directed repair (round-3 FAIL response): commit() additionally
+compares the validated registry mapping's IDENTITY against the
+store's active mapping when validation used the store's own registry
+— replacing the mapping object after validation refuses, even with
+identical content. current_snapshot() returns a deep copy of the
+snapshot fixed by the last successful commit, so session bindings
+derive from observed committed state, never from a caller object.
 """
 
 from __future__ import annotations
@@ -91,12 +99,19 @@ class SimulatedCurrentStore:
         self._validated_copy: Any = None
         self._validated_registry: Optional[Dict[str, Any]] = None
         self._validated_digest: Optional[str] = None
+        # Directed repair (round-3 FAIL response): whether validation
+        # used this store's own registry (identity-checked at commit),
+        # and the snapshot object fixed by the last successful commit
+        # (read back by current_snapshot()).
+        self._validated_from_own: Optional[bool] = None
+        self._current_snapshot_obj: Any = None
 
     def _clear_validation(self) -> None:
         self._validated_id = None
         self._validated_copy = None
         self._validated_registry = None
         self._validated_digest = None
+        self._validated_from_own = None
 
     def register(self, snapshot: Any) -> str:
         """Register a snapshot object (or dict) by its snapshot_id so
@@ -156,6 +171,7 @@ class SimulatedCurrentStore:
         # Bind validation to this exact content and registry mapping.
         self._validated_id = staged
         self._validated_registry = registry
+        self._validated_from_own = snapshots is None
         self._validated_copy = copy.deepcopy(snap)
         self._validated_digest = digest
         self.state = "VALIDATED"
@@ -171,6 +187,14 @@ class SimulatedCurrentStore:
         staged = self._staged
         registry = self._validated_registry
         if registry is None or self._validated_id != staged:
+            self.state = "FAILED"
+            self._clear_validation()
+            raise KcCurrentError("COMMIT_VALIDATION_STALE")
+        if self._validated_from_own and registry is not self._registry:
+            # The registry mapping object itself was replaced after
+            # validation. Content equality with the retained mapping
+            # is not enough: commit must read the ACTIVE authoritative
+            # mapping, never a superseded one.
             self.state = "FAILED"
             self._clear_validation()
             raise KcCurrentError("COMMIT_VALIDATION_STALE")
@@ -206,8 +230,20 @@ class SimulatedCurrentStore:
         self._staged = None
         self.state = "CURRENT"
         self._seq += 1
+        self._current_snapshot_obj = current
         self._clear_validation()
         return self.observed_receipt()
+
+    def current_snapshot(self) -> Any:
+        """Deep copy of the snapshot fixed by the last successful
+        commit, or None if nothing is committed. Callers use this
+        read-back value — never a retained caller object — to derive
+        bindings, so a caller mutation after commit cannot move them.
+        The copy is revalidated by the caller (digest recomputation),
+        so post-commit content tampering is detected at use."""
+        if self._current is None or self._current_snapshot_obj is None:
+            return None
+        return copy.deepcopy(self._current_snapshot_obj)
 
     def read_current(self) -> Optional[str]:
         return self._current
