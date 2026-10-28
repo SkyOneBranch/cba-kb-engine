@@ -155,7 +155,20 @@ def _bound_session(mod, fx):
     round-3 membership bug, not a valid positive case."""
     session = _session(mod)
     passage = _routed_target(fx)
-    stats_entry = {"entry_id": "entry-stats", "sha256": "a" * 64,
+    # Directed repair 2 (round-4 FAIL response): the stats entry
+    # digest must bind the actual WHOLE_SEASON slice payload the
+    # answer path computes, so the slice justifying a Fact is
+    # snapshot-bound rather than caller-supplied. The digest is
+    # computed with the entry's own content-digest function over a
+    # probe slice for the exact answer query; the probe session is
+    # unbound, so this binds content, not session state.
+    probe = _session(mod)
+    probed = probe.consume_slice(
+        fx["stats_records"], player_uid=A, season=SEASON,
+        match_type="REGULAR", scope="WHOLE_SEASON",
+        provider=PROVIDER, competition=COMPETITION)
+    slice_digest = mod._content_digest(probed["payload"])
+    stats_entry = {"entry_id": "entry-stats", "sha256": slice_digest,
                    "authority": "canonical", "rights": "public",
                    "source_id": "fixture_stats"}
     doc_entry = {"entry_id": "entry-doc-D1", "sha256": passage["digest"],
@@ -412,7 +425,17 @@ def test_entry_citation_refuses_unregistered_source(fx):
 def test_entry_answer_claim_conflict_keeps_fact(fx):
     mod = _entry_or_fail()
     session, snap, passage, chain = _bound_session(mod, fx)
-    fact_before = copy.deepcopy(fx["fact"])
+    # Contract correction (directed repair 2): the positive Fact
+    # must carry a snapshot-bound authorized source. The fixture
+    # Fact's URI source ("fixture://canonical-registration") is
+    # absent from the bound snapshot's manifest — accepting it as
+    # authoritative was exactly the R3-NB3 gap. The corrected input
+    # keeps every other field (including team_id) identical, so the
+    # byte-identity, team_id, and claim-separation properties below
+    # are preserved, not weakened; the unmodified fixture Fact is
+    # asserted untouched at the end.
+    bound_fact = dict(fx["fact"], source="fixture_doc_D1")
+    fact_before = copy.deepcopy(bound_fact)
     conflicting_claim = {
         "claim_id": "fixture_claim_ATTACK", "player_uid": A,
         "date": "2026-10-20", "text": "attacker claim text",
@@ -422,7 +445,7 @@ def test_entry_answer_claim_conflict_keeps_fact(fx):
         records=fx["stats_records"], player_uid=A, season=SEASON,
         match_type="REGULAR", scope="WHOLE_SEASON",
         provider=PROVIDER, competition=COMPETITION,
-        metric="points_per_game", fact=fx["fact"], passage=passage,
+        metric="points_per_game", fact=bound_fact, passage=passage,
         source_text=QUOTE, chain=chain, claims=[conflicting_claim])
     payload = out["payload"]
     # Authoritative layers byte-identical to their inputs.
@@ -440,7 +463,8 @@ def test_entry_answer_claim_conflict_keeps_fact(fx):
     assert any(r.get("refused") is True for r in claim_layer["refusals"])
     assert "OTHER_TEAM" in str(claim_layer)
     # The caller's fact dict itself was never mutated.
-    assert fx["fact"] == fact_before
+    assert bound_fact == fact_before
+    assert fx["fact"]["source"] == "fixture://canonical-registration"
     assert out["verification"]["verified_by"] == "kc_consume"
 
 
@@ -788,3 +812,143 @@ def test_directed_answer_renders_end_to_end(fx):
     rendered = session.render_verified(out, kind="answer")
     assert "CANONICAL_FACT" in rendered
     assert "end_marker" in rendered
+
+
+# ------------------------------------------------------- DIRECTED REPAIR 2
+# (round-4 FAIL response — behavioral counterexamples, one per
+# residual defect; each fails on the 77cc0cb5 code because the
+# current code returns, wraps, or renders the wrong thing on a real
+# call chain: a fabricated-source Fact copied as authoritative, a
+# Fact justified by a slice whose digest is absent from the bound
+# snapshot, and a verified artifact rendered after revocation.)
+
+def _bound_fact(fx):
+    """The positive answer Fact with a snapshot-bound authorized
+    source (see the contract correction on
+    test_entry_answer_claim_conflict_keeps_fact)."""
+    return dict(fx["fact"], source="fixture_doc_D1")
+
+
+def test_directed2_answer_rejects_fabricated_source(fx):
+    mod = _entry_or_fail()
+    session, snap, passage, chain = _bound_session(mod, fx)
+    # Attack: UID, season, Stats records, and committed snapshot all
+    # unchanged; only the Fact's source is a fabricated truthy value.
+    # Presence-only source validation accepts it pre-fix.
+    bad_fact = dict(fx["fact"], source="fixture://fabricated-attacker")
+    out = session.consume_answer(
+        **_answer_args(mod, fx, session, snap, passage, chain,
+                       bad_fact, []))
+    assert out["payload"]["grains"]["CANONICAL_FACT"] == \
+        dict(mod.UNIFORM_NOT_FOUND)
+
+
+def test_directed2_answer_rejects_fabricated_source_and_changed_field(fx):
+    mod = _entry_or_fail()
+    session, snap, passage, chain = _bound_session(mod, fx)
+    # Round-4 counterexample, verbatim: fabricated source AND a
+    # changed authoritative field, UID and season retained.
+    bad_fact = dict(fx["fact"], source="fixture://fabricated-attacker",
+                    team_id="OTHER_TEAM")
+    out = session.consume_answer(
+        **_answer_args(mod, fx, session, snap, passage, chain,
+                       bad_fact, []))
+    assert out["payload"]["grains"]["CANONICAL_FACT"] == \
+        dict(mod.UNIFORM_NOT_FOUND)
+
+
+def test_directed2_answer_rejects_unbound_slice_records(fx):
+    mod = _entry_or_fail()
+    session, snap, passage, chain = _bound_session(mod, fx)
+    # Attack: the caller supplies different Stats records, so the
+    # justifying slice's digest is absent from the bound snapshot —
+    # yet the Fact (bound source, matching UID/season) would still be
+    # copied pre-fix because the slice is merely "OK", not bound.
+    records = copy.deepcopy(fx["stats_records"])
+    for record in records:
+        if record["player_uid"] == A and record["season"] == SEASON \
+                and record["match_type"] == "REGULAR" \
+                and record["scope"] == "WHOLE_SEASON":
+            record["metrics"]["games_played"] = 41
+    out = session.consume_answer(
+        records=records, player_uid=A, season=SEASON,
+        match_type="REGULAR", scope="WHOLE_SEASON",
+        provider=PROVIDER, competition=COMPETITION,
+        metric="points_per_game", fact=_bound_fact(fx),
+        passage=passage, source_text=QUOTE, chain=chain, claims=[])
+    # The attacker slice IS computed from the supplied records
+    # (games_played 41, not the snapshot-bound 40), but the Fact
+    # must not ride on an unbound slice.
+    attacker_slice = session.consume_slice(
+        records, player_uid=A, season=SEASON,
+        match_type="REGULAR", scope="WHOLE_SEASON",
+        provider=PROVIDER, competition=COMPETITION)
+    assert attacker_slice["payload"]["metrics"]["games_played"] \
+        ["value"] == 41
+    assert out["payload"]["grains"]["CANONICAL_FACT"] == \
+        dict(mod.UNIFORM_NOT_FOUND)
+
+
+def test_directed2_render_refuses_revoked_passage_source(fx):
+    mod = _entry_or_fail()
+    session, snap, passage, chain = _bound_session(mod, fx)
+    cited = session.consume_citation(passage=passage, source_text=QUOTE,
+                                     chain=chain)
+    assert cited["payload"]["status"] == "OK"
+    # Attack: revoke the source AFTER verification. Digest, kind,
+    # session, and snapshot membership are all unchanged — only the
+    # current authorization set moved, and rendering must observe it.
+    session.authorized_sources.discard("fixture_doc_D1")
+    with pytest.raises(mod.KcConsumeError):
+        session.render_verified(cited, kind="passage")
+
+
+def test_directed2_render_refuses_revoked_slice_player(fx):
+    mod = _entry_or_fail()
+    session = _session(mod)
+    out = session.consume_slice(
+        fx["stats_records"], player_uid=A, season=SEASON,
+        match_type="REGULAR", scope="WHOLE_SEASON",
+        provider=PROVIDER, competition=COMPETITION)
+    session.authorized_players.discard(A)
+    with pytest.raises(mod.KcConsumeError):
+        session.render_verified(out, kind="slice_markdown")
+    with pytest.raises(mod.KcConsumeError):
+        session.render_verified(out, kind="slice_json")
+
+
+def test_directed2_render_refuses_revoked_catalog_player(fx):
+    mod = _entry_or_fail()
+    session = _session(mod)
+    key = (SEASON, "REGULAR", "WHOLE_SEASON", None)
+    out = session.consume_catalog(
+        fx["stats_records"], player_uid=A, expected_keys=[key],
+        provider=PROVIDER, competition=COMPETITION)
+    assert out["payload"]["complete"] is True
+    session.authorized_players.discard(A)
+    with pytest.raises(mod.KcConsumeError):
+        session.render_verified(out, kind="catalog")
+
+
+def test_directed2_render_refuses_revoked_answer_source(fx):
+    mod = _entry_or_fail()
+    session, snap, passage, chain = _bound_session(mod, fx)
+    out = session.consume_answer(
+        **_answer_args(mod, fx, session, snap, passage, chain,
+                       _bound_fact(fx), []))
+    assert out["payload"]["grains"]["DOCUMENT"]["status"] == "OK"
+    session.authorized_sources.discard("fixture_doc_D1")
+    with pytest.raises(mod.KcConsumeError):
+        session.render_verified(out, kind="answer")
+
+
+def test_directed2_render_refuses_revoked_answer_player(fx):
+    mod = _entry_or_fail()
+    session, snap, passage, chain = _bound_session(mod, fx)
+    out = session.consume_answer(
+        **_answer_args(mod, fx, session, snap, passage, chain,
+                       _bound_fact(fx), []))
+    assert out["payload"]["grains"]["CANONICAL_FACT"]["player_uid"] == A
+    session.authorized_players.discard(A)
+    with pytest.raises(mod.KcConsumeError):
+        session.render_verified(out, kind="answer")

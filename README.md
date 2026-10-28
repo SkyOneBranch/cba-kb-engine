@@ -137,7 +137,9 @@ live query service:
   flags. The session current is a validated commit plus observed
   readback, never a retained caller object. Rendering additionally
   requires the record's producer to match the requested kind, and
-  passage rendering re-checks snapshot membership.
+  passage rendering re-checks snapshot membership; rendering also
+  revalidates current authorization at render time (passage source,
+  slice/catalog player, answer Fact UID and Document source).
 
 What this does **not** mean yet: these are offline implementations
 tested on synthetic (made-up) examples. They are **not** verified on
@@ -183,16 +185,24 @@ answers exactly those five points on the existing call chains:
 citations and passage rendering now check the snapshot-bound source
 manifest; catalogs with no verifiable record and passage failures of
 every cause return the uniform consumer result (diagnostics stay
-internal); answers accept a Fact only when its UID, season, verified
-slice, committed snapshot, and source bind to the answer; session
+internal); answers accept a Fact only when its UID, season, a
+verified slice whose content digest is in the bound snapshot's
+manifest, committed snapshot, and a source that is itself a source_id
+in the bound snapshot's manifest and in the authorized sources bind
+to the answer; session
 Current is a validated commit plus observed readback, recomputed on
 every use; and rendering binds records to their producer kind with
-passage membership re-checked. What the entry proves, precisely:
+passage membership re-checked and current authorization revalidated
+at render time. What the entry proves, precisely:
 consistency with the committed snapshot and the session's authorized
 sets under the five checks above. It does NOT prove: producer-source
 authenticity beyond session-registered state; Fact field-level
-authenticity beyond the UID/season/slice/snapshot/source-presence
-bindings (for example team_id against a WHOLE_SEASON slice); real
+authenticity beyond the UID/season/slice-digest/snapshot/
+source-membership bindings (for example team_id against a
+WHOLE_SEASON slice); render-time revalidation of an answer's STATS
+grain, which carries no player identity in the payload (its rendering
+is gated by the answer's identifiable Fact/Document grains whenever
+those grains are authoritative); real
 Drive authorization, ACL eligibility, revocation timing, or upstream
 pagination completeness; or any real-client (P0/production) behavior
 — all stay NOT_VERIFIED.

@@ -519,16 +519,21 @@ class ConsumeSession:
         """Integrated cross-source answer through the entry. Stats
         come from consume_slice, Document from consume_citation, Fact
         is deep-copied and never mutated — but only if it validates
-        against this answer: same player UID (and authorized), same
-        season, anchored by a verified slice, bound to a committed
-        snapshot, and carrying a source. Otherwise the Fact layer is
-        the uniform UNKNOWN, never the supplied dict. Claims are
-        resolved in the claim layer only: every claim whose fields
-        collide with Fact fields is routed through
-        refuse_claim_merge() on this integrated path; the refusal is
-        recorded and the claim is reported only in the claim layer.
-        Instruction-like passage text is carried as data
-        (treat_as_data) and never executed."""
+        against this answer AND against the bound snapshot: same
+        player UID (and authorized), same season, anchored by a
+        verified slice whose content digest is in the bound
+        snapshot's manifest, bound to a committed snapshot, and
+        carrying a source that is itself a source_id in the bound
+        snapshot's manifest and in the session's authorized sources.
+        A merely truthy source proves nothing, and an "OK" slice
+        computed from caller-supplied records proves nothing by
+        itself. Otherwise the Fact layer is the uniform UNKNOWN,
+        never the supplied dict. Claims are resolved in the claim
+        layer only: every claim whose fields collide with Fact
+        fields is routed through refuse_claim_merge() on this
+        integrated path; the refusal is recorded and the claim is
+        reported only in the claim layer. Instruction-like passage
+        text is carried as data (treat_as_data) and never executed."""
         fact_copy = copy.deepcopy(fact)
         sliced = self.consume_slice(
             records, player_uid=player_uid, season=season,
@@ -538,11 +543,29 @@ class ConsumeSession:
             stats_layer = query_slice_metric(sliced["payload"], metric)
         else:
             stats_layer = dict(sliced)
-        # Fact authority: the supplied dict is authoritative only if
-        # it binds to this verified answer. Anything else yields a
-        # uniform UNKNOWN Fact layer (claim-layer refusal reporting
-        # below still runs against the supplied copy, in the claim
-        # layer only — it never promotes the copy to authoritative).
+        # Fact authority (directed repair 2): the supplied dict is
+        # authoritative only if it binds to this verified answer AND
+        # to the bound snapshot. Source membership: the source must
+        # be a source_id in the bound snapshot's manifest and in the
+        # session's authorized sources — a merely truthy source (a
+        # URI, a fabricated string) proves nothing. Slice binding:
+        # the justifying slice's content digest must be a digest in
+        # the bound snapshot's manifest — an "OK" slice computed
+        # from caller-supplied records proves nothing by itself.
+        # Anything else yields a uniform UNKNOWN Fact layer
+        # (claim-layer refusal reporting below still runs against
+        # the supplied copy, in the claim layer only — it never
+        # promotes the copy to authoritative).
+        manifest = self._snapshot_manifest()
+        manifest_digests = {sha for digests in manifest.values()
+                            for sha in digests}
+        fact_source = fact.get("source") if isinstance(fact, dict) \
+            else None
+        source_bound = isinstance(fact_source, str) \
+            and fact_source in manifest \
+            and fact_source in self.authorized_sources
+        slice_bound = "payload" in sliced and \
+            _content_digest(sliced["payload"]) in manifest_digests
         fact_valid = (
             isinstance(fact, dict)
             and fact.get("player_uid") == player_uid
@@ -551,7 +574,8 @@ class ConsumeSession:
             and "payload" in sliced
             and sliced["payload"].get("status") == "OK"
             and self._bound_snapshot_id is not None
-            and bool(fact.get("source"))
+            and source_bound
+            and slice_bound
         )
         fact_layer = fact_copy if fact_valid else dict(UNIFORM_NOT_FOUND)
         cited = self.consume_citation(passage=passage,
@@ -642,12 +666,17 @@ class ConsumeSession:
         payload; snapshot binding match when the record carries one;
         producer entry permitted for the requested kind (a
         passage-only wrapper never renders as a passage, a slice
-        never renders as a passage, and so on). Passage rendering
+        never renders as a passage, and so on); CURRENT authorization
+        revalidated at render time from the session's sets (a
+        verification record proves what was authorized at
+        consumption time — it must not outlive a revocation; this
+        refuses NEW renderings after authorization changed and does
+        not delete already-seen session text). Passage rendering
         additionally re-checks snapshot manifest membership at render
         time. Then the raw renderer is invoked by the entry itself.
         Raw output, unwrapped dicts, forged records, kind mismatches,
-        cross-session artifacts, and PARTIAL catalogs are all
-        refused."""
+        cross-session artifacts, revoked authorizations, and PARTIAL
+        catalogs are all refused."""
         if not isinstance(artifact, dict):
             raise KcConsumeError("ARTIFACT_NOT_ENTRY_VERIFIED")
         payload = artifact.get("payload")
@@ -675,6 +704,46 @@ class ConsumeSession:
             raise KcConsumeError(f"UNKNOWN_RENDERING_KIND:{kind}")
         if verification.get("entry") not in allowed:
             raise KcConsumeError("ARTIFACT_KIND_MISMATCH")
+        # Directed repair 2: CURRENT authorization, read from the
+        # session's own sets at render time (so a discard() of a
+        # source or player after verification is observed here).
+        # Only digest-bound identities are revalidated: payload
+        # fields are covered by the content-digest check above, so
+        # they cannot be rewritten without breaking the digest,
+        # while a verification-record-only identity would be
+        # forgeable. An answer's STATS grain carries no player
+        # identity in the payload, so it has no revalidatable
+        # identity of its own; its rendering is gated by the
+        # answer's identifiable grains (Fact UID, Document source)
+        # whenever those grains are authoritative — see the
+        # evidence note's stated residual.
+        if kind == "passage":
+            if payload.get("source_id") not in self.authorized_sources:
+                raise KcConsumeError("ARTIFACT_SOURCE_NOT_AUTHORIZED")
+        elif kind in ("slice_json", "slice_markdown"):
+            if payload.get("player_uid") not in self.authorized_players:
+                raise KcConsumeError("ARTIFACT_PLAYER_NOT_AUTHORIZED")
+        elif kind == "catalog":
+            for sl in payload.get("slices", []):
+                if not isinstance(sl, dict) \
+                        or sl.get("player_uid") not in \
+                        self.authorized_players:
+                    raise KcConsumeError(
+                        "ARTIFACT_PLAYER_NOT_AUTHORIZED")
+        elif kind == "answer":
+            grains = payload.get("grains", {})
+            fact_layer = grains.get("CANONICAL_FACT", {})
+            if isinstance(fact_layer, dict) \
+                    and "player_uid" in fact_layer \
+                    and fact_layer["player_uid"] not in \
+                    self.authorized_players:
+                raise KcConsumeError("ARTIFACT_PLAYER_NOT_AUTHORIZED")
+            doc_layer = grains.get("DOCUMENT", {})
+            if isinstance(doc_layer, dict) \
+                    and doc_layer.get("status") == "OK" \
+                    and doc_layer.get("source_id") not in \
+                    self.authorized_sources:
+                raise KcConsumeError("ARTIFACT_SOURCE_NOT_AUTHORIZED")
         if kind == "slice_json":
             return render_json_slice(payload)
         if kind == "slice_markdown":
