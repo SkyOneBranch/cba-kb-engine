@@ -104,3 +104,35 @@ These are directions for improvement, **not a committed scope or release date**.
 The repository provides a **Public Engine**. Real private material is operated separately in a user's **Private Instance** under applicable permissions and law. Code uses [Apache-2.0](LICENSE), docs use [CC BY 4.0](DATA_LICENSE.md), and synthetic fixtures use [CC0-1.0](DATA_LICENSE.md). Third-party reporting and photographs retain their owners' rights; see [third-party data](THIRD_PARTY_DATA.md).
 
 **Make basketball research easier to verify—not just more confident-sounding.**
+
+## v2.1.0 PR-B (in development, offline and synthetic only)
+
+This work adds the building blocks for answering questions from
+already-published, already-authorized material — without running a
+live query service:
+
+- **Query-ready slices** (`kc_slices`): find a player's records by
+  exact season, competition, match type, and scope, with the full
+  lookup key shown. Missing details are rejected, never guessed.
+- **Passages** (`kc_passages`): find interview or document quotes
+  with their source, revision, and location, and check the quote
+  against the source before repeating it word for word.
+- **Snapshots and manifests** (`kc_snapshot`): bundle a set of
+  records into a versioned, checkable package that can be rebuilt
+  exactly the same way again.
+- **Current pointer (simulated)** (`kc_current`): practise the
+  "which version is current right now?" check offline, including
+  what happens when a version changes or permission is removed.
+- **Candidate renderings** (`kc_render`): small JSON, table, and
+  text formats for the material above, plus a checklist of what a
+  real connector measurement would still need to prove.
+- **Permission-first views** (`kc_visibility`): a reader only ever
+  sees material they are authorized for; something they may not
+  see looks exactly the same as something that does not exist.
+
+What this does **not** mean yet: these are offline implementations
+tested on synthetic (made-up) examples. They are **not** verified on
+the real ChatGPT Web + Google Drive client — that real-client check
+stays NOT_VERIFIED until it is separately authorized and run. Nothing
+here claims a P0 pass, a real Drive test pass, or a production
+release.
