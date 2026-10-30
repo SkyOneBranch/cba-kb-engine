@@ -297,6 +297,12 @@ REQUIRED_LOCAL_ARTIFACTS = ("snapshot.json", "guarantee.json",
                              "answer.json", "index.md", "catalog.md")
 REQUIRED_LOCAL_CATEGORIES = ("slices/", "passages/")
 
+# Sentinel for "JSON parsing did not produce a value". It must be
+# distinct from None: a parsed JSON null IS a value (Python None)
+# and must fail explicitly as a non-object, never be mistaken
+# for "nothing was read" (Q2 round 2, D-02 remainder).
+_NOT_PARSED = object()
+
 
 def verify_local_projection(output_dir: str) -> Dict[str, Any]:
     """Re-verify a local materialisation from its own files only:
@@ -306,7 +312,11 @@ def verify_local_projection(output_dir: str) -> Dict[str, Any]:
     and index snapshot reference. Returns {"valid", "checks",
     "failures"} and NEVER raises: any malformed structure,
     unexpected type, or unreadable file is a failure, not an
-    exception (Q2 round 1, blocker D-02).
+    exception (Q2 round 1, blocker D-02). A parsed JSON null
+    is a value, not an absence: any parsed artifact that is
+    not an object fails explicitly, and None is never used
+    as both "unparsed" and "parsed null" (Q2 round 2, D-02
+    remainder).
 
     Residual risk, stated plainly: this is a structural
     completeness and digest-integrity check against the
@@ -403,15 +413,21 @@ def verify_local_projection(output_dir: str) -> Dict[str, Any]:
         if not os.path.isfile(snap_path):
             fail("snapshot_exists", "SNAPSHOT_MISSING")
         else:
+            snap_value: Any = _NOT_PARSED
             try:
                 with open(snap_path, encoding="utf-8") as fh:
-                    snap_dict = json.load(fh)
+                    snap_value = json.load(fh)
             except (OSError, ValueError):
                 fail("snapshot_parse", "SNAPSHOT_UNPARSEABLE")
-            if snap_dict is not None \
-                    and not isinstance(snap_dict, dict):
+            if snap_value is _NOT_PARSED:
+                pass  # parse failure already recorded above
+            elif not isinstance(snap_value, dict):
+                # A parsed JSON null is a value, not an absence:
+                # it must fail explicitly, never be mistaken for
+                # "no snapshot was read" (Q2 round 2, D-02).
                 fail("snapshot_type", "SNAPSHOT_NOT_OBJECT")
-                snap_dict = None
+            else:
+                snap_dict = snap_value
         if snap_dict is not None:
             try:
                 snap_ok = validate_snapshot(snap_dict)["valid"] is True
@@ -431,47 +447,53 @@ def verify_local_projection(output_dir: str) -> Dict[str, Any]:
         if not os.path.isfile(guarantee_path):
             fail("guarantee_exists", "GUARANTEE_MISSING")
         else:
-            guarantee = None
+            guarantee_value: Any = _NOT_PARSED
             try:
                 with open(guarantee_path, encoding="utf-8") as fh:
-                    guarantee = json.load(fh)
+                    guarantee_value = json.load(fh)
             except (OSError, ValueError):
                 fail("guarantee_parse", "GUARANTEE_UNPARSEABLE")
-            if guarantee is not None:
-                if not isinstance(guarantee, dict):
-                    fail("guarantee_type", "GUARANTEE_NOT_OBJECT")
-                elif snap_dict is None:
-                    fail("guarantee",
-                         "GUARANTEE_UNVERIFIABLE_WITHOUT_SNAPSHOT")
+            if guarantee_value is _NOT_PARSED:
+                pass  # parse failure already recorded above
+            elif not isinstance(guarantee_value, dict):
+                # Parsed JSON null (or any non-object) is a value,
+                # not an absence: fail explicitly (Q2 round 2, D-02).
+                fail("guarantee_type", "GUARANTEE_NOT_OBJECT")
+            elif snap_dict is None:
+                fail("guarantee",
+                     "GUARANTEE_UNVERIFIABLE_WITHOUT_SNAPSHOT")
+            else:
+                try:
+                    g_ok = validate_fact_guarantee(
+                        guarantee_value,
+                        snapshot=snap_dict)["valid"] is True
+                except Exception:  # noqa: BLE001 - never raises
+                    g_ok = False
+                if not g_ok:
+                    fail("guarantee", "GUARANTEE_INVALID")
                 else:
-                    try:
-                        g_ok = validate_fact_guarantee(
-                            guarantee,
-                            snapshot=snap_dict)["valid"] is True
-                    except Exception:  # noqa: BLE001 - never raises
-                        g_ok = False
-                    if not g_ok:
-                        fail("guarantee", "GUARANTEE_INVALID")
-                    else:
-                        checks["guarantee"] = True
+                    checks["guarantee"] = True
         answer_path = os.path.join(output_dir, "answer.json")
         if not os.path.isfile(answer_path):
             fail("answer_exists", "ANSWER_MISSING")
         else:
-            answer = None
+            answer_value: Any = _NOT_PARSED
             try:
                 with open(answer_path, encoding="utf-8") as fh:
-                    answer = json.load(fh)
+                    answer_value = json.load(fh)
             except (OSError, ValueError):
                 fail("answer_parse", "ANSWER_UNPARSEABLE")
-            if answer is not None:
-                if not isinstance(answer, dict):
-                    fail("answer_type", "ANSWER_NOT_OBJECT")
-                elif answer.get("end_marker") is not True \
-                        or answer.get("rendering_kind") != "json_answer":
-                    fail("answer_marker", "ANSWER_END_MARKER_MISSING")
-                else:
-                    checks["answer_marker"] = True
+            if answer_value is _NOT_PARSED:
+                pass  # parse failure already recorded above
+            elif not isinstance(answer_value, dict):
+                # Parsed JSON null (or any non-object) is a value,
+                # not an absence: fail explicitly (Q2 round 2, D-02).
+                fail("answer_type", "ANSWER_NOT_OBJECT")
+            elif answer_value.get("end_marker") is not True \
+                    or answer_value.get("rendering_kind") != "json_answer":
+                fail("answer_marker", "ANSWER_END_MARKER_MISSING")
+            else:
+                checks["answer_marker"] = True
         index_path = os.path.join(output_dir, "index.md")
         if not os.path.isfile(index_path):
             fail("index_exists", "INDEX_MISSING")
