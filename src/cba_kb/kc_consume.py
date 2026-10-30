@@ -111,7 +111,8 @@ from .kc_passages import verify_passage_text
 from .kc_projection import (
     KcError,
     canonical_json,
-    resolve_claims,
+    resolve_claims_by_event,
+    resolve_identity,
     sha256_hex,
     validate_passage,
 )
@@ -128,7 +129,7 @@ from .kc_slices import (
     build_slice_catalog,
     query_slice_metric,
 )
-from .kc_snapshot import validate_snapshot
+from .kc_snapshot import validate_fact_guarantee, validate_snapshot
 from .kc_visibility import (
     NOT_FOUND_DETAIL,
     query_visible,
@@ -394,6 +395,70 @@ class ConsumeSession:
             return dict(UNIFORM_NOT_FOUND)
         return self._wrap("consume_catalog", out)
 
+    # ---- v2.1.1 T2-1 (Issue #226): controlled identity entry ----
+    # Freeze Delta Candidate Δ-03 (B-first): reuse resolve_identity,
+    # but only after target-first filtering, with pagination and
+    # evidence completeness enforced fail-closed. This is NOT a new
+    # public wrapper around the primitives: it is an entry method of
+    # the controlled surface, and it adds no new API outside this
+    # session. Counts are never included in a consumer result, so an
+    # unauthorized-existing candidate and a nonexistent candidate
+    # return the identical uniform UNKNOWN (F-02). The session's
+    # snapshot binding is reported as a SEPARATE field and is never
+    # presented as identity evidence.
+    def consume_identity(self, *, players: List[Dict[str, Any]],
+                         aliases: List[Dict[str, Any]], query: str,
+                         query_kind: str,
+                         identity_source: Any = None,
+                         all_pages_received: bool = True
+                         ) -> Dict[str, Any]:
+        def unknown(reason: str) -> Dict[str, Any]:
+            self._last_diagnostic = {"cause": reason,
+                                     "entry": "consume_identity"}
+            return {"status": "UNKNOWN", "grain": "IDENTITY",
+                    "candidates": [], "relation": "UNDECIDED",
+                    "reason": reason}
+
+        if all_pages_received is not True:
+            return unknown("PAGINATION_INCOMPLETE")
+        if not isinstance(identity_source, dict):
+            return unknown("IDENTITY_EVIDENCE_NOT_BOUND")
+        source_id = identity_source.get("source_id")
+        revision = identity_source.get("revision")
+        digest = identity_source.get("digest")
+        hexdigits = set("0123456789abcdef")
+        if not (isinstance(source_id, str) and source_id
+                and isinstance(revision, str) and revision
+                and isinstance(digest, str) and len(digest) == 64
+                and all(ch in hexdigits for ch in digest)):
+            return unknown("IDENTITY_EVIDENCE_NOT_BOUND")
+        # Target-first: filter BEFORE any resolution, summary, or
+        # candidate list is derived. Unauthorized entries never reach
+        # the primitive, so they cannot leak through a candidate,
+        # a count, or a clarification list.
+        filtered_players = [p for p in players
+                            if isinstance(p, dict)
+                            and p.get("player_uid")
+                            in self.authorized_players]
+        filtered_aliases = [a for a in aliases
+                            if isinstance(a, dict)
+                            and a.get("player_uid")
+                            in self.authorized_players]
+        resolved = resolve_identity(filtered_players, filtered_aliases,
+                                    query=query, query_kind=query_kind)
+        if resolved["status"] == "UNKNOWN":
+            return dict(resolved)
+        payload = dict(resolved)
+        payload["authorization_scope"] = "AUTHORIZED_PLAYERS_ONLY"
+        payload["evidence_binding"] = {
+            "source_id": source_id, "revision": revision,
+            "digest": digest, "kind": "KC_IDENTITY_EVIDENCE"}
+        payload["session_snapshot_id"] = self._bound_snapshot_id
+        payload["binding_separation"] = (
+            "SESSION_SNAPSHOT_BINDING_IS_NOT_IDENTITY_EVIDENCE")
+        self._last_diagnostic = None
+        return self._wrap("consume_identity", payload)
+
     def consume_object(self, objects: List[Dict[str, Any]],
                        object_id: str) -> Dict[str, Any]:
         """Consumer object lookup: the target-first view already
@@ -515,7 +580,10 @@ class ConsumeSession:
                        passage: Dict[str, Any], source_text: str,
                        chain: Dict[str, Any],
                        claims: List[Dict[str, Any]],
-                       team_id: Optional[str] = None) -> Dict[str, Any]:
+                       team_id: Optional[str] = None,
+                       fact_guarantee: Any = None,
+                       require_fact_guarantee: bool = False
+                       ) -> Dict[str, Any]:
         """Integrated cross-source answer through the entry. Stats
         come from consume_slice, Document from consume_citation, Fact
         is deep-copied and never mutated — but only if it validates
@@ -600,6 +668,34 @@ class ConsumeSession:
             and source_bound
             and slice_bound
         )
+        # v2.1.1 T2-1 (Issue #226) Δ-01: when the caller opts in, the
+        # Fact layer additionally requires a valid guarantee sidecar
+        # bound to THIS session's current snapshot and to the same
+        # fact_id. A missing, tampered, or mis-bound guarantee turns
+        # ONLY the Fact layer UNKNOWN; Stats and Document below are
+        # computed independently and are untouched. The default path
+        # (require_fact_guarantee=False) is unchanged.
+        if fact_valid and require_fact_guarantee:
+            guarantee_ok = False
+            guarantee_reason = "FACT_GUARANTEE_MISSING_OR_INVALID"
+            if isinstance(fact_guarantee, dict) \
+                    and isinstance(fact, dict) \
+                    and self._bound_snapshot_id is not None:
+                current = self._store.current_snapshot()
+                if current is not None:
+                    checked = validate_fact_guarantee(
+                        fact_guarantee, snapshot=current)
+                    guarantee_ok = (
+                        checked["valid"] is True
+                        and fact_guarantee.get("fact_id")
+                        == fact.get("fact_id"))
+                    if checked["reason"] is not None:
+                        guarantee_reason = checked["reason"]
+            if not guarantee_ok:
+                fact_valid = False
+                self._last_diagnostic = {
+                    "cause": guarantee_reason,
+                    "entry": "consume_answer"}
         fact_layer = fact_copy if fact_valid else dict(UNIFORM_NOT_FOUND)
         cited = self.consume_citation(passage=passage,
                                       source_text=source_text,
@@ -615,13 +711,25 @@ class ConsumeSession:
             }
         else:
             doc_layer = dict(cited)
-        resolved = resolve_claims(claims)
+        # v2.1.1 T2-1 (Issue #226) Δ-02: claims resolve through the
+        # event-aware resolver (legacy behaviour preserved for
+        # unlabelled claims). Δ-D mis-rejection fix: provenance
+        # fields and the kind label are NOT business collisions — a
+        # claim differing from the Fact only in source, source_id,
+        # digest, locator, revision, claim_id, fact_id, or kind is
+        # not a merge attempt and is not refused. Genuine business
+        # differences (player_uid, season, team_id, ...) still are.
+        resolved = resolve_claims_by_event(claims)
         refusals = []
+        _PROVENANCE_EXCLUDED = frozenset({
+            "source", "source_id", "digest", "locator", "revision",
+            "claim_id", "fact_id", "kind"})
         for claim in claims:
             if not isinstance(claim, dict):
                 continue
             collision = any(
-                key in fact_copy and claim.get(key) != fact_copy.get(key)
+                key in fact_copy and key not in _PROVENANCE_EXCLUDED
+                and claim.get(key) != fact_copy.get(key)
                 for key in claim)
             if collision:
                 try:
@@ -641,6 +749,8 @@ class ConsumeSession:
             "refusals": refusals,
             "claims": copy.deepcopy(claims),
         }
+        if resolved.get("unresolved"):
+            claim_layer["unresolved"] = list(resolved["unresolved"])
         handling = treat_as_data(
             passage.get("text", "") if isinstance(passage, dict) else "")
         payload = {

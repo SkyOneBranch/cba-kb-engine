@@ -267,6 +267,125 @@ def rebuild_snapshot(snapshot: Snapshot, *, entries: List[Dict[str, Any]],
             "original_snapshot_id": snapshot.snapshot_id}
 
 
+# ------------------------------------------------- v2.1.1 T2-1 (Issue #226):
+# Fact guarantee sidecar (Freeze Delta Candidate Δ-01, C class).
+#
+# The sidecar is a SEPARATE dict bound to a snapshot by digest — it is
+# the single T2-1 implementation choice (sidecar, not manifest
+# extension), and it NEVER changes the five-field SnapshotEntry
+# (entry_id, sha256, authority, rights, source_id). A guarantee proves:
+# a fact_id/version maps to an authorized source_id, an authorized
+# file version, a field scope, an authorization domain, and one
+# immutable snapshot. The digest covers every field except the digest
+# itself, so any mutation invalidates it. A missing or invalid
+# guarantee never blocks Stats or Document: the consumer entry turns
+# only the affected Fact layer UNKNOWN (see kc_consume).
+FACT_GUARANTEE_DIGEST_KIND = "KC_FACT_GUARANTEE_SHA256"
+_FACT_GUARANTEE_FIELDS = ("fact_id", "fact_version", "source_id",
+                          "file_version", "field_scope",
+                          "authorization_domain", "snapshot_id",
+                          "source_digest")
+
+
+def _guarantee_content(guarantee: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: guarantee.get(k) for k in _FACT_GUARANTEE_FIELDS}
+
+
+def build_fact_guarantee(*, fact_id: str, fact_version: str,
+                         source_id: str, file_version: str,
+                         field_scope: List[str],
+                         authorization_domain: str, snapshot_id: str,
+                         source_digest: Any = None) -> Dict[str, Any]:
+    """Build a Fact guarantee sidecar. Fail-closed at construction:
+    empty identifiers, an empty field scope, or a malformed optional
+    source digest are build failures, never silent defaults."""
+    for name, value in (("fact_id", fact_id), ("fact_version", fact_version),
+                        ("source_id", source_id),
+                        ("file_version", file_version),
+                        ("authorization_domain", authorization_domain),
+                        ("snapshot_id", snapshot_id)):
+        if not isinstance(value, str) or not value:
+            raise KcSnapshotError(f"INVALID_FACT_GUARANTEE_{name.upper()}")
+    if not isinstance(field_scope, list) or not field_scope \
+            or any(not isinstance(f, str) or not f for f in field_scope):
+        raise KcSnapshotError("INVALID_FACT_GUARANTEE_FIELD_SCOPE")
+    if source_digest is not None and not _SHA256_RE.match(source_digest):
+        raise KcSnapshotError("INVALID_FACT_GUARANTEE_SOURCE_DIGEST")
+    content = {
+        "fact_id": fact_id, "fact_version": fact_version,
+        "source_id": source_id, "file_version": file_version,
+        "field_scope": list(field_scope),
+        "authorization_domain": authorization_domain,
+        "snapshot_id": snapshot_id, "source_digest": source_digest,
+    }
+    digest = sha256_hex(canonical_json(content))
+    return dict(content, digest=digest,
+                digest_kind=FACT_GUARANTEE_DIGEST_KIND,
+                algorithm="SHA-256",
+                covered_bytes=(
+                    "UTF-8 bytes of canonical JSON of "
+                    "{fact_id, fact_version, source_id, file_version, "
+                    "field_scope, authorization_domain, snapshot_id, "
+                    "source_digest}"))
+
+
+def validate_fact_guarantee(guarantee: Any, *,
+                            snapshot: Any) -> Dict[str, Any]:
+    """Validate a guarantee sidecar against a snapshot object or dict.
+    Returns {"valid": bool, "reason": str|None}; it never raises on a
+    malformed or tampered sidecar — a bad guarantee is simply invalid,
+    and the consumer entry turns the affected Fact UNKNOWN."""
+    def invalid(reason: str) -> Dict[str, Any]:
+        return {"valid": False, "reason": reason}
+
+    if not isinstance(guarantee, dict):
+        return invalid("GUARANTEE_MALFORMED")
+    for name in ("fact_id", "fact_version", "source_id", "file_version",
+                 "authorization_domain", "snapshot_id"):
+        value = guarantee.get(name)
+        if not isinstance(value, str) or not value:
+            return invalid("GUARANTEE_MALFORMED")
+    scope = guarantee.get("field_scope")
+    if not isinstance(scope, list) or not scope \
+            or any(not isinstance(f, str) or not f for f in scope):
+        return invalid("GUARANTEE_FIELD_SCOPE_EMPTY")
+    if guarantee.get("digest_kind") != FACT_GUARANTEE_DIGEST_KIND \
+            or guarantee.get("algorithm") != "SHA-256":
+        return invalid("GUARANTEE_DIGEST_MISMATCH")
+    try:
+        expected = sha256_hex(canonical_json(_guarantee_content(guarantee)))
+    except (TypeError, ValueError):
+        return invalid("GUARANTEE_MALFORMED")
+    if guarantee.get("digest") != expected:
+        return invalid("GUARANTEE_DIGEST_MISMATCH")
+    if validate_snapshot(snapshot)["valid"] is not True:
+        return invalid("GUARANTEE_SNAPSHOT_INVALID")
+    if isinstance(snapshot, dict):
+        snap_id = snapshot.get("snapshot_id")
+        snap_domain = snapshot.get("target_domain")
+        entries = [_plain_entry(e) for e in snapshot["entries"]]
+    else:
+        snap_id = getattr(snapshot, "snapshot_id", None)
+        snap_domain = getattr(snapshot, "target_domain", None)
+        entries = [_plain_entry(e) for e in snapshot.entries]
+    if guarantee.get("snapshot_id") != snap_id:
+        return invalid("GUARANTEE_SNAPSHOT_MISMATCH")
+    if guarantee.get("authorization_domain") != snap_domain:
+        return invalid("GUARANTEE_AUTHORIZATION_MISMATCH")
+    sources = {}
+    for entry in entries:
+        sources.setdefault(entry.get("source_id"), set()).add(
+            entry.get("sha256"))
+    if guarantee.get("source_id") not in sources:
+        return invalid("GUARANTEE_SOURCE_NOT_IN_SNAPSHOT")
+    source_digest = guarantee.get("source_digest")
+    if source_digest is not None \
+            and source_digest not in sources.get(
+                guarantee.get("source_id"), set()):
+        return invalid("GUARANTEE_SOURCE_DIGEST_MISMATCH")
+    return {"valid": True, "reason": None}
+
+
 def _jsonable(value: Any) -> Any:
     """Recursively normalize tuples to lists so canonical JSON is
     deterministic for every slice shape. Anything else must already be

@@ -320,6 +320,105 @@ def resolve_claims(claims: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {"status": "OK", "grain": "CLAIM", "conflicting_claim_ids": []}
 
 
+# ------------------------------------------------- v2.1.1 T2-1 (Issue #226):
+# Event-aware claim resolution (Freeze Delta Candidate Δ-02, C + A).
+#
+# resolve_claims() above is KEPT unchanged as the legacy heuristic:
+# it groups by (player_uid, date) and can neither find a same-event
+# conflict across different dates nor prove that different dates mean
+# different events. resolve_claims_by_event() is the new entry:
+# - A claim carries a TRUSTED event association only when its
+#   event_association dict has a non-empty event_ref AND a non-empty
+#   evidence list. An event_key alone is a candidate index, never
+#   proof: it must not group claims, and it must not separate them.
+# - Trusted claims sharing (player_uid, event_ref) form one event
+#   group; differing normalized business values (date, text) inside
+#   one group are CONFLICT, with every participating claim listed.
+# - Claims without a trusted association keep the legacy heuristic
+#   grouping by (player_uid, date), so pre-existing behaviour for
+#   unlabelled claims is unchanged.
+# - When event identity is explicitly invoked (an event_key or an
+#   event_association is present) but the association is unproven, or
+#   when different event refs share evidence, and the business values
+#   differ, the result is UNKNOWN — never a proven-no-conflict OK.
+#   A single unlabelled pair with no event fields at all keeps the
+#   legacy OK: the resolver does not invent UNKNOWN for every
+#   unlabelled pair, and that limitation is documented, not hidden.
+def _event_association_valid(claim: Dict[str, Any]) -> bool:
+    assoc = claim.get("event_association")
+    if not isinstance(assoc, dict):
+        return False
+    ref = assoc.get("event_ref")
+    evidence = assoc.get("evidence")
+    return (isinstance(ref, str) and bool(ref)
+            and isinstance(evidence, list) and len(evidence) > 0
+            and all(isinstance(e, str) and bool(e) for e in evidence))
+
+
+def _claim_business_value(claim: Dict[str, Any]):
+    return (claim.get("date"), claim.get("text"))
+
+
+def resolve_claims_by_event(claims: List[Dict[str, Any]]) -> Dict[str, Any]:
+    conflicting: set = set()
+    unresolved: set = set()
+    trusted: Dict[Any, List[Dict[str, Any]]] = {}
+    for claim in claims:
+        if _event_association_valid(claim):
+            key = (claim.get("player_uid"),
+                   claim["event_association"]["event_ref"])
+            trusted.setdefault(key, []).append(claim)
+    for members in trusted.values():
+        values = {_claim_business_value(m) for m in members}
+        if len(values) > 1:
+            conflicting.update(m.get("claim_id") for m in members
+                               if m.get("claim_id") is not None)
+    legacy: Dict[Any, List[Dict[str, Any]]] = {}
+    for claim in claims:
+        if not _event_association_valid(claim):
+            legacy.setdefault((claim.get("player_uid"),
+                               claim.get("date")), []).append(claim)
+    for members in legacy.values():
+        texts = {m.get("text") for m in members}
+        if len(texts) > 1:
+            conflicting.update(m.get("claim_id") for m in members
+                               if m.get("claim_id") is not None)
+    by_player: Dict[Any, List[Dict[str, Any]]] = {}
+    for claim in claims:
+        by_player.setdefault(claim.get("player_uid"), []).append(claim)
+    for members in by_player.values():
+        if len(members) < 2:
+            continue
+        values = {_claim_business_value(m) for m in members}
+        if len(values) <= 1:
+            continue
+        invoking = [m for m in members
+                    if "event_key" in m or "event_association" in m]
+        if invoking and any(not _event_association_valid(m)
+                            for m in invoking):
+            unresolved.add("EVENT_ASSOCIATION_UNPROVEN")
+        evidence_by_ref: Dict[Any, set] = {}
+        for member in members:
+            if _event_association_valid(member):
+                ref = member["event_association"]["event_ref"]
+                evidence_by_ref.setdefault(ref, set()).update(
+                    member["event_association"]["evidence"])
+        refs = list(evidence_by_ref)
+        for i in range(len(refs)):
+            for j in range(i + 1, len(refs)):
+                if evidence_by_ref[refs[i]] & evidence_by_ref[refs[j]]:
+                    unresolved.add("SHARED_EVIDENCE_DIFFERENT_EVENT_KEYS")
+    if conflicting:
+        status = "CONFLICT"
+    elif unresolved:
+        status = "UNKNOWN"
+    else:
+        status = "OK"
+    return {"status": status, "grain": "CLAIM",
+            "conflicting_claim_ids": sorted(conflicting),
+            "unresolved": sorted(unresolved)}
+
+
 # ------------------------------------------------------------ passages
 def build_passage(*, source_id: str, revision: str, locator: str,
                   text: str, player_uid: Optional[str] = None,
