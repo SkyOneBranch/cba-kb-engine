@@ -273,13 +273,19 @@ def rebuild_snapshot(snapshot: Snapshot, *, entries: List[Dict[str, Any]],
 # The sidecar is a SEPARATE dict bound to a snapshot by digest — it is
 # the single T2-1 implementation choice (sidecar, not manifest
 # extension), and it NEVER changes the five-field SnapshotEntry
-# (entry_id, sha256, authority, rights, source_id). A guarantee proves:
-# a fact_id/version maps to an authorized source_id, an authorized
-# file version, a field scope, an authorization domain, and one
-# immutable snapshot. The digest covers every field except the digest
-# itself, so any mutation invalidates it. A missing or invalid
-# guarantee never blocks Stats or Document: the consumer entry turns
-# only the affected Fact layer UNKNOWN (see kc_consume).
+# (entry_id, sha256, authority, rights, source_id). A guarantee binds
+# (by digest) the RECORDED mapping: fact_id/version to a recorded
+# source_id, a recorded file version, a field scope, a recorded
+# authorization domain, and one snapshot. The digest covers every
+# field except the digest itself, so any mutation invalidates it.
+# Residual risk, stated plainly: the sidecar does NOT independently
+# establish that the recorded file version is the actual revision
+# of the underlying file, nor that the source is externally
+# authorized — source_digest is optional and validation checks
+# recorded bindings against the snapshot only. Real external
+# provenance remains NOT_VERIFIED. A missing or invalid guarantee
+# never blocks Stats or Document: the consumer entry turns only
+# the affected Fact layer UNKNOWN (see kc_consume).
 FACT_GUARANTEE_DIGEST_KIND = "KC_FACT_GUARANTEE_SHA256"
 _FACT_GUARANTEE_FIELDS = ("fact_id", "fact_version", "source_id",
                           "file_version", "field_scope",

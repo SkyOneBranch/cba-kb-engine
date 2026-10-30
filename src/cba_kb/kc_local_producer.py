@@ -288,11 +288,34 @@ def build_local_projection(*, fixture: Dict[str, Any],
     }
 
 
+# Artifacts a complete local materialisation must contain, and
+# file categories it must contain at least one of. The verifier
+# enforces this set independently of the manifest's own file list:
+# a manifest that omits a required artifact must fail even when
+# its own digest is self-consistent (Q2 round 1, blocker D-01).
+REQUIRED_LOCAL_ARTIFACTS = ("snapshot.json", "guarantee.json",
+                             "answer.json", "index.md", "catalog.md")
+REQUIRED_LOCAL_CATEGORIES = ("slices/", "passages/")
+
+
 def verify_local_projection(output_dir: str) -> Dict[str, Any]:
     """Re-verify a local materialisation from its own files only:
-    manifest digest, every file digest and size, snapshot digest and
-    binding, guarantee validity, answer end marker, and index
-    snapshot reference. Returns {"valid", "checks", "failures"}."""
+    manifest digest, every manifest-listed file digest and size,
+    the mandatory artifact set and categories above, snapshot
+    digest and binding, guarantee validity, answer end marker,
+    and index snapshot reference. Returns {"valid", "checks",
+    "failures"} and NEVER raises: any malformed structure,
+    unexpected type, or unreadable file is a failure, not an
+    exception (Q2 round 1, blocker D-02).
+
+    Residual risk, stated plainly: this is a structural
+    completeness and digest-integrity check against the
+    directory's own manifest. It is NOT authentication against
+    an actor who can rewrite every file and recompute the
+    manifest digest — no signing key exists in this local
+    scope — and it does NOT independently read back any
+    recorded file revision from an external registry. Real
+    external provenance remains NOT_VERIFIED."""
     checks: Dict[str, bool] = {}
     failures: List[str] = []
 
@@ -301,7 +324,7 @@ def verify_local_projection(output_dir: str) -> Dict[str, Any]:
         failures.append(reason)
 
     manifest_path = os.path.join(output_dir, "manifest.json")
-    if not os.path.exists(manifest_path):
+    if not os.path.isfile(manifest_path):
         return {"valid": False, "checks": {"manifest_exists": False},
                 "failures": ["MANIFEST_MISSING"]}
     try:
@@ -311,86 +334,160 @@ def verify_local_projection(output_dir: str) -> Dict[str, Any]:
         return {"valid": False, "checks": {"manifest_parse": False},
                 "failures": ["MANIFEST_UNPARSEABLE"]}
     checks["manifest_exists"] = True
-    if manifest.get("local_only") is not True:
-        fail("local_only", "MANIFEST_NOT_LOCAL_ONLY")
-    else:
-        checks["local_only"] = True
-    if manifest.get("drive_publication") is not False:
-        fail("drive_publication", "MANIFEST_CLAIMS_DRIVE_PUBLICATION")
-    else:
-        checks["drive_publication"] = True
-    claimed = manifest.get("manifest_sha256")
-    without = {k: v for k, v in manifest.items()
-               if k != "manifest_sha256"}
-    if claimed != sha256_hex(canonical_json(without)):
-        fail("manifest_digest", "MANIFEST_DIGEST_MISMATCH")
-    else:
-        checks["manifest_digest"] = True
-    for entry in manifest.get("files") or []:
-        rel = entry.get("path", "")
-        full = os.path.join(output_dir, rel)
-        if not os.path.exists(full):
-            fail("file:" + rel, "FILE_MISSING:" + rel)
-            continue
-        with open(full, "rb") as fh:
-            data = fh.read()
-        if sha256_hex(data) != entry.get("sha256") \
-                or len(data) != entry.get("bytes"):
-            fail("file:" + rel, "FILE_DIGEST_MISMATCH:" + rel)
+    if not isinstance(manifest, dict):
+        return {"valid": False,
+                "checks": {"manifest_exists": True,
+                           "manifest_type": False},
+                "failures": ["MANIFEST_NOT_OBJECT"]}
+    try:
+        if manifest.get("local_only") is not True:
+            fail("local_only", "MANIFEST_NOT_LOCAL_ONLY")
         else:
-            checks["file:" + rel] = True
-    snap_dict = None
-    snap_path = os.path.join(output_dir, "snapshot.json")
-    if os.path.exists(snap_path):
-        try:
-            with open(snap_path, encoding="utf-8") as fh:
-                snap_dict = json.load(fh)
-        except (OSError, ValueError):
-            fail("snapshot_parse", "SNAPSHOT_UNPARSEABLE")
-    if snap_dict is not None:
-        if validate_snapshot(snap_dict)["valid"] is not True:
-            fail("snapshot_digest", "SNAPSHOT_DIGEST_INVALID")
+            checks["local_only"] = True
+        if manifest.get("drive_publication") is not False:
+            fail("drive_publication", "MANIFEST_CLAIMS_DRIVE_PUBLICATION")
         else:
-            checks["snapshot_digest"] = True
-        if snap_dict.get("snapshot_id") != manifest.get("snapshot_id") \
-                or snap_dict.get("content_sha256") \
-                != manifest.get("content_sha256"):
-            fail("snapshot_binding", "SNAPSHOT_BINDING_MISMATCH")
+            checks["drive_publication"] = True
+        claimed = manifest.get("manifest_sha256")
+        without = {k: v for k, v in manifest.items()
+                   if k != "manifest_sha256"}
+        if claimed != sha256_hex(canonical_json(without)):
+            fail("manifest_digest", "MANIFEST_DIGEST_MISMATCH")
         else:
-            checks["snapshot_binding"] = True
+            checks["manifest_digest"] = True
+        files_field = manifest.get("files")
+        listed: List[str] = []
+        if not isinstance(files_field, list):
+            fail("manifest_files", "MANIFEST_FILES_INVALID")
+        else:
+            for entry in files_field:
+                if not isinstance(entry, dict):
+                    fail("file_entry", "FILE_ENTRY_INVALID")
+                    continue
+                rel = entry.get("path")
+                if not isinstance(rel, str) or not rel \
+                        or os.path.isabs(rel) \
+                        or ".." in rel.split("/"):
+                    fail("file_entry", "FILE_PATH_UNSAFE")
+                    continue
+                if not isinstance(entry.get("sha256"), str) \
+                        or type(entry.get("bytes")) is not int:
+                    fail("file:" + rel, "FILE_ENTRY_INVALID:" + rel)
+                    continue
+                listed.append(rel)
+                full = os.path.join(output_dir, rel)
+                if not os.path.isfile(full):
+                    fail("file:" + rel, "FILE_MISSING:" + rel)
+                    continue
+                try:
+                    with open(full, "rb") as fh:
+                        data = fh.read()
+                except OSError:
+                    fail("file:" + rel, "FILE_UNREADABLE:" + rel)
+                    continue
+                if sha256_hex(data) != entry.get("sha256") \
+                        or len(data) != entry.get("bytes"):
+                    fail("file:" + rel, "FILE_DIGEST_MISMATCH:" + rel)
+                else:
+                    checks["file:" + rel] = True
+        for rel in REQUIRED_LOCAL_ARTIFACTS:
+            if rel not in listed:
+                fail("mandatory:" + rel,
+                     "REQUIRED_FILE_MISSING_FROM_MANIFEST:" + rel)
+        for prefix in REQUIRED_LOCAL_CATEGORIES:
+            if not any(p.startswith(prefix) for p in listed):
+                fail("mandatory:" + prefix,
+                     "REQUIRED_CATEGORY_MISSING_FROM_MANIFEST:" + prefix)
+        snap_dict = None
+        snap_path = os.path.join(output_dir, "snapshot.json")
+        if not os.path.isfile(snap_path):
+            fail("snapshot_exists", "SNAPSHOT_MISSING")
+        else:
+            try:
+                with open(snap_path, encoding="utf-8") as fh:
+                    snap_dict = json.load(fh)
+            except (OSError, ValueError):
+                fail("snapshot_parse", "SNAPSHOT_UNPARSEABLE")
+            if snap_dict is not None \
+                    and not isinstance(snap_dict, dict):
+                fail("snapshot_type", "SNAPSHOT_NOT_OBJECT")
+                snap_dict = None
+        if snap_dict is not None:
+            try:
+                snap_ok = validate_snapshot(snap_dict)["valid"] is True
+            except Exception:  # noqa: BLE001 - verifier never raises
+                snap_ok = False
+            if not snap_ok:
+                fail("snapshot_digest", "SNAPSHOT_DIGEST_INVALID")
+            else:
+                checks["snapshot_digest"] = True
+            if snap_dict.get("snapshot_id") != manifest.get("snapshot_id") \
+                    or snap_dict.get("content_sha256") \
+                    != manifest.get("content_sha256"):
+                fail("snapshot_binding", "SNAPSHOT_BINDING_MISMATCH")
+            else:
+                checks["snapshot_binding"] = True
         guarantee_path = os.path.join(output_dir, "guarantee.json")
-        if os.path.exists(guarantee_path):
+        if not os.path.isfile(guarantee_path):
+            fail("guarantee_exists", "GUARANTEE_MISSING")
+        else:
+            guarantee = None
             try:
                 with open(guarantee_path, encoding="utf-8") as fh:
                     guarantee = json.load(fh)
             except (OSError, ValueError):
                 fail("guarantee_parse", "GUARANTEE_UNPARSEABLE")
-                guarantee = None
-            if guarantee is not None and validate_fact_guarantee(
-                    guarantee, snapshot=snap_dict)["valid"] is not True:
-                fail("guarantee", "GUARANTEE_INVALID")
-            elif guarantee is not None:
-                checks["guarantee"] = True
-    answer_path = os.path.join(output_dir, "answer.json")
-    if os.path.exists(answer_path):
-        try:
-            with open(answer_path, encoding="utf-8") as fh:
-                answer = json.load(fh)
-        except (OSError, ValueError):
-            fail("answer_parse", "ANSWER_UNPARSEABLE")
-            answer = None
-        if answer is not None:
-            if answer.get("end_marker") is not True \
-                    or answer.get("rendering_kind") != "json_answer":
-                fail("answer_marker", "ANSWER_END_MARKER_MISSING")
-            else:
-                checks["answer_marker"] = True
-    index_path = os.path.join(output_dir, "index.md")
-    if os.path.exists(index_path):
-        with open(index_path, encoding="utf-8") as fh:
-            index_text = fh.read()
-        if manifest.get("snapshot_id") not in index_text:
-            fail("index_snapshot", "INDEX_SNAPSHOT_MISSING")
+            if guarantee is not None:
+                if not isinstance(guarantee, dict):
+                    fail("guarantee_type", "GUARANTEE_NOT_OBJECT")
+                elif snap_dict is None:
+                    fail("guarantee",
+                         "GUARANTEE_UNVERIFIABLE_WITHOUT_SNAPSHOT")
+                else:
+                    try:
+                        g_ok = validate_fact_guarantee(
+                            guarantee,
+                            snapshot=snap_dict)["valid"] is True
+                    except Exception:  # noqa: BLE001 - never raises
+                        g_ok = False
+                    if not g_ok:
+                        fail("guarantee", "GUARANTEE_INVALID")
+                    else:
+                        checks["guarantee"] = True
+        answer_path = os.path.join(output_dir, "answer.json")
+        if not os.path.isfile(answer_path):
+            fail("answer_exists", "ANSWER_MISSING")
         else:
-            checks["index_snapshot"] = True
+            answer = None
+            try:
+                with open(answer_path, encoding="utf-8") as fh:
+                    answer = json.load(fh)
+            except (OSError, ValueError):
+                fail("answer_parse", "ANSWER_UNPARSEABLE")
+            if answer is not None:
+                if not isinstance(answer, dict):
+                    fail("answer_type", "ANSWER_NOT_OBJECT")
+                elif answer.get("end_marker") is not True \
+                        or answer.get("rendering_kind") != "json_answer":
+                    fail("answer_marker", "ANSWER_END_MARKER_MISSING")
+                else:
+                    checks["answer_marker"] = True
+        index_path = os.path.join(output_dir, "index.md")
+        if not os.path.isfile(index_path):
+            fail("index_exists", "INDEX_MISSING")
+        else:
+            try:
+                with open(index_path, encoding="utf-8") as fh:
+                    index_text = fh.read()
+            except OSError:
+                fail("index_read", "INDEX_UNREADABLE")
+                index_text = None
+            if index_text is not None:
+                sid = manifest.get("snapshot_id")
+                if not isinstance(sid, str) or sid not in index_text:
+                    fail("index_snapshot", "INDEX_SNAPSHOT_MISSING")
+                else:
+                    checks["index_snapshot"] = True
+    except Exception:  # noqa: BLE001 - verifier never raises
+        fail("verifier", "VERIFIER_INTERNAL_ERROR")
     return {"valid": not failures, "checks": checks, "failures": failures}
