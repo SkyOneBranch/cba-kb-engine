@@ -4,7 +4,7 @@
 
 **CBA-KB is an open-source research and document engine for Chinese Basketball Association (CBA) basketball.** It helps researchers and AI tools organize player records, league notices, interviews, and other documents without confusing an unverified report with a confirmed fact.
 
-**Latest published Engine release: [v2.0.4-2](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.0.4-2).** The v2.1.0 implementation has been merged into `main` but has **not** been released. A merged change is not a production deployment or a verified Consumer capability.
+**Latest official Engine release: [GitHub Releases](https://github.com/SkyOneBranch/cba-kb-engine/releases/latest).**
 
 ## Why CBA-KB?
 
@@ -41,9 +41,9 @@ The public repository provides the **Engine**, its schemas, tools, and synthetic
 | Find evidence | Search indexed content and follow source/document references |
 | Manage Drive-backed files | Discover changes, prepare bounded archive/retain plans, perform authorized operations, and verify results |
 | Research players | Distinguish player identities, official facts, source claims, and exact season/team statistical grains |
-| Prepare AI-readable evidence | Build versioned query slices, passages, snapshot/manifest bindings, and permission-aware consumption records in the merged v2.1.0 code |
+| Prepare AI-readable evidence | Build versioned query slices, passages, snapshot/manifest bindings, and permission-aware consumption records |
 
-The v2.1.0 code does **not** add a hosted chatbot or a live HTTP/MCP query service. Local Engine processing prepares evidence; ChatGPT Web can read a separately authorized Google Drive projection through its own connector when that projection has been explicitly published and is visible to the user.
+The Engine does **not** provide a hosted chatbot or a live HTTP/MCP query service. Local Engine processing prepares evidence; ChatGPT Web can read a separately authorized Google Drive projection through its own connector when that projection has been explicitly published and is visible to the user.
 
 ## 5-minute quick start
 
@@ -53,8 +53,8 @@ Requires **Python 3.11+** and **Git** on macOS, Linux, or a compatible shell. Th
 git clone https://github.com/SkyOneBranch/cba-kb-engine.git
 cd cba-kb-engine
 
-# Use the latest published Engine release, not unreleased main changes.
-git checkout v2.0.4-2
+# Check out the latest official release tag from GitHub Releases.
+git checkout "$(python3.11 -c 'import json,urllib.request; print(json.load(urllib.request.urlopen("https://api.github.com/repos/SkyOneBranch/cba-kb-engine/releases/latest"))["tag_name"])')"
 
 python3.11 -m venv .venv
 source .venv/bin/activate
@@ -79,26 +79,25 @@ This example does not move or publish real files. See the [Operations guide](doc
 | --- | --- | --- |
 | v1.5.x–v1.9.0 | Player registration and export, document evidence, source acquisition, Statements and Claims | Historical milestones |
 | v2.0.2 | Reusable public Engine, licensing, synthetic fixtures, reproducible tooling | Historical milestone |
-| [v2.0.4-2](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.0.4-2) | Inbox and Drive discovery, guarded archiving, document search, recovery | **Released** |
-| v2.1.0 | Merged offline query/evidence slices, passages, snapshots, current-pointer simulation, permission-checked consumption | **Merged to main · Not released** |
+| [v2.0.4-2](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.0.4-2) | Inbox and Drive discovery, guarded archiving, document search, recovery | Released milestone |
 
-The merged v2.1.0 code passed its recorded independent code review and has limited **real ChatGPT Web + Google Drive connector tests on isolated synthetic material**. Those tests reported no failures in the tested synthetic scenarios; they do **not** establish full production readiness or the real-data P0 acceptance. A later offline comparison of 14 cases found **10 PASS, 4 NOT_VERIFIED, 0 reported FAIL**: statistical values matched, while Fact/source mapping, event-level Claim conflicts, and the identity entry remained unverified.
+Evidence-consumption components have been tested with synthetic materials, including isolated ChatGPT Web + Google Drive checks. These tests support development but do not establish readiness for a particular private dataset, user, or production environment.
 
 ### What's next
 
-- **v2.1.1 candidate:** make canonical Fact/source/version binding explicit; detect genuine same-event Claim conflicts without false positives; verify authorized identity clarification through the consumer entry. This work is **planned, not frozen or implemented**.
-- Finish bounded real-data, cross-account authorization, citation/revision, and freshness checks before claiming the relevant Drive-only P0 capabilities are ready for production.
-- Continue improving searchable evidence and per-user isolation using existing components, rather than adding a new database, hosted API, or authorization platform without demonstrated need.
+- **Evidence-backed basketball research:** make player identities, facts, statistics, and disputed reports easier to compare and verify against original sources.
+- **Reliable AI knowledge access:** improve permission-aware, up-to-date reading of research materials through authorized tools, with traceable citations and clear uncertainty.
+- **Simpler research workflows:** make collecting, organizing, updating, and finding materials easier while strengthening privacy boundaries and reusing existing Engine components.
 
 These are directions, not guaranteed release dates. See [Releases](https://github.com/SkyOneBranch/cba-kb-engine/releases) and [Issues](https://github.com/SkyOneBranch/cba-kb-engine/issues) for confirmed changes.
 
 ## Limitations, authorization, and safety
 
-- **No automatic promotion to Fact.** Being able to read a Drive file, or seeing a source in a manifest, does not by itself authenticate each claimed Fact. The v2.1.0 Fact-source mapping and some cross-source conflict checks require further work.
+- **No automatic promotion to Fact.** Being able to read a Drive file, or seeing a source in a manifest, does not by itself authenticate each claimed Fact. Fact-source mapping and cross-source conflict checks still require careful validation.
 - **Identity ambiguity is not a match.** Same-name candidates must remain unresolved until supported by authorized identity evidence. Do not merge players based only on names.
 - **Google Drive visibility is conditional.** A producer upload is not proof that ChatGPT observed the current material. Connector indexing, authorization, and revocation must be checked for the target and time of use.
 - **Multi-user access is limited.** Some lower-level Engine search paths do not consistently enforce per-user authorization ([Issue #169](https://github.com/SkyOneBranch/cba-kb-engine/issues/169)); do not expose them directly as an authorization boundary to untrusted users.
-- **No implied production approval.** v2.1.0 Engine code, synthetic UAT, private Data Production, public Engine Release, and Consumer acceptance have separate states. No full v2.1.0 P0, cross-account ACL, Production GO, or Consumer CLOSED is asserted by this README.
+- **Synthetic tests are not production approval.** Before real-data use, operators must verify the relevant permissions, source bindings, freshness, and consumer behavior for their own environment.
 - **Respect upstream rights.** Permission to read or privately analyze documents does not authorize redistribution.
 
 ## Documentation, contributing, and licenses

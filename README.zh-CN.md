@@ -4,7 +4,7 @@
 
 **CBA-KB 是一个开源的 CBA 篮球资料整理与研究引擎。** 它帮助研究者和 AI 工具整理球员记录、联赛公告、采访及其他文档，避免把尚未核实的报道当成确定事实。
 
-**最新正式发布的 Engine：[v2.0.4-2](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.0.4-2)。** v2.1.0 的代码已合并到 `main`，但**尚未正式发布**。代码合并不等于生产部署，也不等于 Consumer 能力已经验收通过。
+**最新正式发布的 Engine：以 [GitHub Releases](https://github.com/SkyOneBranch/cba-kb-engine/releases/latest) 为准。**
 
 ## 为什么需要 CBA-KB？
 
@@ -41,9 +41,9 @@ Source / Document / 来源追踪 / 权限
 | 查找证据 | 搜索已建立索引的内容，并定位来源和文档 |
 | 管理 Drive 文件 | 发现变更、制定有界归档/保留计划、执行获授权操作并核验结果 |
 | 研究球员 | 区分球员身份、官方事实、来源主张和精确的赛季/球队统计口径 |
-| 准备 AI 可读的证据 | 在已合并的 v2.1.0 代码中构建版本化查询切片、原文段落、快照/清单绑定及权限核验的消费记录 |
+| 准备 AI 可读的证据 | 构建版本化查询切片、原文段落、快照/清单绑定及权限核验的消费记录 |
 
-v2.1.0 代码**没有**新增托管聊天机器人或实时 HTTP/MCP 查询服务。本地 Engine 负责准备证据；当某个 Google Drive 投影已获授权发布、且使用者可见时，ChatGPT Web 可以通过自身连接器读取该投影。
+Engine **不提供**托管聊天机器人或实时 HTTP/MCP 查询服务。本地 Engine 负责准备证据；当某个 Google Drive 投影已获授权发布、且使用者可见时，ChatGPT Web 可以通过自身连接器读取该投影。
 
 ## 5 分钟快速开始
 
@@ -53,8 +53,8 @@ v2.1.0 代码**没有**新增托管聊天机器人或实时 HTTP/MCP 查询服�
 git clone https://github.com/SkyOneBranch/cba-kb-engine.git
 cd cba-kb-engine
 
-# 使用最新已发布的 Engine，而非尚未发布的 main 改动。
-git checkout v2.0.4-2
+# 从 GitHub Releases 获取最新正式发布的 Tag。
+git checkout "$(python3.11 -c 'import json,urllib.request; print(json.load(urllib.request.urlopen("https://api.github.com/repos/SkyOneBranch/cba-kb-engine/releases/latest"))["tag_name"])')"
 
 python3.11 -m venv .venv
 source .venv/bin/activate
@@ -79,26 +79,25 @@ python scripts/run_cleanroom_smoke.py --output .cleanroom/ci-smoke
 | --- | --- | --- |
 | v1.5.x–v1.9.0 | 球员注册与导出、文档证据、来源采集、Statement 与 Claim | 历史里程碑 |
 | v2.0.2 | 可复用的公开 Engine、许可证、合成夹具和可复现工具 | 历史里程碑 |
-| [v2.0.4-2](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.0.4-2) | Inbox 与 Drive 发现、受控归档、文档检索及故障恢复 | **已发布** |
-| v2.1.0 | 合并离线查询/证据切片、原文段落、快照、Current 指针模拟和受授权消费入口 | **已合并 main · 尚未发布** |
+| [v2.0.4-2](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.0.4-2) | Inbox 与 Drive 发现、受控归档、文档检索及故障恢复 | 已发布里程碑 |
 
-v2.1.0 已合并代码通过了所记录的独立代码审查，并已在**隔离合成资料上通过真实 ChatGPT Web + Google Drive 连接器**开展有限测试。已测合成场景未报告失败，但这**不代表真实业务资料 P0 或生产验收通过**。后续 14 题离线语义比对为 **10 PASS、4 NOT_VERIFIED、0 项报告为 FAIL**：Stats 数值一致，Fact/来源绑定、同事件 Claim 冲突和身份入口仍未完全验证。
+知识消费组件已在合成资料上进行测试，包括隔离环境中的 ChatGPT Web + Google Drive 查询。这些测试支持开发验证，但不代表对特定私人资料、使用者或生产环境的完整验收。
 
 ### 下一步方向
 
-- **v2.1.1 候选：** 明确正式 Fact 的来源/文件版本绑定；正确识别同事件的 Claim 冲突并避免误报；验证可信消费入口的身份候选澄清。该项**已规划，但尚未 Freeze，也未实现**。
-- 在宣布相应 Drive-only P0 能力可用于生产之前，完成有界的真实数据、跨账号授权、引用版本和新鲜度验收。
-- 优先复用现有组件改善证据检索及逐用户权限隔离；没有实际需求证据，不扩建数据库、托管 API 或独立授权平台。
+- **有证据的篮球研究：** 让球员身份、事实、统计和存在争议的报道更容易与原始资料对照、比较和核验。
+- **可靠的 AI 知识读取：** 通过获授权的工具，更及时、安全地读取研究资料，保留可追溯引用和明确的不确定性。
+- **更简单的资料工作流：** 降低采集、整理、更新和检索资料的操作成本，强化隐私边界，优先复用已有 Engine 能力。
 
 以上是方向，不是保证的发布日期。正式变化请查看 [Releases](https://github.com/SkyOneBranch/cba-kb-engine/releases) 与 [Issues](https://github.com/SkyOneBranch/cba-kb-engine/issues)。
 
 ## 已知限制、授权与安全
 
-- **不能自动升格为 Fact。** Drive 文件可见，或来源出现在清单中，并不能自动证明其每一条正式事实。v2.1.0 的 Fact 来源映射及部分跨来源冲突判断仍需补足。
+- **不能自动升格为 Fact。** Drive 文件可见，或来源出现在清单中，并不能自动证明其每一条正式事实。Fact 来源绑定及跨来源冲突判断仍需审慎验证。
 - **同名不等于同一人。** 身份候选必须有当前获授权的身份资料支持；没有证据时保留待澄清，不自动合并球员。
 - **Drive 可见性有条件。** Producer 上传不等于 ChatGPT 已看到当前资料；连接器索引、授权及撤权必须按目标和使用时点核验。
 - **多用户检索仍有限制。** 部分 Engine 底层搜索入口尚未一致执行逐用户授权（[Issue #169](https://github.com/SkyOneBranch/cba-kb-engine/issues/169)）；修复前不要直接将其作为面向不可信多用户的授权边界。
-- **不能把合成测试冒充生产批准。** v2.1.0 Engine 代码、合成 UAT、私人 Data Production、公开 Engine Release 与 Consumer 验收是不同状态。本 README 不宣称 v2.1.0 完整 P0、跨账号 ACL、Production GO 或 Consumer CLOSED 已完成。
+- **合成测试不等于生产验收。** 在使用真实资料前，应针对具体使用者和环境核验权限、来源绑定、新鲜度与实际查询结果。
 - **尊重原始资料版权。** 私人阅读和研究权限不自动包含公开转载权限。
 
 ## 文档、贡献与许可证
