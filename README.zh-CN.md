@@ -1,181 +1,113 @@
 # CBA-KB｜让每一条篮球结论都有出处
 
-[English](README.md) · [快速开始](#5-分钟快速开始) · [操作手册](docs/operations/OPERATIONS.zh-CN.md)
+[English](README.md) · [5 分钟快速开始](#5-分钟快速开始) · [中文操作手册](docs/operations/OPERATIONS.zh-CN.md)
 
-**CBA-KB 是一个开源的 CBA 篮球资料整理与研究引擎。** 它帮助你整理球员资料、新闻报道、联赛公告和其他文件，让每条信息都能找到来源，方便人和 AI 查询、比较和核实。
+**CBA-KB 是一个开源的 CBA 篮球资料整理与研究引擎。** 它帮助研究者和 AI 工具整理球员记录、联赛公告、采访及其他文档，避免把尚未核实的报道当成确定事实。
 
-**当前正式版本：[v2.0.4-2](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.0.4-2)（已发布，已完成本轮交付）。**
+**最新正式发布的 Engine：[v2.0.4-2](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.0.4-2)。** v2.1.0 的代码已合并到 `main`，但**尚未正式发布**。代码合并不等于生产部署，也不等于 Consumer 能力已经验收通过。
 
 ## 为什么需要 CBA-KB？
 
-假设你想知道一名球员是否转会。一篇新闻说“可能加盟”，另一份官方名单仍显示原球队。如果只看搜索摘要，很容易把传闻当成事实。
+假设一篇报道说某球员可能加盟新球队，但官方注册资料仍显示另一支球队。普通搜索摘要容易把传闻说成事实。CBA-KB 帮助区分：
 
-CBA-KB 希望让你分清楚：
+- **来源（Source）：** 记录来自哪里？
+- **文档（Document）：** 原始文件或报道究竟写了什么？
+- **陈述 / 主张（Statement / Claim）：** 有人说了什么，哪些说法仍待核查？
+- **正式事实 / 统计（Fact / Stats）：** 哪些结论有可信记录、精确统计口径支持？
 
-- **来源（Source）**：这条消息来自哪里？
-- **文档（Document）**：原始报道或文件是什么？
-- **陈述（Statement）**：原文究竟说了什么？
-- **主张（Claim）**：哪些说法还需要核实？
-- **事实（Fact）**：哪些结论有足够证据支持？
+**核心规则：陈述 ≠ 事实；证据 ≠ 事实；未知 ≠ 0。** 回答应保留身份、日期、授权、来源和不确定性，而不是猜测。
 
-**核心原则：陈述 ≠ 事实；证据 ≠ 事实；未知 ≠ 0。** AI 的回答应当有出处，不能把猜测包装成确定事实。
+## 工作方式
 
-## 它能做什么？
+```text
+已获授权的来源文件和记录
+           ↓
+Source / Document / 来源追踪 / 权限
+           ↓
+身份 · Fact · Stats · Statement / Claim
+           ↓
+有版本绑定、受授权的查询与证据视图
+           ↓
+研究者或 AI 消费端核对答案
+```
 
-| 你想做的事 | CBA-KB 提供的能力 |
+公开仓库提供 **Engine**、数据结构、工具和合成样例。真实研究资料、访问授权与凭证保留在使用者自己的 **Private Instance**。本仓库不包含私人 CBA 语料库。
+
+## 核心能力
+
+| 研究任务 | Engine 提供的能力 |
 | --- | --- |
-| 整理资料 | 登记文件与来源，识别重复内容，保留可追溯记录 |
-| 查找内容 | 按关键词查询已建立索引的文档，找到对应来源 |
-| 管理 Google Drive 文件 | 发现文件变化，制定归档或保留计划，经授权后执行并核对结果 |
-| 研究球员和球队 | 使用身份、陈述、主张和事实等数据模型，区分不同证据的可信程度 |
-| 让 AI 辅助阅读 | 为获授权的资料查询提供文档及来源信息，便于核对原文 |
+| 整理资料 | 登记来源和文档，识别重复，保留可追溯的元数据 |
+| 查找证据 | 搜索已建立索引的内容，并定位来源和文档 |
+| 管理 Drive 文件 | 发现变更、制定有界归档/保留计划、执行获授权操作并核验结果 |
+| 研究球员 | 区分球员身份、官方事实、来源主张和精确的赛季/球队统计口径 |
+| 准备 AI 可读的证据 | 在已合并的 v2.1.0 代码中构建版本化查询切片、原文段落、快照/清单绑定及权限核验的消费记录 |
 
-CBA-KB **不是**自动抓取全网、直接宣布篮球事实的聊天机器人。它提供处理资料和追溯证据的工具；真实数据、核验和授权仍由使用者管理。
-
-## 主要版本与当前状态
-
-| 版本 | 主要迭代功能 | 状态 |
-| --- | --- | --- |
-| **v1.5.x** | 球员注册数据模型、可复现的 Excel 导出、早期 Drive 发布工具 | 历史里程碑 |
-| **v1.8.x** | 文档证据、稳定球员身份、消费端核验 | 历史里程碑 |
-| **v1.9.0** | 来源入库、Statement、Claim、核验队列和研究视图 | 历史里程碑 |
-| **v2.0.2** | 公开开源 Engine、许可证与脱敏、合成测试样例及可复现工具 | 历史里程碑 |
-| **v2.0.4-2** | 本地 Inbox、Drive 发现与轮询、受控归档、搜索索引及故障恢复 | **已发布 · 本轮交付完成** |
-
-在项目所有者授权的私人环境中，本轮已经完成实际的 Drive 资料整理，并通过了一次可回溯原件的私人资料问答验收。公开仓库**不包含**这些私人资料。[查看正式版本记录](https://github.com/SkyOneBranch/cba-kb-engine/releases)。
+v2.1.0 代码**没有**新增托管聊天机器人或实时 HTTP/MCP 查询服务。本地 Engine 负责准备证据；当某个 Google Drive 投影已获授权发布、且使用者可见时，ChatGPT Web 可以通过自身连接器读取该投影。
 
 ## 5 分钟快速开始
 
-准备好 **Python 3.11+** 和 **Git**。以下命令适用于 macOS、Linux 或兼容终端；使用公开合成数据，**不需要真实 CBA 资料或 Google Drive 账号**。
+需要 **Python 3.11+** 和 **Git**，适用于 macOS、Linux 或兼容终端。以下示例只使用公开合成数据，**无需 Google Drive 账号或私人篮球文档**。
 
 ```bash
-# 获取公开代码
 git clone https://github.com/SkyOneBranch/cba-kb-engine.git
 cd cba-kb-engine
 
-# 使用 v2.0.4-2 正式发布版本
+# 使用最新已发布的 Engine，而非尚未发布的 main 改动。
 git checkout v2.0.4-2
 
-# 创建独立 Python 环境并安装
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.lock
 python -m pip install --no-deps --no-build-isolation -e .
 
-# 查看环境和命令
 make doctor
 cba-kb --help
 
-# 用仓库内的虚构数据体验研究流程
+# 使用虚构记录运行 clean-room 示例。
 unset CBA_KB_INSTANCE_ROOT CBA_KB_SOURCE_POLICY_JSON CBA_STATS_AES_KEY GOOGLE_APPLICATION_CREDENTIALS
 python scripts/run_cleanroom_smoke.py --output .cleanroom/ci-smoke
 ```
 
-以上示例不会移动或发布你的真实文件。想进一步试用本地 Inbox、关键词检索或 Drive 操作，请阅读[中文操作手册](docs/operations/OPERATIONS.zh-CN.md)。需要最新开发改动时，可以查看 [`main` 分支](https://github.com/SkyOneBranch/cba-kb-engine)；它不一定与已发布的 Tag 完全相同。
+此示例不会移动或发布任何真实文件。本地 Inbox、索引及获授权的 Drive 操作请参阅[中文操作手册](docs/operations/OPERATIONS.zh-CN.md)。[`main` 分支](https://github.com/SkyOneBranch/cba-kb-engine)可能包含尚未正式发布的代码。
 
-## 使用真实数据前要知道
+## 产品进展与路线图
 
-- **操作要授权。** 处理私人文件或移动 Drive 文件时，需要相应访问权限；每次真实文件操作都要确认结果。
-- **私人数据不等于公开数据。** 本仓库只有开源代码及合成样例，不提供项目所有者的私人篮球资料。阅读私人资料的许可也不等于可以公开转载。
-- **多用户检索仍有限制。** 当前 Engine 底层搜索接口存在待修复的逐用户权限隔离问题（[Issue #169](https://github.com/SkyOneBranch/cba-kb-engine/issues/169)）。修复前，不要直接将其作为面向不可信多用户的授权边界。
-- **有来源不代表已证实。** AI 摘要和文件中的说法仍需按证据核实。
+### 近期重要里程碑
 
-## 接下来关注什么？
+| 版本 | 主要成果 | 状态 |
+| --- | --- | --- |
+| v1.5.x–v1.9.0 | 球员注册与导出、文档证据、来源采集、Statement 与 Claim | 历史里程碑 |
+| v2.0.2 | 可复用的公开 Engine、许可证、合成夹具和可复现工具 | 历史里程碑 |
+| [v2.0.4-2](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.0.4-2) | Inbox 与 Drive 发现、受控归档、文档检索及故障恢复 | **已发布** |
+| v2.1.0 | 合并离线查询/证据切片、原文段落、快照、Current 指针模拟和受授权消费入口 | **已合并 main · 尚未发布** |
 
-- 完善不同用户之间的检索权限隔离。
-- 让资料来源、文档 ID 与原件链接更加一致可靠。
-- 让新增资料更方便地进入索引，供已授权的用户查询。
+v2.1.0 已合并代码通过了所记录的独立代码审查，并已在**隔离合成资料上通过真实 ChatGPT Web + Google Drive 连接器**开展有限测试。已测合成场景未报告失败，但这**不代表真实业务资料 P0 或生产验收通过**。后续 14 题离线语义比对为 **10 PASS、4 NOT_VERIFIED、0 项报告为 FAIL**：Stats 数值一致，Fact/来源绑定、同事件 Claim 冲突和身份入口仍未完全验证。
 
-这些是改进方向，**不代表已承诺的下一版本范围或发布日期**。具体进展见 [Issues](https://github.com/SkyOneBranch/cba-kb-engine/issues)。
+### 下一步方向
 
-## 谁适合使用？
+- **v2.1.1 候选：** 明确正式 Fact 的来源/文件版本绑定；正确识别同事件的 Claim 冲突并避免误报；验证可信消费入口的身份候选澄清。该项**已规划，但尚未 Freeze，也未实现**。
+- 在宣布相应 Drive-only P0 能力可用于生产之前，完成有界的真实数据、跨账号授权、引用版本和新鲜度验收。
+- 优先复用现有组件改善证据检索及逐用户权限隔离；没有实际需求证据，不扩建数据库、托管 API 或独立授权平台。
 
-- **篮球研究者和资料整理者**：希望每个结论都能查到出处。
-- **开发者**：希望复用数据模型、入库工具和检索能力。
-- **AI 应用开发者**：希望 AI 回答有证据，而不是把传闻当事实。
+以上是方向，不是保证的发布日期。正式变化请查看 [Releases](https://github.com/SkyOneBranch/cba-kb-engine/releases) 与 [Issues](https://github.com/SkyOneBranch/cba-kb-engine/issues)。
 
-## 文档与贡献
+## 已知限制、授权与安全
 
-- [操作手册（中文）](docs/operations/OPERATIONS.zh-CN.md) · [Operations Manual (English)](docs/operations/OPERATIONS.md)
+- **不能自动升格为 Fact。** Drive 文件可见，或来源出现在清单中，并不能自动证明其每一条正式事实。v2.1.0 的 Fact 来源映射及部分跨来源冲突判断仍需补足。
+- **同名不等于同一人。** 身份候选必须有当前获授权的身份资料支持；没有证据时保留待澄清，不自动合并球员。
+- **Drive 可见性有条件。** Producer 上传不等于 ChatGPT 已看到当前资料；连接器索引、授权及撤权必须按目标和使用时点核验。
+- **多用户检索仍有限制。** 部分 Engine 底层搜索入口尚未一致执行逐用户授权（[Issue #169](https://github.com/SkyOneBranch/cba-kb-engine/issues/169)）；修复前不要直接将其作为面向不可信多用户的授权边界。
+- **不能把合成测试冒充生产批准。** v2.1.0 Engine 代码、合成 UAT、私人 Data Production、公开 Engine Release 与 Consumer 验收是不同状态。本 README 不宣称 v2.1.0 完整 P0、跨账号 ACL、Production GO 或 Consumer CLOSED 已完成。
+- **尊重原始资料版权。** 私人阅读和研究权限不自动包含公开转载权限。
+
+## 文档、贡献与许可证
+
+- [中文操作手册](docs/operations/OPERATIONS.zh-CN.md) · [Operations Manual](docs/operations/OPERATIONS.md)
 - [参与贡献](CONTRIBUTING.md) · [安全说明](SECURITY.md)
+- [正式发布](https://github.com/SkyOneBranch/cba-kb-engine/releases) · [Issues](https://github.com/SkyOneBranch/cba-kb-engine/issues)
 - [数据与许可](DATA_LICENSE.md) · [第三方资料说明](THIRD_PARTY_DATA.md)
-- [Releases](https://github.com/SkyOneBranch/cba-kb-engine/releases) · [Issues](https://github.com/SkyOneBranch/cba-kb-engine/issues)
 
-公开仓库提供 **Public Engine**；私人真实资料应由使用者在独立的 **Private Instance** 中依法管理。代码采用 [Apache-2.0](LICENSE)，文档依 [CC BY 4.0](DATA_LICENSE.md)，仓库的合成样例依 [CC0-1.0](DATA_LICENSE.md)。第三方报道、照片等仍受原版权约束，详见[第三方数据说明](THIRD_PARTY_DATA.md)。
+**Public Engine** 代码采用 [Apache-2.0](LICENSE)，文档依 [CC BY 4.0](DATA_LICENSE.md)，仓库合成样例依 [CC0-1.0](DATA_LICENSE.md)。第三方文章、照片和其他原始资料仍受原版权所有者保护。私人研究数据和凭证必须保留在使用者独立的 Private Instance 中。
 
 **让篮球研究更容易查证，而不是让 AI 听起来更确定。**
-
-## v2.1.0 PR-B（开发中，仅离线与合成示例）
-
-这部分工作为“从已发布、已授权的资料中回答问题”准备基础能力，
-而不是搭建一个实时查询服务：
-
-- **查询切片**（`kc_slices`）：按赛季、赛事、比赛类型和范围精
-  确找到球员记录，并展示完整查询条件；缺失条件会被拒绝，不会
-  被猜测补全。
-- **段落引用**（`kc_passages`）：找到采访或文档原话及其来源、
-  版本和位置，逐字引用前先与原文核对。
-- **快照与清单**（`kc_snapshot`）：把一组记录打包成可核验的
-  版本化包裹，可以按同样方式精确重建。
-- **当前指针（模拟）**（`kc_current`）：离线练习“现在哪个版本
-  是最新的？”这一检查，包括版本变化或权限被撤回时的处理。
-- **候选渲染格式**（`kc_render`）：上述资料的小型 JSON、表格
-  和文本格式，以及一份真实连接器测量仍需证明的检查清单。
-- **权限优先视图**（`kc_visibility`）：读者只能看到自己有权看
-  的资料；无权看到的内容与不存在的内容看起来完全一样。
-- **统一消费入口**（`kc_consume`，路线 A + 定向修复）：唯一的消
-  费端可信表面。原始构造器属于内部原语；消费端结果必须通过入
-  口重算核对的授权、摘要、快照成员关系、回执/构建绑定，以及
-  （答案类）Fact 绑定，而非调用方标记。会话 Current 只能是已验
-  证提交并回读的快照，绝非保留的调用方对象。渲染还要求记录的
-  生产者与请求类型匹配，引用渲染须重验快照成员关系；渲染时还
-  须重验当前授权（引用来源、切片/目录玩家、答案 Fact UID、
-  Document 来源，以及答案 STATS 粒度自带的、受摘要保护的
-  subject_player_uid——即使答案中没有其他可识别粒度，STATS
-  字段在撤权后也不再可渲染）。
-
-需要注意：这些是离线实现，用合成（虚构）示例测试。**尚未**在
-真实 ChatGPT Web + Google Drive 客户端上验证——真实客户端检查
-在另行授权并实际执行前仍为 NOT_VERIFIED。这里不宣称 P0 通过、
-真实 Drive 测试通过或生产发布。
-
-独立 Q2 第二轮（FAIL）与路线 A 修复之后的已知限度：首轮闭合了快
-照 ID 载荷绑定（B1）与清单摘要全覆盖（B2）；第二轮认定 B3–B7
-仅部分闭合，并提出五项新阻断（原始构造/引用路径绕过授权、原始
-切片路径上未授权与不存在可区分、校验与提交未原子绑定、证据链
-未门控引用、Claim 守门未接入集成路径）。路线 A 以统一入口
-（`kc_consume`）回应：原始构造器属于内部原语，其输出不是消费
-端可信结果；只有入口核验过的输出才是。未授权与不存在的一致性
-在入口表面成立——原始错误码（如 PLAYER_NOT_AUTHORIZED 与
-EMPTY）仍属内部诊断，不是消费端表面。入口证明的是与会话已注
-册状态的一致性（重算摘要、注册成员关系、快照/回执/构建绑定），
-不证明真实 Drive 授权、来源真实性、ACL 资格或上游分页完整性，
-以上如前仍为 NOT_VERIFIED。剩余残余风险：上游分页完整性仅在已
-提供页面范围内得到证明；进程内会话令牌属于能力记录，不是密码
-学认证；全新入口的证伪证据部分依赖接口差异测试（测试中已如实
-标注）并配有原始原语缺口的行为演示。
-
-独立 Q2 第三轮（FAIL——三连 FAIL，已触发自动补丁循环的停损）
-认定路线 A 入口仍有五处不完整：仅凭会话注册即可获得引用信任
-（已绑定快照的条目未门控成员关系）；目录与引用表面未做到统一
-无泄漏；答案直接信任调用方传入的 Fact；会话 Current 可能脱离
-已提交状态；渲染只验摘要与会话，未验类型与来源。本 PR 的定向
-修复在现有调用链上逐项回应这五点：引用与引用渲染现核对快照
-绑定的来源清单；无可验证记录的目录与所有原因的引用失败均返回
-统一的消费端结果（诊断仅留内部）；答案仅在 Fact 的 UID、赛季、
-内容摘要位于已绑定快照清单内的已验证切片、已提交快照，以及本
-身就是已绑定快照清单内且已授权的来源 ID 的来源均绑定到该答案
-时才接受该 Fact；会话 Current 是已验证提交并回读的快照，每次使
-用时重算；渲染将记录绑定到其生产者类型，并重验引用成员关系与
-渲染时的当前授权。入口能够证明的范围，准确说是：在上述五项检
-查之下，与已提交快照及会话授权集合的一致性。它不能证明：会话
-已注册状态之外的来源真实性；上述 UID/赛季/切片摘要/快照/来源成
-员关系绑定之外的 Fact 字段级真实性（例如 WHOLE_SEASON 切片之下
-的 team_id）；真实 Drive
-授权、ACL 资格、撤权时序或上游分页完整性；以及任何真实客户端
-（P0/生产）行为——以上全部仍为 NOT_VERIFIED。定向修复 3（第五轮
-Q2 的唯一残缺）补上了答案 STATS 粒度的渲染授权：STATS 粒度现
-在其载荷内携带受摘要保护的 subject_player_uid，渲染时只要
-STATS 状态为 OK 就重验该主体是否仍在当前授权集内，与其他粒度
-无关；改写该主体会破坏已存摘要校验（摘要覆盖整个载荷），而不
-是只改一条可变验证记录。
