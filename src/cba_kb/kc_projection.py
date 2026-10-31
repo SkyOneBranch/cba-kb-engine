@@ -397,10 +397,19 @@ def resolve_claims(claims: List[Dict[str, Any]]) -> Dict[str, Any]:
 #   signal, not semantic event understanding, and passage
 #   authenticity itself remains a Phase-2 / real-source matter
 #   (the same (a)/(b) distinction the Q2 accepted for
-#   formal_registry). Same-key-different-events positive
-#   identification (contract §3.1(3) bullet 1) has no in-repo
-#   mechanism — no canonical event reference registry exists —
-#   and is NOT faked here; it is carried as a remaining gap.
+#   formal_registry). Canonical event references (contract
+#   §3.1(2)(a)) are consumed through an explicit canonical
+#   layer below: refs + a digest-bound approval object. A
+#   workspace CANDIDATE registry derived from real data exists
+#   (version-bound, CANDIDATE-labeled); it is NOT a formal
+#   release. Without a valid approval the layer is inert or
+#   invalid and nothing claims formal event identity. The
+#   same-key-different-events POSITIVE identification
+#   (§3.1(3) bullet 1 — proving two same-key claims are
+#   different events) still has no mechanism: ref-level gating
+#   can refuse a false CONFLICT/OK, but identifying the second
+#   event needs a second identified event. That gap is carried,
+#   not faked.
 # - Trusted claims sharing (player_uid, event_ref) form one event
 #   group; differing normalized business values (date, text) inside
 #   one group are CONFLICT, with every participating claim listed.
@@ -444,12 +453,66 @@ def event_association_digest(claim: Dict[str, Any],
     }))
 
 
+def validate_canonical_approval(approval: Any, refs: Any) -> bool:
+    """Validate a canonical-release approval object against the refs
+    it claims to approve. Returns False on ANY defect, never raises.
+
+    The approval binds {release_id, release_version, source_sha256,
+    approved_tiers, canonical_digest} with approval_digest, and
+    canonical_digest must equal SHA-256 over the canonical JSON of
+    the refs dict itself — so an approval cannot be replayed onto
+    different refs, and refs cannot be swapped under an approval.
+
+    What this does NOT prove (same (a)/(b) distinction as
+    formal_registry and identity authorization): the code verifies
+    structure and binding only. It does NOT authenticate the
+    publisher, the release, or the business correctness of the
+    refs — that authentication is out-of-band (a Human-approved
+    formal release). A digest that recomputes proves internal
+    consistency, never external authenticity. An attacker able to
+    rewrite refs and both digests together is outside this check."""
+    if not isinstance(approval, dict) or not isinstance(refs, dict):
+        return False
+    release_id = approval.get("release_id")
+    release_version = approval.get("release_version")
+    source_sha256 = approval.get("source_sha256")
+    approved_tiers = approval.get("approved_tiers")
+    canonical_digest = approval.get("canonical_digest")
+    approval_digest = approval.get("approval_digest")
+    if not (isinstance(release_id, str) and release_id
+            and isinstance(release_version, str) and release_version
+            and isinstance(source_sha256, str)
+            and _SHA256_RE.match(source_sha256)
+            and isinstance(approved_tiers, list) and approved_tiers
+            and all(isinstance(t, str) and t for t in approved_tiers)
+            and len(set(approved_tiers)) == len(approved_tiers)
+            and isinstance(canonical_digest, str)
+            and _SHA256_RE.match(canonical_digest)
+            and isinstance(approval_digest, str)
+            and _SHA256_RE.match(approval_digest)):
+        return False
+    try:
+        expected_approval = sha256_hex(canonical_json({
+            "release_id": release_id,
+            "release_version": release_version,
+            "source_sha256": source_sha256,
+            "approved_tiers": sorted(approved_tiers),
+            "canonical_digest": canonical_digest}))
+        expected_canonical = sha256_hex(canonical_json(refs))
+    except (TypeError, ValueError):
+        return False
+    return (approval_digest == expected_approval
+            and canonical_digest == expected_canonical)
+
+
 def _event_association_valid(claim: Dict[str, Any], *,
                              authorized_sources=None,
                              snapshot_sources=None,
                              snapshot_id=None,
                              passage_anchors=None,
-                             passage_texts=None) -> bool:
+                             passage_texts=None,
+                             canonical_refs=None,
+                             canonical_approval=None) -> bool:
     assoc = claim.get("event_association")
     if not isinstance(assoc, dict):
         return False
@@ -527,6 +590,28 @@ def _event_association_valid(claim: Dict[str, Any], *,
         return False
     if digest != expected:
         return False
+    if canonical_refs is not None or canonical_approval is not None:
+        # Canonical layer configured (fully or partially). It is an
+        # ADDITIONAL gate, never an override: every earlier check
+        # still applies. A half-configured layer trusts nothing.
+        # A fully configured layer trusts only an event_ref that
+        # is present in the approved refs, in an approved tier,
+        # and marked confirmed — with the approval's digests
+        # binding exactly those refs. Anything else is untrusted,
+        # so the claim falls back to the UNKNOWN paths, never to
+        # a CONFLICT or OK on an unapproved basis.
+        if canonical_refs is None or canonical_approval is None:
+            return False
+        if not validate_canonical_approval(canonical_approval,
+                                            canonical_refs):
+            return False
+        entry = canonical_refs.get(ref)
+        if not isinstance(entry, dict):
+            return False
+        if entry.get("tier") not in canonical_approval["approved_tiers"]:
+            return False
+        if entry.get("confirmed") is not True:
+            return False
     return True
 
 
@@ -539,17 +624,28 @@ def resolve_claims_by_event(claims: List[Dict[str, Any]], *,
                             snapshot_sources=None,
                             snapshot_id=None,
                             passage_anchors=None,
-                            passage_texts=None) -> Dict[str, Any]:
+                            passage_texts=None,
+                            canonical_refs=None,
+                            canonical_approval=None) -> Dict[str, Any]:
     def _valid(claim: Dict[str, Any]) -> bool:
         return _event_association_valid(
             claim, authorized_sources=authorized_sources,
             snapshot_sources=snapshot_sources,
             passage_texts=passage_texts,
             snapshot_id=snapshot_id,
-            passage_anchors=passage_anchors)
+            passage_anchors=passage_anchors,
+            canonical_refs=canonical_refs,
+            canonical_approval=canonical_approval)
 
     conflicting: set = set()
     unresolved: set = set()
+    if claims:
+        if ((canonical_refs is None) != (canonical_approval is None)):
+            unresolved.add("CANONICAL_LAYER_HALF_CONFIGURED")
+        elif (canonical_refs is not None
+                and not validate_canonical_approval(canonical_approval,
+                                                    canonical_refs)):
+            unresolved.add("CANONICAL_APPROVAL_INVALID")
     trusted: Dict[Any, List[Dict[str, Any]]] = {}
     for claim in claims:
         if _valid(claim):

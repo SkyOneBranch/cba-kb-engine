@@ -222,12 +222,22 @@ class ConsumeSession:
                  authorized_players: Any = (),
                  authorized_sources: Any = (),
                  authorized_objects: Any = (),
-                 authorization_basis: str = DEFAULT_AUTHORIZATION_BASIS):
+                 authorization_basis: str = DEFAULT_AUTHORIZATION_BASIS,
+                 canonical_event_refs: Any = None,
+                 canonical_approval: Any = None):
         self.target_domain = target_domain
         self.authorized_players = set(authorized_players)
         self.authorized_sources = set(authorized_sources)
         self.authorized_objects = set(authorized_objects)
         self.authorization_basis = authorization_basis
+        # Canonical layer inputs are deep-copied at bind time so a
+        # later caller mutation cannot move the binding, mirroring
+        # how snapshots are deep-copied on bind. None/None keeps
+        # the pre-canonical behavior unchanged.
+        self._canonical_event_refs = copy.deepcopy(canonical_event_refs) \
+            if canonical_event_refs is not None else None
+        self._canonical_approval = copy.deepcopy(canonical_approval) \
+            if canonical_approval is not None else None
         self.session_id = uuid.uuid4().hex
         self._store: SimulatedCurrentStore = SimulatedCurrentStore(
             target_domain=target_domain)
@@ -928,7 +938,9 @@ class ConsumeSession:
             snapshot_sources=set(manifest.keys()),
             snapshot_id=self._bound_snapshot_id,
             passage_anchors=passage_anchors,
-            passage_texts=passage_texts)
+            passage_texts=passage_texts,
+            canonical_refs=self._canonical_event_refs,
+            canonical_approval=self._canonical_approval)
         refusals = []
         _PROVENANCE_EXCLUDED = frozenset({
             "source", "source_id", "digest", "locator", "revision",

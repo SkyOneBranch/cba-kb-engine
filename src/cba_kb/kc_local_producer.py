@@ -203,6 +203,88 @@ def _validate_identity_authorization(auth: Any) -> Dict[str, Any]:
             "index_digest": digest}
 
 
+def validate_identity_inventory_candidate(candidate: Any) -> Dict[str, Any]:
+    """Validate a B1-style identity inventory CANDIDATE, read-only.
+    Returns {"valid": bool, ...}; never raises on malformed input.
+
+    This validates CANDIDATE inventories only: the label must be
+    exactly CANDIDATE_NOT_FORMAL_INDEX, and a candidate that
+    claims to be formal is refused, not blessed — label
+    laundering must not turn an unapproved inventory into a
+    trusted index. Checks are internal reconciliation only:
+    version present, source SHA well-formed, coverage season
+    counts summing to master_rows, distinct-name count matching
+    the inventory size, and every entry's season/club/tier
+    counts summing to its row count.
+
+    What this does NOT do, by design: it never returns an
+    authorization object and never feeds a trusted RESOLVED. A
+    candidate inventory has observed names, no UIDs, no approved
+    aliases, and no publisher approval — it cannot authorize
+    identity. The producer's trusted path still requires a
+    separate formal identity_authorization object; without one,
+    identity stays UNKNOWN (HOLD). Structural reconciliation
+    proves the inventory is self-consistent, never that its
+    names are complete, correct, or approved."""
+    def _invalid(reason: str) -> Dict[str, Any]:
+        return {"valid": False, "reason": reason}
+
+    def _counts(mapping: Any) -> bool:
+        return (isinstance(mapping, dict) and bool(mapping)
+                and all(isinstance(v, int) and not isinstance(v, bool)
+                        and v >= 0 for v in mapping.values()))
+
+    def _is_sha(value: Any) -> bool:
+        hexdigits = set("0123456789abcdef")
+        return (isinstance(value, str) and len(value) == 64
+                and all(ch in hexdigits for ch in value))
+
+    if not isinstance(candidate, dict):
+        return _invalid("CANDIDATE_MALFORMED")
+    if candidate.get("candidate_label") != "CANDIDATE_NOT_FORMAL_INDEX":
+        return _invalid("CANDIDATE_LABEL_NOT_CANDIDATE")
+    version = candidate.get("candidate_version")
+    if not (isinstance(version, str) and version):
+        return _invalid("CANDIDATE_VERSION_MISSING")
+    sources = candidate.get("sources")
+    if not (isinstance(sources, dict)
+            and _is_sha(sources.get("master_sha256"))):
+        return _invalid("CANDIDATE_SOURCE_SHA_MISSING")
+    coverage = candidate.get("coverage_proof")
+    inventory = candidate.get("inventory")
+    if not isinstance(coverage, dict) or not isinstance(inventory, dict) \
+            or not inventory:
+        return _invalid("CANDIDATE_STRUCTURE_MISSING")
+    master_rows = coverage.get("master_rows")
+    per_season = coverage.get("per_season_counts")
+    if not (isinstance(master_rows, int)
+            and not isinstance(master_rows, bool) and master_rows > 0):
+        return _invalid("CANDIDATE_MASTER_ROWS_INVALID")
+    if not _counts(per_season):
+        return _invalid("CANDIDATE_SEASON_COUNTS_INVALID")
+    if sum(per_season.values()) != master_rows:
+        return _invalid("COVERAGE_SEASON_SUM_MISMATCH")
+    if coverage.get("distinct_player_names") != len(inventory):
+        return _invalid("COVERAGE_NAME_COUNT_MISMATCH")
+    for name, entry in inventory.items():
+        if not (isinstance(name, str) and name
+                and isinstance(entry, dict)):
+            return _invalid("CANDIDATE_ENTRY_MALFORMED")
+        rows = entry.get("rows")
+        if not (isinstance(rows, int) and not isinstance(rows, bool)
+                and rows > 0):
+            return _invalid("CANDIDATE_ENTRY_ROWS_INVALID")
+        for field in ("seasons", "clubs", "tiers"):
+            mapping = entry.get(field)
+            if not _counts(mapping):
+                return _invalid("CANDIDATE_ENTRY_COUNTS_INVALID")
+            if sum(mapping.values()) != rows:
+                return _invalid("INVENTORY_ENTRY_SUM_MISMATCH")
+    return {"valid": True, "candidate_version": version,
+            "master_rows": master_rows,
+            "distinct_player_names": len(inventory)}
+
+
 def _snapshot_dict(snap: Any) -> Dict[str, Any]:
     receipt = snap.simulated_validator_receipt
     receipt_d = dict(receipt) if isinstance(receipt, dict) \
