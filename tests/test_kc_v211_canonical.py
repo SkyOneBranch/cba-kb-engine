@@ -111,9 +111,13 @@ def test_canonical_approved_distinct_refs_ok():
 
 def test_canonical_ref_absent_unknown():
     # NEW-CAPABILITY gate: same shape as the conflict positive,
-    # but the ref is absent from the canonical set. The old
-    # (no-canonical-params) path returns CONFLICT here; the
+    # but the ref is absent from the canonical set. The
     # canonical layer refuses it: UNKNOWN, not CONFLICT.
+    # Corrective rewrite (2026-10-31, Q2 B-01): the old
+    # contrast line (no-canonical-params path returns
+    # CONFLICT) is superseded — without any trusted basis,
+    # the same claims are UNKNOWN too. The canonical refusal
+    # assertion above is unchanged.
     refs = {"EV9": {"tier": TIER_A, "confirmed": True}}
     claims = [_claim("c1", "甲", "EV1", "P1"),
               _claim("c2", "乙", "EV1", "P1")]
@@ -122,7 +126,7 @@ def test_canonical_ref_absent_unknown():
     assert out["status"] == "UNKNOWN"
     assert out["conflicting_claim_ids"] == []
     base = _resolve(claims, _texts(("P1", "EV1")))
-    assert base["status"] == "CONFLICT"
+    assert base["status"] == "UNKNOWN"
 
 
 def test_canonical_tier_unapproved_unknown():
@@ -212,15 +216,18 @@ def test_canonical_half_configured_trusts_nothing():
     assert "CANONICAL_LAYER_HALF_CONFIGURED" in out["unresolved"]
 
 
-def test_canonical_absent_fallback_unchanged():
-    # PIN: with neither param, behavior is exactly the
-    # pre-canonical behavior — same-ref differing values
-    # content-backed still CONFLICT. The layer adds a gate;
-    # it does not change the fallback.
+def test_canonical_absent_no_basis_unknown():
+    # Corrective rewrite (Human-authorized, 2026-10-31, Q2
+    # B-01): the old fallback PIN is superseded. With neither
+    # canonical param NOR a formal association assertion,
+    # content-backed associations are untrusted: same-ref
+    # differing values are UNKNOWN, not CONFLICT. The
+    # assertion-backed positive path lives in
+    # test_kc_v211_corrective.py.
     claims = [_claim("c1", "甲", "EV1", "P1"),
               _claim("c2", "乙", "EV1", "P1")]
     out = _resolve(claims, _texts(("P1", "EV1")))
-    assert out["status"] == "CONFLICT"
+    assert out["status"] == "UNKNOWN"
 
 
 def test_canonical_does_not_override_content_or_digest():

@@ -29,7 +29,8 @@ from cba_kb.kc_local_producer import (
     verify_local_projection)
 from cba_kb.kc_passages import build_routed_passage, evidence_chain
 from cba_kb.kc_projection import (
-    canonical_json, event_association_digest, sha256_hex)
+    canonical_json, event_association_digest,
+    formal_association_assertion_digest, sha256_hex)
 from cba_kb.kc_snapshot import build_snapshot
 
 PROVIDER = "CBA_OFFICIAL"
@@ -111,6 +112,28 @@ def _claim(snap, cid, text, ref, src, loc, evidence):
     return claim
 
 
+def _assert(claim):
+    # Corrective migration (Human-authorized, 2026-10-31, Q2
+    # B-01): a positive consumer test now carries the second
+    # contract-allowed trusted basis — a separate formal
+    # association assertion bound to the claim's association.
+    # Content support alone is no longer a trusted basis.
+    assoc = claim["event_association"]
+    aid = "ASSERT-" + claim["claim_id"]
+    claim["formal_association_assertion"] = {
+        "assertion_id": aid,
+        "source_id": assoc["source_id"],
+        "revision": assoc["revision"],
+        "locator": assoc["locator"],
+        "event_ref": assoc["event_ref"],
+        "claim_id": claim["claim_id"],
+        "player_uid": claim["player_uid"],
+        "snapshot_id": assoc.get("snapshot_id"),
+        "assertion_digest": formal_association_assertion_digest(
+            claim, assoc, aid)}
+    return claim
+
+
 def _answer(session, fx, passage, chain, claims):
     fact = {"fact_id": "ev_fact", "fact_version": "v1",
             "player_uid": A, "season": SEASON,
@@ -156,14 +179,19 @@ def test_event_identity_content_backed_same_ref_conflict(fx):
     # PIN (positive): the same shape, but the anchor passage's
     # text states the claimed event — a content-backed
     # association. Same event, differing values: CONFLICT.
+    # Corrective migration (2026-10-31, Q2 B-01): the claims
+    # now also carry formal association assertions, the
+    # second contract-allowed trusted basis.
     passage = _passage("fixture_doc_D1", "rev-1", "P3",
                        fx["passages"][0]["text"] + " 事件 event_Q。")
     session, snap, chain = _bound_session(fx, [passage])
     claims = [
-        _claim(snap, "c1", "事件发生在 2026-03-10", "event_Q",
-               "fixture_doc_D1", "P3", ["fixture_doc_D1:P3"]),
-        _claim(snap, "c2", "事件发生在 2026-03-15", "event_Q",
-               "fixture_doc_D1", "P3", ["fixture_doc_D1:P3"])]
+        _assert(_claim(snap, "c1", "事件发生在 2026-03-10", "event_Q",
+                       "fixture_doc_D1", "P3",
+                       ["fixture_doc_D1:P3"])),
+        _assert(_claim(snap, "c2", "事件发生在 2026-03-15", "event_Q",
+                       "fixture_doc_D1", "P3",
+                       ["fixture_doc_D1:P3"]))]
     layer = _layer(_answer(session, fx, passage, chain, claims))
     assert layer["status"] == "CONFLICT"
     assert layer["conflicting_claim_ids"] == ["c1", "c2"]
@@ -197,16 +225,20 @@ def test_event_identity_content_backed_distinct_refs_ok(fx):
     # with disjoint resolving evidence. Distinctness is proven
     # by distinct content-backed associations, not by string
     # inequality: OK.
+    # Corrective migration (2026-10-31, Q2 B-01): the claims
+    # now also carry formal association assertions.
     passage = _passage("fixture_doc_D1", "rev-1", "P3",
                        fx["passages"][0]["text"] + " 事件 game_01。")
     passage2 = _passage("fixture_doc_D2", "rev-1", "P9",
                         "第二来源文本。事件 game_02。")
     session, snap, chain = _bound_session(fx, [passage, passage2])
     claims = [
-        _claim(snap, "c1", "事件发生在 2026-03-10", "game_01",
-               "fixture_doc_D1", "P3", ["fixture_doc_D1:P3"]),
-        _claim(snap, "c2", "事件发生在 2026-03-15", "game_02",
-               "fixture_doc_D2", "P9", ["fixture_doc_D2:P9"])]
+        _assert(_claim(snap, "c1", "事件发生在 2026-03-10", "game_01",
+                       "fixture_doc_D1", "P3",
+                       ["fixture_doc_D1:P3"])),
+        _assert(_claim(snap, "c2", "事件发生在 2026-03-15", "game_02",
+                       "fixture_doc_D2", "P9",
+                       ["fixture_doc_D2:P9"]))]
     layer = _layer(_answer(session, fx, passage, chain, claims))
     assert layer["status"] == "OK"
     assert layer["conflicting_claim_ids"] == []

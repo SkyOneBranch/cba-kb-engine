@@ -42,6 +42,7 @@ from cba_kb.kc_cleanroom import A, B, QUOTE, SEASON, build_cleanroom_fixture
 from cba_kb.kc_consume import ConsumeSession, _content_digest
 from cba_kb.kc_passages import build_routed_passage, evidence_chain
 from cba_kb.kc_projection import (build_passage, canonical_json,
+                                  formal_association_assertion_digest,
                                   resolve_claims, sha256_hex)
 from cba_kb.kc_snapshot import build_snapshot
 
@@ -194,13 +195,50 @@ def _identity_source(players, aliases):
                 players=players, aliases=aliases)}
 
 
+def _assert(claim):
+    # Corrective migration (Human-authorized, 2026-10-31, Q2
+    # B-01): the second contract-allowed trusted basis — a
+    # separate formal association assertion bound to the
+    # claim's association. Content + digest alone no longer
+    # suffice for a trusted verdict.
+    assoc = claim["event_association"]
+    aid = "ASSERT-" + claim["claim_id"]
+    claim["formal_association_assertion"] = {
+        "assertion_id": aid,
+        "source_id": assoc["source_id"],
+        "revision": assoc["revision"],
+        "locator": assoc["locator"],
+        "event_ref": assoc["event_ref"],
+        "claim_id": claim["claim_id"],
+        "player_uid": claim["player_uid"],
+        "snapshot_id": assoc.get("snapshot_id"),
+        "assertion_digest": formal_association_assertion_digest(
+            claim, assoc, aid)}
+    return claim
+
+
+def _auth(uids):
+    # Corrective migration (Human-authorized, 2026-10-31, Q2
+    # B-02): a formal identity authorization object, digest-
+    # bound the way the shared validator recomputes it.
+    auth = {"index_id": "fixture_index", "index_version": "v1",
+            "authorized_players": sorted(uids),
+            "approved_aliases": None, "index_digest": ""}
+    auth["index_digest"] = sha256_hex(canonical_json({
+        "index_id": "fixture_index", "index_version": "v1",
+        "authorized_players": sorted(uids),
+        "approved_aliases": None}))
+    return auth
+
+
 def _e4b_claims(snapshot_id=None):
-    # Post-freeze Q2 B-03 fix, completed by the Q2-227-02 repair:
-    # the associations are FORMAL assertions bound to each
-    # claim's own source, revision, locator, player UID and
-    # snapshot, with a digest RECOMPUTED over that bound content
-    # — not a fixed hex string, and not a bare event_ref +
-    # evidence declaration.
+    # Post-freeze Q2 B-03 fix, completed by the Q2-227-02 repair
+    # and the 2026-10-31 corrective migration (Q2 B-01): each
+    # claim carries a FORMAL association assertion — a separate
+    # artifact bound to the claim's own source, revision,
+    # locator, player UID and snapshot, with a digest
+    # RECOMPUTED over that bound content — not a fixed hex
+    # string, and not a bare event_ref + evidence declaration.
     digest_of = _association_digest()
     base = {"event_ref": "fixture_event_E4b",
             "evidence": ["fixture_doc_D1:P3", "fixture_doc_D2:P7"],
@@ -222,6 +260,7 @@ def _e4b_claims(snapshot_id=None):
     for claim in claims:
         claim["event_association"]["digest"] = digest_of(
             claim, claim["event_association"])
+        _assert(claim)
     return claims
 
 
@@ -415,6 +454,10 @@ def test_event_resolver_three_claims_precise_members():
     for claim in claims:
         claim["event_association"]["digest"] = digest_of(
             claim, claim["event_association"])
+        # Corrective migration (2026-10-31, Q2 B-01): the
+        # shared-ref group is trusted via formal association
+        # assertions, the second contract-allowed basis.
+        _assert(claim)
     out = fn(claims)
     assert out["status"] == "CONFLICT"
     assert out["conflicting_claim_ids"] == ["t_a1", "t_a2", "t_b"]
@@ -521,7 +564,10 @@ def _identity(session, fx, **kw):
 
 
 def test_identity_alias_resolved_authorized(fx):
-    session = _session()
+    # Corrective migration (2026-10-31, Q2 B-02): the session
+    # now also carries the formal authorization object that
+    # the consumer entry requires for a trusted RESOLVED.
+    session = _session(identity_authorization=_auth([A, B]))
     out = _identity(session, fx)
     assert out["payload"]["status"] == "RESOLVED"
     assert out["payload"]["candidates"] == [A]
@@ -531,7 +577,11 @@ def test_identity_alias_resolved_authorized(fx):
 
 
 def test_identity_same_name_clarification(fx):
-    session = _session(authorized_players={A, B})
+    # Corrective migration (2026-10-31, Q2 B-02): the session
+    # now also carries the formal authorization object, so
+    # the shared-name candidate set is authorization-backed.
+    session = _session(authorized_players={A, B},
+                       identity_authorization=_auth([A, B]))
     out = _identity(session, fx, query="林测试", query_kind="name")
     assert out["payload"]["status"] == "CLARIFICATION_REQUIRED"
     assert out["payload"]["candidates"] == sorted([A, B])

@@ -95,7 +95,11 @@ from .kc_consume import (
     identity_evidence_digest,
 )
 from .kc_passages import evidence_chain, validate_passage
-from .kc_projection import canonical_json, sha256_hex
+from .kc_projection import (
+    canonical_json,
+    sha256_hex,
+    validate_identity_authorization,
+)
 from .kc_snapshot import (
     build_fact_guarantee,
     build_snapshot,
@@ -137,70 +141,14 @@ def _formal_routes(formal_registry: Any) -> Any:
 
 
 def _validate_identity_authorization(auth: Any) -> Dict[str, Any]:
-    """Validate a formal identity authorization object and return
-    its normalized form. This object is a SEPARATE artifact from
-    the players/aliases being resolved — it is the authorization
-    baseline, never derived from the resolution input. It carries
-    an index identity (index_id, index_version), the authorized
-    player set, and an index_digest recomputed over the canonical
-    JSON of {index_id, index_version, authorized_players sorted,
-    approved_aliases normalized-or-None}. Any structural defect
-    or digest mismatch is a build failure, never a silent
-    downgrade. The producer validates structure and binding; it
-    does NOT authenticate the index itself — the reported index
-    identity is what an out-of-band check compares (the same
-    (a)/(b) distinction the Q2 accepted for formal_registry).
-    When present, approved_aliases is the approved alias set:
-    aliases outside it are filtered before resolution, never
-    trusted as approved bindings."""
-    if not isinstance(auth, dict):
-        raise KcLocalProducerError(
-            "LOCAL_PROJECTION_IDENTITY_AUTHORIZATION_MALFORMED")
-    index_id = auth.get("index_id")
-    index_version = auth.get("index_version")
-    players = auth.get("authorized_players")
-    if not (isinstance(index_id, str) and index_id
-            and isinstance(index_version, str) and index_version
-            and isinstance(players, list) and players
-            and all(isinstance(p, str) and p for p in players)
-            and len(set(players)) == len(players)):
-        raise KcLocalProducerError(
-            "LOCAL_PROJECTION_IDENTITY_AUTHORIZATION_MALFORMED")
-    approved = auth.get("approved_aliases")
-    normalized_approved = None
-    if approved is not None:
-        if not isinstance(approved, list):
-            raise KcLocalProducerError(
-                "LOCAL_PROJECTION_IDENTITY_AUTHORIZATION_MALFORMED")
-        pairs = []
-        for entry in approved:
-            if not isinstance(entry, dict) \
-                    or not (isinstance(entry.get("alias"), str)
-                            and entry.get("alias")) \
-                    or not (isinstance(entry.get("player_uid"), str)
-                            and entry.get("player_uid")):
-                raise KcLocalProducerError(
-                    "LOCAL_PROJECTION_IDENTITY_AUTHORIZATION_MALFORMED")
-            pairs.append({"alias": entry["alias"],
-                          "player_uid": entry["player_uid"]})
-        if len({(p["alias"], p["player_uid"]) for p in pairs}) \
-                != len(pairs):
-            raise KcLocalProducerError(
-                "LOCAL_PROJECTION_IDENTITY_AUTHORIZATION_MALFORMED")
-        normalized_approved = sorted(
-            pairs, key=lambda p: (p["alias"], p["player_uid"]))
-    digest = auth.get("index_digest")
-    expected = sha256_hex(canonical_json({
-        "index_id": index_id, "index_version": index_version,
-        "authorized_players": sorted(players),
-        "approved_aliases": normalized_approved}))
-    if not (isinstance(digest, str) and digest == expected):
-        raise KcLocalProducerError(
-            "LOCAL_PROJECTION_IDENTITY_AUTHORIZATION_INVALID")
-    return {"index_id": index_id, "index_version": index_version,
-            "authorized_players": sorted(players),
-            "approved_aliases": normalized_approved,
-            "index_digest": digest}
+    """Producer wrapper around the shared validator in
+    kc_projection (moved there so the consumer entry can reuse
+    the same rule without a circular import). Failures are
+    still reported as build errors with the legacy codes."""
+    try:
+        return validate_identity_authorization(auth)
+    except ValueError as exc:
+        raise KcLocalProducerError(str(exc))
 
 
 def validate_identity_inventory_candidate(candidate: Any) -> Dict[str, Any]:
@@ -266,6 +214,7 @@ def validate_identity_inventory_candidate(candidate: Any) -> Dict[str, Any]:
         return _invalid("COVERAGE_SEASON_SUM_MISMATCH")
     if coverage.get("distinct_player_names") != len(inventory):
         return _invalid("COVERAGE_NAME_COUNT_MISMATCH")
+    entry_total = 0
     for name, entry in inventory.items():
         if not (isinstance(name, str) and name
                 and isinstance(entry, dict)):
@@ -274,12 +223,19 @@ def validate_identity_inventory_candidate(candidate: Any) -> Dict[str, Any]:
         if not (isinstance(rows, int) and not isinstance(rows, bool)
                 and rows > 0):
             return _invalid("CANDIDATE_ENTRY_ROWS_INVALID")
+        entry_total += rows
         for field in ("seasons", "clubs", "tiers"):
             mapping = entry.get(field)
             if not _counts(mapping):
                 return _invalid("CANDIDATE_ENTRY_COUNTS_INVALID")
             if sum(mapping.values()) != rows:
                 return _invalid("INVENTORY_ENTRY_SUM_MISMATCH")
+    # Corrective repair (Human-authorized, 2026-10-31): season
+    # sums and per-entry sums are not enough — an inventory
+    # silently dropping entries still reconciles. The sum of
+    # every entry's rows must equal the declared master total.
+    if entry_total != master_rows:
+        return _invalid("COVERAGE_ENTRY_TOTAL_MISMATCH")
     return {"valid": True, "candidate_version": version,
             "master_rows": master_rows,
             "distinct_player_names": len(inventory)}
@@ -385,6 +341,13 @@ def build_local_projection(*, fixture: Dict[str, Any],
                       authorized_players=authorized_players,
                       authorized_sources=authorized_sources,
                       authorized_objects=authorized_objects)
+    if identity_authorization is not None:
+        # Corrective repair (Human-authorized, 2026-10-31, Q2
+        # B-02): the producer's identity entry must run under
+        # the same authorization binding the consumer entry now
+        # requires — otherwise the producer's formal path would
+        # go UNKNOWN under the new consumer rule.
+        session_kw["identity_authorization"] = identity_authorization
     probe = ConsumeSession(**session_kw)
     probed = probe.consume_slice(
         records, player_uid=first_player, season=season,

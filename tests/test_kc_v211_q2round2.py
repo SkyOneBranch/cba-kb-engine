@@ -33,6 +33,7 @@ from cba_kb.kc_local_producer import (
 from cba_kb.kc_passages import build_routed_passage, evidence_chain
 from cba_kb.kc_projection import (
     canonical_json,
+    formal_association_assertion_digest,
     resolve_claims_by_event,
     sha256_hex,
 )
@@ -217,6 +218,27 @@ def _assoc(claim, source_id, revision, locator, digest, player_uid=A):
             "player_uid": player_uid}
 
 
+def _assert(claim):
+    # Corrective migration (Human-authorized, 2026-10-31, Q2
+    # B-01): positive tests now carry the second
+    # contract-allowed trusted basis — a separate formal
+    # association assertion bound to the claim's association.
+    assoc = claim["event_association"]
+    aid = "ASSERT-" + claim["claim_id"]
+    claim["formal_association_assertion"] = {
+        "assertion_id": aid,
+        "source_id": assoc["source_id"],
+        "revision": assoc["revision"],
+        "locator": assoc["locator"],
+        "event_ref": assoc["event_ref"],
+        "claim_id": claim["claim_id"],
+        "player_uid": claim["player_uid"],
+        "snapshot_id": assoc.get("snapshot_id"),
+        "assertion_digest": formal_association_assertion_digest(
+            claim, assoc, aid)}
+    return claim
+
+
 def test_q2r2_event_fixed_hex_digest_unknown():
     # BEHAVIORAL: a merely well-formed 64-hex digest is NOT a
     # bound assertion — the digest must recompute over the bound
@@ -259,6 +281,8 @@ def test_q2r2_event_bound_digests_conflict():
     # digest helper is imported lazily so that, on the old HEAD,
     # this positive test fails at the import boundary (a new
     # seam) rather than masquerading as business falsification.
+    # Corrective migration (2026-10-31, Q2 B-01): the claims
+    # now also carry formal association assertions.
     from cba_kb.kc_projection import event_association_digest
     claims = []
     for cid, text in (("q_a", "说法一"), ("q_b", "说法二")):
@@ -268,7 +292,7 @@ def test_q2r2_event_bound_digests_conflict():
         assoc = _assoc(claim, "src_Q", "rev-1", "P1", "")
         assoc["digest"] = event_association_digest(claim, assoc)
         claim["event_association"] = assoc
-        claims.append(claim)
+        claims.append(_assert(claim))
     out = resolve_claims_by_event(claims)
     assert out["status"] == "CONFLICT"
     assert out["conflicting_claim_ids"] == ["q_a", "q_b"]
@@ -280,6 +304,8 @@ def test_q2r2_event_distinct_trusted_refs_ok():
     # PIN: proven-no-conflict OK is preserved when every claim is
     # trusted under a pairwise-distinct event ref. Lazy import
     # for the same reason as test_q2r2_event_bound_digests_conflict.
+    # Corrective migration (2026-10-31, Q2 B-01): the claims
+    # now also carry formal association assertions.
     from cba_kb.kc_projection import event_association_digest
     claims = []
     for cid, ref, ev, text in (("q_a", "event_1", "src_Q:P1", "说法一"),
@@ -292,7 +318,7 @@ def test_q2r2_event_distinct_trusted_refs_ok():
                  "locator": "P1", "player_uid": A, "digest": ""}
         assoc["digest"] = event_association_digest(claim, assoc)
         claim["event_association"] = assoc
-        claims.append(claim)
+        claims.append(_assert(claim))
     out = resolve_claims_by_event(claims)
     assert out["status"] == "OK"
     assert out["conflicting_claim_ids"] == []

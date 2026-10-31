@@ -114,6 +114,7 @@ from .kc_projection import (
     resolve_claims_by_event,
     resolve_identity,
     sha256_hex,
+    validate_identity_authorization,
     validate_passage,
 )
 from .kc_render import (
@@ -224,7 +225,8 @@ class ConsumeSession:
                  authorized_objects: Any = (),
                  authorization_basis: str = DEFAULT_AUTHORIZATION_BASIS,
                  canonical_event_refs: Any = None,
-                 canonical_approval: Any = None):
+                 canonical_approval: Any = None,
+                 identity_authorization: Any = None):
         self.target_domain = target_domain
         self.authorized_players = set(authorized_players)
         self.authorized_sources = set(authorized_sources)
@@ -238,6 +240,11 @@ class ConsumeSession:
             if canonical_event_refs is not None else None
         self._canonical_approval = copy.deepcopy(canonical_approval) \
             if canonical_approval is not None else None
+        # Formal identity authorization, same deep-copy rule:
+        # the binding for consume_identity's completeness proof.
+        self._identity_authorization = \
+            copy.deepcopy(identity_authorization) \
+            if identity_authorization is not None else None
         self.session_id = uuid.uuid4().hex
         self._store: SimulatedCurrentStore = SimulatedCurrentStore(
             target_domain=target_domain)
@@ -499,18 +506,46 @@ class ConsumeSession:
             return unknown("IDENTITY_EVIDENCE_DIGEST_MISMATCH")
         if digest != expected_digest:
             return unknown("IDENTITY_EVIDENCE_DIGEST_MISMATCH")
-        # Target-first: filter BEFORE any resolution, summary, or
-        # candidate list is derived. Unauthorized entries never reach
-        # the primitive, so they cannot leak through a candidate,
-        # a count, or a clarification list.
+        # Corrective repair (Human-authorized, 2026-10-31, Q2
+        # B-02): completeness is proven against a SEPARATE
+        # formal identity authorization object, never against
+        # the caller's own session set, page flag, or a digest
+        # recomputed over the caller's own submission. Without
+        # that object, no trusted RESOLVED or complete
+        # candidate set may be emitted: the entry stays UNKNOWN
+        # (HOLD). The object is validated by the shared rule
+        # the producer enforces; its publisher authenticity
+        # remains out-of-band, exactly as on the producer path.
+        # The earlier checks above still run first, so their
+        # specific UNKNOWN reasons are preserved.
+        auth = self._identity_authorization
+        if auth is None:
+            return unknown("IDENTITY_COVERAGE_UNPROVEN")
+        try:
+            formal = validate_identity_authorization(auth)
+        except ValueError:
+            return unknown("IDENTITY_AUTHORIZATION_INVALID")
+        auth_players = set(formal["authorized_players"])
+        if not auth_players <= supplied_uids:
+            return unknown("IDENTITY_COVERAGE_INCOMPLETE")
+        # Target-first, against the authorization baseline (not
+        # the caller session set): entries outside the formal
+        # index never reach resolution, so a session scoped
+        # narrower than the index cannot hide a same-name second
+        # UID behind a trusted RESOLVED. Approved aliases are
+        # enforced the same way the producer enforces them.
         filtered_players = [p for p in players
                             if isinstance(p, dict)
-                            and p.get("player_uid")
-                            in self.authorized_players]
+                            and p.get("player_uid") in auth_players]
         filtered_aliases = [a for a in aliases
                             if isinstance(a, dict)
-                            and a.get("player_uid")
-                            in self.authorized_players]
+                            and a.get("player_uid") in auth_players]
+        if formal["approved_aliases"] is not None:
+            approved_set = {(a["alias"], a["player_uid"])
+                            for a in formal["approved_aliases"]}
+            filtered_aliases = [a for a in filtered_aliases
+                                if (a.get("alias"),
+                                    a.get("player_uid")) in approved_set]
         resolved = resolve_identity(filtered_players, filtered_aliases,
                                     query=query, query_kind=query_kind)
         if resolved["status"] == "UNKNOWN":
@@ -519,7 +554,10 @@ class ConsumeSession:
         payload["authorization_scope"] = "AUTHORIZED_PLAYERS_ONLY"
         payload["evidence_binding"] = {
             "source_id": source_id, "revision": revision,
-            "digest": digest, "kind": "KC_IDENTITY_EVIDENCE"}
+            "digest": digest, "kind": "KC_IDENTITY_EVIDENCE",
+            "index_id": formal["index_id"],
+            "index_version": formal["index_version"],
+            "index_digest": formal["index_digest"]}
         payload["session_snapshot_id"] = self._bound_snapshot_id
         payload["binding_separation"] = (
             "SESSION_SNAPSHOT_BINDING_IS_NOT_IDENTITY_EVIDENCE")

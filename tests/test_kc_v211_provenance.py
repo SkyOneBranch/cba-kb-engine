@@ -47,7 +47,8 @@ from cba_kb.kc_local_producer import (
     verify_local_projection,
 )
 from cba_kb.kc_passages import build_routed_passage, evidence_chain
-from cba_kb.kc_projection import event_association_digest
+from cba_kb.kc_projection import (
+    event_association_digest, formal_association_assertion_digest)
 from cba_kb.kc_snapshot import build_fact_guarantee, build_snapshot
 
 PROVIDER = "CBA_OFFICIAL"
@@ -216,6 +217,27 @@ def test_provenance_tampered_passage_digest_raises(fx, tmp_path):
 
 # ------------------------------------------------------- Claim path
 
+def _assert(claim):
+    # Corrective migration (Human-authorized, 2026-10-31, Q2
+    # B-01): positive tests now carry the second
+    # contract-allowed trusted basis — a separate formal
+    # association assertion bound to the claim's association.
+    assoc = claim["event_association"]
+    aid = "ASSERT-" + claim["claim_id"]
+    claim["formal_association_assertion"] = {
+        "assertion_id": aid,
+        "source_id": assoc["source_id"],
+        "revision": assoc["revision"],
+        "locator": assoc["locator"],
+        "event_ref": assoc["event_ref"],
+        "claim_id": claim["claim_id"],
+        "player_uid": claim["player_uid"],
+        "snapshot_id": assoc.get("snapshot_id"),
+        "assertion_digest": formal_association_assertion_digest(
+            claim, assoc, aid)}
+    return claim
+
+
 def _claims_with_assoc(snap, passage, texts, refs):
     claims = []
     for cid, text, ref in zip(("c1", "c2"), texts, refs):
@@ -229,7 +251,7 @@ def _claims_with_assoc(snap, passage, texts, refs):
                  "snapshot_id": snap.snapshot_id, "digest": ""}
         assoc["digest"] = event_association_digest(claim, assoc)
         claim["event_association"] = assoc
-        claims.append(claim)
+        claims.append(_assert(claim))
     return claims
 
 
@@ -319,7 +341,7 @@ def test_provenance_claim_anchored_distinct_refs_ok(fx):
                  "snapshot_id": snap.snapshot_id, "digest": ""}
         assoc["digest"] = event_association_digest(claim, assoc)
         claim["event_association"] = assoc
-        claims.append(claim)
+        claims.append(_assert(claim))
     out = _answer(session, fx, passage, chain, claims)
     layer = out["payload"]["claim_layer"]
     assert layer["status"] == "OK"
