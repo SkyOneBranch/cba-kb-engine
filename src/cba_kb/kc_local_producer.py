@@ -52,6 +52,29 @@ LOCAL ONLY, by construction:
   published registry), not proven in-band. Authenticating the
   published registry release is a Phase-2 readback item and
   remains NOT_VERIFIED here.
+- Identity authorization distinction (Q2 H03, Human-authorized
+  2026-10-31 event-identity repair): the identity authorization
+  baseline is a SEPARATE formal authorization object
+  (index_id / index_version / authorized player set /
+  index_digest, optionally approved aliases), validated whole
+  and read read-only — never derived from the players or
+  aliases being resolved. When no such object is supplied,
+  identity stays UNKNOWN (HOLD); the projection never writes
+  a trusted RESOLVED from a players-derived session. When one
+  is supplied, the session's authorized player set comes from
+  it, the identity evidence digest names its index identity,
+  and approved aliases outside its set never reach resolution
+  as approved bindings. Residual risk, stated plainly: the
+  authorization object itself is caller-supplied in this local
+  scope. The producer validates its structure and digest
+  binding, but it does NOT authenticate the index — a forged
+  index naming a subset of the real formal index would still
+  validate. The identity claim is therefore checkable
+  out-of-band (compare the reported index identity against the
+  published formal index), not proven in-band. Authenticating
+  the formal identity index is an E4a / Phase-2 item and
+  remains NOT_VERIFIED here; this module does not declare
+  E4a PASS.
 
 The snapshot is built from slice + passage entries only. Object
 visibility uses target-first filtering (target domain + APPROVED
@@ -113,6 +136,73 @@ def _formal_routes(formal_registry: Any) -> Any:
     return registry, routes, index
 
 
+def _validate_identity_authorization(auth: Any) -> Dict[str, Any]:
+    """Validate a formal identity authorization object and return
+    its normalized form. This object is a SEPARATE artifact from
+    the players/aliases being resolved — it is the authorization
+    baseline, never derived from the resolution input. It carries
+    an index identity (index_id, index_version), the authorized
+    player set, and an index_digest recomputed over the canonical
+    JSON of {index_id, index_version, authorized_players sorted,
+    approved_aliases normalized-or-None}. Any structural defect
+    or digest mismatch is a build failure, never a silent
+    downgrade. The producer validates structure and binding; it
+    does NOT authenticate the index itself — the reported index
+    identity is what an out-of-band check compares (the same
+    (a)/(b) distinction the Q2 accepted for formal_registry).
+    When present, approved_aliases is the approved alias set:
+    aliases outside it are filtered before resolution, never
+    trusted as approved bindings."""
+    if not isinstance(auth, dict):
+        raise KcLocalProducerError(
+            "LOCAL_PROJECTION_IDENTITY_AUTHORIZATION_MALFORMED")
+    index_id = auth.get("index_id")
+    index_version = auth.get("index_version")
+    players = auth.get("authorized_players")
+    if not (isinstance(index_id, str) and index_id
+            and isinstance(index_version, str) and index_version
+            and isinstance(players, list) and players
+            and all(isinstance(p, str) and p for p in players)
+            and len(set(players)) == len(players)):
+        raise KcLocalProducerError(
+            "LOCAL_PROJECTION_IDENTITY_AUTHORIZATION_MALFORMED")
+    approved = auth.get("approved_aliases")
+    normalized_approved = None
+    if approved is not None:
+        if not isinstance(approved, list):
+            raise KcLocalProducerError(
+                "LOCAL_PROJECTION_IDENTITY_AUTHORIZATION_MALFORMED")
+        pairs = []
+        for entry in approved:
+            if not isinstance(entry, dict) \
+                    or not (isinstance(entry.get("alias"), str)
+                            and entry.get("alias")) \
+                    or not (isinstance(entry.get("player_uid"), str)
+                            and entry.get("player_uid")):
+                raise KcLocalProducerError(
+                    "LOCAL_PROJECTION_IDENTITY_AUTHORIZATION_MALFORMED")
+            pairs.append({"alias": entry["alias"],
+                          "player_uid": entry["player_uid"]})
+        if len({(p["alias"], p["player_uid"]) for p in pairs}) \
+                != len(pairs):
+            raise KcLocalProducerError(
+                "LOCAL_PROJECTION_IDENTITY_AUTHORIZATION_MALFORMED")
+        normalized_approved = sorted(
+            pairs, key=lambda p: (p["alias"], p["player_uid"]))
+    digest = auth.get("index_digest")
+    expected = sha256_hex(canonical_json({
+        "index_id": index_id, "index_version": index_version,
+        "authorized_players": sorted(players),
+        "approved_aliases": normalized_approved}))
+    if not (isinstance(digest, str) and digest == expected):
+        raise KcLocalProducerError(
+            "LOCAL_PROJECTION_IDENTITY_AUTHORIZATION_INVALID")
+    return {"index_id": index_id, "index_version": index_version,
+            "authorized_players": sorted(players),
+            "approved_aliases": normalized_approved,
+            "index_digest": digest}
+
+
 def _snapshot_dict(snap: Any) -> Dict[str, Any]:
     receipt = snap.simulated_validator_receipt
     receipt_d = dict(receipt) if isinstance(receipt, dict) \
@@ -142,16 +232,21 @@ def _snapshot_dict(snap: Any) -> Dict[str, Any]:
 
 
 def _identity_digest(target_domain: str, players: List[Dict[str, Any]],
-                     aliases: List[Dict[str, Any]]) -> str:
+                     aliases: List[Dict[str, Any]], *,
+                     source_id: str, revision: str) -> str:
     """Identity-evidence digest for the local sample, computed by
     the SAME rule the consumer entry enforces
     (identity_evidence_digest): the claimed source triple AND the
     actual submitted players and aliases. A digest for one
     identity payload cannot be replayed onto different content.
-    It is NOT a Drive readback and proves nothing about a real
-    registry or about the completeness of a formal index."""
+    The source triple now names the formal identity index
+    (index_id / index_version from the authorization object),
+    never a self-declared fixture label. It is NOT a Drive
+    readback and proves nothing about a real registry or about
+    the completeness of a formal index beyond the supplied
+    authorization object."""
     return identity_evidence_digest(
-        source_id="fixture_canonical_registry", revision="rev-1",
+        source_id=source_id, revision=revision,
         target_domain=target_domain, players=players, aliases=aliases)
 
 
@@ -162,7 +257,8 @@ def build_local_projection(*, fixture: Dict[str, Any],
                            data_release: str = "SIMULATED_DATA_RELEASE_1",
                            engine_candidate: str = "SIMULATED_ENGINE_CANDIDATE_1",
                            build_code: str = "SIMULATED_BUILD_CODE_1",
-                           formal_registry: Any = None
+                           formal_registry: Any = None,
+                           identity_authorization: Any = None
                            ) -> Dict[str, Any]:
     """Build one local materialisation from a fixture dict and write
     it to output_dir. Returns a summary including the snapshot id,
@@ -180,7 +276,25 @@ def build_local_projection(*, fixture: Dict[str, Any],
         raise KcLocalProducerError("LOCAL_PROJECTION_INPUT_INCOMPLETE")
     first_player = players[0]["player_uid"]
     season = records[0]["season"]
-    authorized_players = {p["player_uid"] for p in players}
+    # Event-identity repair, identity half (Human-authorized,
+    # 2026-10-31, Q2 H03): the identity authorization baseline
+    # must come from a SEPARATE formal authorization object, never
+    # from the players being resolved. Deriving
+    # authorized_players from the resolution input let a caller
+    # prove completeness against its own submission: a formal
+    # index holding two UIDs for one name, with input carrying
+    # only one, used to pass coverage and emit a trusted
+    # RESOLVED. That derivation is removed. When no authorization
+    # object is supplied, identity stays UNKNOWN (HOLD) — the
+    # projection never writes a trusted RESOLVED from a
+    # players-derived session.
+    formal_identity = None
+    if identity_authorization is not None:
+        formal_identity = _validate_identity_authorization(
+            identity_authorization)
+    authorized_players = (set(formal_identity["authorized_players"])
+                          if formal_identity is not None
+                          else {p["player_uid"] for p in players})
     authorized_sources = {p["source_id"] for p in passages}
     authorized_objects = {o["object_id"] for o in source_objects
                           if o.get("target_domain") == target_domain
@@ -289,15 +403,35 @@ def build_local_projection(*, fixture: Dict[str, Any],
         records, player_uid=first_player,
         expected_keys=[(season, "REGULAR", "WHOLE_SEASON", None)],
         provider=PROVIDER, competition=COMPETITION)
-    if aliases:
+    if formal_identity is None:
+        # No separate authorization object: the identity baseline
+        # would be the resolution input itself, which proves
+        # nothing about formal completeness. HOLD, do not call
+        # the entry on a players-derived session.
+        identity = {"status": "UNKNOWN", "grain": "IDENTITY",
+                    "candidates": [], "relation": "UNDECIDED",
+                    "reason": "IDENTITY_FORMAL_INDEX_ABSENT"}
+    elif aliases:
+        use_aliases = aliases
+        if formal_identity["approved_aliases"] is not None:
+            # Approved-alias enforcement, target-first style:
+            # aliases outside the formal index's approved set
+            # never reach resolution as approved bindings.
+            approved_set = {(a["alias"], a["player_uid"])
+                            for a in formal_identity["approved_aliases"]}
+            use_aliases = [a for a in aliases
+                           if (a.get("alias"), a.get("player_uid"))
+                           in approved_set]
         identity = session.consume_identity(
-            players=players, aliases=aliases,
+            players=players, aliases=use_aliases,
             query=aliases[0]["alias"], query_kind="alias",
             identity_source={
-                "source_id": "fixture_canonical_registry",
-                "revision": "rev-1",
-                "digest": _identity_digest(target_domain, players,
-                                           aliases)},
+                "source_id": formal_identity["index_id"],
+                "revision": formal_identity["index_version"],
+                "digest": _identity_digest(
+                    target_domain, players, use_aliases,
+                    source_id=formal_identity["index_id"],
+                    revision=formal_identity["index_version"])},
             all_pages_received=True)
     else:
         identity = {"status": "UNKNOWN", "grain": "IDENTITY",
@@ -421,6 +555,12 @@ def build_local_projection(*, fixture: Dict[str, Any],
     identity_payload = identity.get("payload", identity)
     identity_status = identity_payload.get("status")
     identity_candidates = identity_payload.get("candidates", [])
+    formal_identity_info = None
+    if formal_identity is not None:
+        formal_identity_info = {
+            "index_id": formal_identity["index_id"],
+            "index_version": formal_identity["index_version"],
+            "index_digest": formal_identity["index_digest"]}
     files: Dict[str, str] = {
         "slices/%s.json" % first_player: slice_json,
         "slices/%s.md" % first_player: slice_md,
@@ -444,6 +584,9 @@ def build_local_projection(*, fixture: Dict[str, Any],
         "- target_domain: %s" % target_domain,
         "- build_time: %s" % build_time,
         "- identity: %s %s" % (identity_status, identity_candidates),
+        "- formal identity index (out-of-band check identity; "
+        "the producer does NOT authenticate the index itself): %s"
+        % (formal_identity_info or "none"),
         "- answer CANONICAL_FACT status: %s" % answer_fact_status,
         "- answer Fact guaranteed by its own guarantee: %s"
         % answer_fact_guaranteed,
@@ -489,7 +632,8 @@ def build_local_projection(*, fixture: Dict[str, Any],
         "local_only": True,
         "drive_publication": False,
         "identity": {"status": identity_status,
-                     "candidates": identity_candidates},
+                     "candidates": identity_candidates,
+                     "formal_authorization": formal_identity_info},
         "answer_fact": {"fact_id": answer_fact_id,
                         "status": answer_fact_status,
                         "guaranteed": answer_fact_guaranteed,
@@ -514,6 +658,7 @@ def build_local_projection(*, fixture: Dict[str, Any],
         "files": sorted(files) + ["manifest.json"],
         "identity": {"status": identity_status,
                      "candidates": identity_candidates},
+        "formal_identity_authorization": formal_identity_info,
         "guarantee_valid": guarantee_valid,
         "answer_fact_id": answer_fact_id,
         "answer_fact_status": answer_fact_status,

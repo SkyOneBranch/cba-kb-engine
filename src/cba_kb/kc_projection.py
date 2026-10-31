@@ -375,6 +375,32 @@ def resolve_claims(claims: List[Dict[str, Any]]) -> Dict[str, Any]:
 #   digest validity), so the resolver itself never re-validates
 #   passage digests; a standalone call without anchors proves
 #   binding only, never formal association identity.
+# - Event-identity repair (Human-authorized, 2026-10-31, Q2
+#   H01/H02): anchor membership alone is NOT event-identity
+#   proof — it says nothing about passage content. When the
+#   consumer path additionally supplies passage_texts — the
+#   digest-bound texts of its registered passages, keyed by the
+#   same triples — a trusted association additionally requires:
+#   (a) CONTENT SUPPORT: the anchor passage's text mentions the
+#   claimed event_ref (the passage content itself must state the
+#   event; a triple match over ordinary info is not support);
+#   (b) EVIDENCE RESOLUTION: every evidence entry must resolve
+#   to a registered passage ("source_id:locator" form, and that
+#   source must be authorized and a snapshot member when those
+#   contexts are supplied). Arbitrary evidence strings prove
+#   nothing. Under this rule, distinctness is proven by distinct
+#   CONTENT-BACKED associations (each claim's own anchor text
+#   states its own event_ref, refs differ, evidence disjoint) —
+#   never by string inequality alone; and a same-ref CONFLICT
+#   requires both associations content-backed to the SHARED ref.
+#   Residual, stated plainly: mention is a content-support
+#   signal, not semantic event understanding, and passage
+#   authenticity itself remains a Phase-2 / real-source matter
+#   (the same (a)/(b) distinction the Q2 accepted for
+#   formal_registry). Same-key-different-events positive
+#   identification (contract §3.1(3) bullet 1) has no in-repo
+#   mechanism — no canonical event reference registry exists —
+#   and is NOT faked here; it is carried as a remaining gap.
 # - Trusted claims sharing (player_uid, event_ref) form one event
 #   group; differing normalized business values (date, text) inside
 #   one group are CONFLICT, with every participating claim listed.
@@ -422,7 +448,8 @@ def _event_association_valid(claim: Dict[str, Any], *,
                              authorized_sources=None,
                              snapshot_sources=None,
                              snapshot_id=None,
-                             passage_anchors=None) -> bool:
+                             passage_anchors=None,
+                             passage_texts=None) -> bool:
     assoc = claim.get("event_association")
     if not isinstance(assoc, dict):
         return False
@@ -466,6 +493,34 @@ def _event_association_valid(claim: Dict[str, Any], *,
         # registered passage: the digest binds content the caller
         # invented, not a formal association. Untrusted.
         return False
+    if passage_texts is not None:
+        # Event-identity repair (2026-10-31, Q2 H01/H02): anchor
+        # membership says nothing about content. The anchor
+        # passage's own text must mention the claimed event_ref,
+        # and every evidence entry must resolve to a registered
+        # passage ("source_id:locator" form; that source must be
+        # authorized and a snapshot member when those contexts are
+        # supplied). An association whose evidence is arbitrary
+        # strings, or whose passage never states the event, is
+        # untrusted even when its digest recomputes.
+        anchor_text = passage_texts.get((source_id, revision, locator))
+        if not isinstance(anchor_text, str) or ref not in anchor_text:
+            return False
+        registered_locators = {(s, l) for (s, _r, l) in passage_texts}
+        for entry in evidence:
+            if not isinstance(entry, str) or ":" not in entry:
+                return False
+            ev_source, ev_locator = entry.split(":", 1)
+            if not ev_source or not ev_locator:
+                return False
+            if (ev_source, ev_locator) not in registered_locators:
+                return False
+            if authorized_sources is not None and \
+                    ev_source not in authorized_sources:
+                return False
+            if snapshot_sources is not None and \
+                    ev_source not in snapshot_sources:
+                return False
     try:
         expected = event_association_digest(claim, assoc)
     except (TypeError, ValueError):
@@ -483,11 +538,13 @@ def resolve_claims_by_event(claims: List[Dict[str, Any]], *,
                             authorized_sources=None,
                             snapshot_sources=None,
                             snapshot_id=None,
-                            passage_anchors=None) -> Dict[str, Any]:
+                            passage_anchors=None,
+                            passage_texts=None) -> Dict[str, Any]:
     def _valid(claim: Dict[str, Any]) -> bool:
         return _event_association_valid(
             claim, authorized_sources=authorized_sources,
             snapshot_sources=snapshot_sources,
+            passage_texts=passage_texts,
             snapshot_id=snapshot_id,
             passage_anchors=passage_anchors)
 

@@ -79,7 +79,12 @@ def _snapshot_kwargs(**over):
     return kw
 
 
-def _bound_session(fx):
+def _bound_session(fx, event_suffix=""):
+    # event_suffix (event-identity repair, 2026-10-31): when
+    # given, both passages' texts state the claimed event, so
+    # the E4b entry test's associations are content-backed.
+    # Other tests keep the original texts byte-identical, so
+    # their verbatim/citation assertions are untouched.
     """Session bound to a snapshot that actually contains the cited
     Document source and the justifying slice digest (same corrected
     fixture pattern as the PR-B consume tests). Post-freeze Q2
@@ -95,12 +100,14 @@ def _bound_session(fx):
                                            "fixture_doc_D2"})
     passage = build_routed_passage(
         source_id="fixture_doc_D1", revision="rev-1", locator="P3",
-        text=fx["passages"][0]["text"], player_uid=A, aliases=["测试甲"],
+        text=fx["passages"][0]["text"] + event_suffix,
+        player_uid=A, aliases=["测试甲"],
         title="fixture_doc_D1",
         authorized_url="fixture://authorized-copy/fixture_doc_D1")
     passage_d2 = build_routed_passage(
         source_id="fixture_doc_D2", revision="rev-1", locator="P7",
-        text="第二来源文本。", player_uid=A, aliases=["测试甲"],
+        text="第二来源文本。" + event_suffix,
+        player_uid=A, aliases=["测试甲"],
         title="fixture_doc_D2",
         authorized_url="fixture://authorized-copy/fixture_doc_D2")
     probe = _session()
@@ -456,7 +463,8 @@ def test_answer_event_conflict_via_entry(fx):
     # (different dates, different groups) — the miss itself.
     # Q2-227-02: the consumer path binds associations to the
     # bound snapshot, so the fixture carries that snapshot id.
-    session, _snap, passage, chain = _bound_session(fx)
+    session, _snap, passage, chain = _bound_session(
+        fx, event_suffix=" 事件 fixture_event_E4b。")
     out = _answer(session, fx, passage, chain,
                   _e4b_claims(snapshot_id=_snap.snapshot_id))
     layer = out["payload"]["claim_layer"]

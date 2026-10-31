@@ -909,14 +909,26 @@ class ConsumeSession:
         # never registered is untrusted even when its digest
         # recomputes: a recomputed digest proves content binding,
         # not formal association identity.
+        # Event-identity repair (Human-authorized, 2026-10-31,
+        # Q2 H01/H02): the resolver additionally receives the
+        # digest-bound texts of those same passages. Anchor
+        # membership alone says nothing about content; a trusted
+        # association now also requires the anchor passage's text
+        # to mention the claimed event_ref, and every evidence
+        # entry to resolve to a registered passage.
         passage_anchors = {
             (p.get("source_id"), p.get("revision"), p.get("locator"))
+            for p in self._passages.values()}
+        passage_texts = {
+            (p.get("source_id"), p.get("revision"), p.get("locator")):
+                p.get("text")
             for p in self._passages.values()}
         resolved = resolve_claims_by_event(
             claims, authorized_sources=self.authorized_sources,
             snapshot_sources=set(manifest.keys()),
             snapshot_id=self._bound_snapshot_id,
-            passage_anchors=passage_anchors)
+            passage_anchors=passage_anchors,
+            passage_texts=passage_texts)
         refusals = []
         _PROVENANCE_EXCLUDED = frozenset({
             "source", "source_id", "digest", "locator", "revision",

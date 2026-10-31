@@ -88,7 +88,11 @@ def _bound_session(fx, passages, register=True):
     """Session bound to a snapshot carrying the passages' entries.
     When register=False the passages are snapshot members but NOT
     registered — the exact shape of an unanchored association."""
-    session = _session()
+    # Event-identity repair (2026-10-31): authorize every
+    # passage source, so multi-source claim tests can resolve
+    # each claim's evidence against a registered passage.
+    session = _session(authorized_sources={p["source_id"]
+                                           for p in passages})
     probe = _session()
     probed = probe.consume_slice(
         fx["stats_records"], player_uid=A, season=SEASON,
@@ -251,8 +255,10 @@ def test_provenance_claim_unanchored_unknown(fx):
     # formal association. Differing values must be UNKNOWN,
     # never a CONFLICT built on an unanchored assertion.
     # Old code: CONFLICT.
+    # The passage text DOES state the event, so the missing
+    # registration is the only reason this is UNKNOWN.
     passage = _passage("fixture_doc_D1", "rev-1", "P3",
-                       fx["passages"][0]["text"])
+                       fx["passages"][0]["text"] + " 事件 event_Q。")
     session, snap, chain = _bound_session(fx, [passage],
                                           register=False)
     claims = _claims_with_assoc(
@@ -268,8 +274,11 @@ def test_provenance_claim_anchored_conflict(fx):
     # PIN: the same shape with the source passage registered
     # (digest-validated) keeps its precise CONFLICT — the
     # repair removes the bypass, not the capability.
+    # Event-identity repair (2026-10-31): the passage text
+    # now states the claimed event, so the association is
+    # content-backed, not merely triple-anchored.
     passage = _passage("fixture_doc_D1", "rev-1", "P3",
-                       fx["passages"][0]["text"])
+                       fx["passages"][0]["text"] + " 事件 event_Q。")
     session, snap, chain = _bound_session(fx, [passage],
                                           register=True)
     claims = _claims_with_assoc(
@@ -282,20 +291,35 @@ def test_provenance_claim_anchored_conflict(fx):
 
 
 def test_provenance_claim_anchored_distinct_refs_ok(fx):
-    # PIN: anchored associations under pairwise-distinct refs
-    # with disjoint evidence still prove no conflict.
+    # PIN, rewritten for the event-identity repair
+    # (2026-10-31, Q2 H02): distinctness is proven by distinct
+    # CONTENT-BACKED associations, never by string inequality
+    # alone. Each claim anchors to its own registered passage
+    # whose text states its own event_ref, with disjoint
+    # resolving evidence — so OK is a proven no-conflict, not
+    # a "no shared strings" inference.
     passage = _passage("fixture_doc_D1", "rev-1", "P3",
-                       fx["passages"][0]["text"])
-    session, snap, chain = _bound_session(fx, [passage],
+                       fx["passages"][0]["text"] + " 事件 event_1。")
+    passage2 = _passage("fixture_doc_D2", "rev-1", "P9",
+                        "第二来源文本。事件 event_2。")
+    session, snap, chain = _bound_session(fx, [passage, passage2],
                                           register=True)
-    claims = _claims_with_assoc(
-        snap, passage, ("事件发生在 2026-03-10", "事件发生在 2026-03-15"),
-        ("event_1", "event_2"))
-    claims[1]["event_association"]["evidence"] = \
-        ["fixture_doc_D1:P9"]
-    for claim in claims:
-        claim["event_association"]["digest"] = \
-            event_association_digest(claim, claim["event_association"])
+    claims = []
+    for cid, text, ref, src, loc, ev in (
+            ("c1", "事件发生在 2026-03-10", "event_1",
+             "fixture_doc_D1", "P3", ["fixture_doc_D1:P3"]),
+            ("c2", "事件发生在 2026-03-15", "event_2",
+             "fixture_doc_D2", "P9", ["fixture_doc_D2:P9"])):
+        claim = {"claim_id": cid, "player_uid": A,
+                 "date": "2026-03-10", "text": text,
+                 "source_id": src}
+        assoc = {"event_ref": ref, "evidence": ev,
+                 "source_id": src, "revision": "rev-1",
+                 "locator": loc, "player_uid": A,
+                 "snapshot_id": snap.snapshot_id, "digest": ""}
+        assoc["digest"] = event_association_digest(claim, assoc)
+        claim["event_association"] = assoc
+        claims.append(claim)
     out = _answer(session, fx, passage, chain, claims)
     layer = out["payload"]["claim_layer"]
     assert layer["status"] == "OK"
