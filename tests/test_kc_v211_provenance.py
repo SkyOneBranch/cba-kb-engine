@@ -238,6 +238,39 @@ def _assert(claim):
     return claim
 
 
+def _anchor(claims):
+    # Trust-anchor migration (Human-authorized, 2026-10-31, Q2
+    # BLOCK-01): the oracle-preset anchor whose registry holds
+    # the expected digests of the claims' assertions.
+    registry = {}
+    for c in claims:
+        a = c.get("formal_association_assertion")
+        if isinstance(a, dict):
+            registry[a["assertion_id"]] = a["assertion_digest"]
+    return {"anchor_id": "LOCAL_TEST_ORACLE", "target_domain": TARGET,
+            "canonical_digest": None, "assertion_registry": registry}
+
+
+def _reanchor(passages, snap, claims):
+    # Trust-anchor migration (2026-10-31, Q2 BLOCK-01): rebuild
+    # the session with the oracle-preset anchor BEFORE the
+    # answer call under test. The chain is rebuilt
+    # deterministically from the same snapshot.
+    session = _session(
+        authorized_sources={p["source_id"] for p in passages},
+        trust_anchor=_anchor(claims))
+    session.bind_current(snap)
+    session.register_passages(passages)
+    binding = session.current_binding()
+    chain = evidence_chain(
+        receipt_id=binding["receipt_binding"],
+        snapshot_id=snap.snapshot_id,
+        build_version=snap.build_code,
+        source_digest=passages[0]["digest"],
+        authorization_basis=binding["authorization_basis"])
+    return session, chain
+
+
 def _claims_with_assoc(snap, passage, texts, refs):
     claims = []
     for cid, text, ref in zip(("c1", "c2"), texts, refs):
@@ -306,6 +339,7 @@ def test_provenance_claim_anchored_conflict(fx):
     claims = _claims_with_assoc(
         snap, passage, ("事件发生在 2026-03-10", "事件发生在 2026-03-15"),
         ("event_Q", "event_Q"))
+    session, chain = _reanchor([passage], snap, claims)
     out = _answer(session, fx, passage, chain, claims)
     layer = out["payload"]["claim_layer"]
     assert layer["status"] == "CONFLICT"
@@ -342,6 +376,7 @@ def test_provenance_claim_anchored_distinct_refs_ok(fx):
         assoc["digest"] = event_association_digest(claim, assoc)
         claim["event_association"] = assoc
         claims.append(_assert(claim))
+    session, chain = _reanchor([passage, passage2], snap, claims)
     out = _answer(session, fx, passage, chain, claims)
     layer = out["payload"]["claim_layer"]
     assert layer["status"] == "OK"

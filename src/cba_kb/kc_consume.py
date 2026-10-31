@@ -110,6 +110,7 @@ from .kc_current import KcCurrentError, SimulatedCurrentStore
 from .kc_passages import verify_passage_text
 from .kc_projection import (
     KcError,
+    _trust_anchor_valid,
     canonical_json,
     resolve_claims_by_event,
     resolve_identity,
@@ -226,7 +227,8 @@ class ConsumeSession:
                  authorization_basis: str = DEFAULT_AUTHORIZATION_BASIS,
                  canonical_event_refs: Any = None,
                  canonical_approval: Any = None,
-                 identity_authorization: Any = None):
+                 identity_authorization: Any = None,
+                 trust_anchor: Any = None):
         self.target_domain = target_domain
         self.authorized_players = set(authorized_players)
         self.authorized_sources = set(authorized_sources)
@@ -245,6 +247,24 @@ class ConsumeSession:
         self._identity_authorization = \
             copy.deepcopy(identity_authorization) \
             if identity_authorization is not None else None
+        # Trust anchor repair (Human-authorized, 2026-10-31, Q2
+        # BLOCK-01/BLOCK-02): the session-bound anchor preset by
+        # the trusted channel (session construction / test
+        # oracle). It is deep-copied here and never overwritten
+        # by any call input: canonical refs and formal
+        # assertions are trusted only when they match this
+        # anchor. An anchor bound to a different target domain
+        # is invalid (fail-closed, recorded internally, never
+        # raised: unrelated session uses must not crash).
+        self._trust_anchor = None
+        self._trust_anchor_invalid = False
+        if trust_anchor is not None:
+            candidate = copy.deepcopy(trust_anchor)
+            if _trust_anchor_valid(candidate) \
+                    and candidate.get("target_domain") == target_domain:
+                self._trust_anchor = candidate
+            else:
+                self._trust_anchor_invalid = True
         self.session_id = uuid.uuid4().hex
         self._store: SimulatedCurrentStore = SimulatedCurrentStore(
             target_domain=target_domain)
@@ -507,15 +527,16 @@ class ConsumeSession:
         if digest != expected_digest:
             return unknown("IDENTITY_EVIDENCE_DIGEST_MISMATCH")
         # Corrective repair (Human-authorized, 2026-10-31, Q2
-        # B-02): completeness is proven against a SEPARATE
-        # formal identity authorization object, never against
-        # the caller's own session set, page flag, or a digest
-        # recomputed over the caller's own submission. Without
-        # that object, no trusted RESOLVED or complete
-        # candidate set may be emitted: the entry stays UNKNOWN
-        # (HOLD). The object is validated by the shared rule
-        # the producer enforces; its publisher authenticity
-        # remains out-of-band, exactly as on the producer path.
+        # B-02), strengthened by the trust-anchor ruling
+        # (2026-10-31, Q2 BLOCK-02): completeness is proven
+        # against a SEPARATE formal identity authorization
+        # object (I, preset by the trusted channel), never
+        # against the caller's own session set, page flag, or
+        # a digest recomputed over the caller's own
+        # submission. Without that object, no trusted RESOLVED
+        # or complete candidate set may be emitted: the entry
+        # stays UNKNOWN (HOLD). The visible set V is validated
+        # against I below, and disclosure is filtered to V.
         # The earlier checks above still run first, so their
         # specific UNKNOWN reasons are preserved.
         auth = self._identity_authorization
@@ -525,21 +546,41 @@ class ConsumeSession:
             formal = validate_identity_authorization(auth)
         except ValueError:
             return unknown("IDENTITY_AUTHORIZATION_INVALID")
+        # Trust-anchor repair (Human-authorized, 2026-10-31, Q2
+        # BLOCK-02): I/V separation. I is the trusted
+        # published index (this formal object, preset by the
+        # trusted channel); V is this session's independently
+        # authorized visible set (authorized_players, also
+        # preset). Two rules, both fail-closed:
+        # (a) V must be validated against I: a visible set
+        # reaching outside the trusted index is a session
+        # misconfiguration, never a wider disclosure license.
+        # The failure is uniform UNKNOWN; the specific cause
+        # stays in the internal diagnostic only.
+        # (b) Coverage is judged WITHIN V (the earlier
+        # V ⊆ supplied check): the submitted page must cover
+        # the visible range, not the whole index. The old
+        # separate I ⊆ supplied check is removed: it forced
+        # narrow sessions to submit the full index to prove
+        # anything, and it is subsumed by (a) + V-coverage
+        # whenever V == I.
         auth_players = set(formal["authorized_players"])
-        if not auth_players <= supplied_uids:
-            return unknown("IDENTITY_COVERAGE_INCOMPLETE")
-        # Target-first, against the authorization baseline (not
-        # the caller session set): entries outside the formal
-        # index never reach resolution, so a session scoped
-        # narrower than the index cannot hide a same-name second
-        # UID behind a trusted RESOLVED. Approved aliases are
-        # enforced the same way the producer enforces them.
+        visible = set(self.authorized_players)
+        if not visible <= auth_players:
+            return unknown("IDENTITY_AUTHORIZATION_SCOPE_MISMATCH")
+        # Target-first, filtered to the VISIBLE set only:
+        # entries outside V never reach resolution or
+        # disclosure, so an index wider than the session can
+        # neither leak an out-of-session UID nor inflate a
+        # candidate count, status, or clarification. Approved
+        # aliases are enforced the same way the producer
+        # enforces them.
         filtered_players = [p for p in players
                             if isinstance(p, dict)
-                            and p.get("player_uid") in auth_players]
+                            and p.get("player_uid") in visible]
         filtered_aliases = [a for a in aliases
                             if isinstance(a, dict)
-                            and a.get("player_uid") in auth_players]
+                            and a.get("player_uid") in visible]
         if formal["approved_aliases"] is not None:
             approved_set = {(a["alias"], a["player_uid"])
                             for a in formal["approved_aliases"]}
@@ -552,6 +593,17 @@ class ConsumeSession:
             return dict(resolved)
         payload = dict(resolved)
         payload["authorization_scope"] = "AUTHORIZED_PLAYERS_ONLY"
+        # Trust-anchor repair: when the visible set is strictly
+        # narrower than the trusted index, the result is
+        # explicitly scoped — it resolves within the session's
+        # visible range only and must not be read as global
+        # uniqueness. The marker travels with the payload; a
+        # consumer that ignores it misreads the result, the
+        # code does not overclaim it.
+        if visible < auth_players:
+            payload["resolution_scope"] = "SESSION_VISIBLE_SCOPE"
+        else:
+            payload["resolution_scope"] = "AUTHORIZED_INDEX_SCOPE"
         payload["evidence_binding"] = {
             "source_id": source_id, "revision": revision,
             "digest": digest, "kind": "KC_IDENTITY_EVIDENCE",
@@ -978,7 +1030,11 @@ class ConsumeSession:
             passage_anchors=passage_anchors,
             passage_texts=passage_texts,
             canonical_refs=self._canonical_event_refs,
-            canonical_approval=self._canonical_approval)
+            canonical_approval=self._canonical_approval,
+            # Trust-anchor repair: only the SESSION's own anchor
+            # is passed, never any per-call material. A claim
+            # carrying its own "anchor" gains nothing here.
+            trust_anchor=self._trust_anchor)
         refusals = []
         _PROVENANCE_EXCLUDED = frozenset({
             "source", "source_id", "digest", "locator", "revision",

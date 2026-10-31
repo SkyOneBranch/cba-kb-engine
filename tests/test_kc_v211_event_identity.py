@@ -134,6 +134,37 @@ def _assert(claim):
     return claim
 
 
+def _anchor(claims):
+    # Trust-anchor migration (Human-authorized, 2026-10-31, Q2
+    # BLOCK-01): the oracle-preset anchor whose registry holds
+    # the expected digests of the claims' assertions.
+    registry = {}
+    for c in claims:
+        a = c.get("formal_association_assertion")
+        if isinstance(a, dict):
+            registry[a["assertion_id"]] = a["assertion_digest"]
+    return {"anchor_id": "LOCAL_TEST_ORACLE", "target_domain": TARGET,
+            "canonical_digest": None, "assertion_registry": registry}
+
+
+def _reanchor(passages, snap, claims):
+    # Trust-anchor migration (2026-10-31, Q2 BLOCK-01): rebuild
+    # the session with the oracle-preset anchor BEFORE the
+    # answer call under test. The chain is rebuilt
+    # deterministically from the same snapshot.
+    session = _session(trust_anchor=_anchor(claims))
+    session.bind_current(snap)
+    session.register_passages(passages)
+    binding = session.current_binding()
+    chain = evidence_chain(
+        receipt_id=binding["receipt_binding"],
+        snapshot_id=snap.snapshot_id,
+        build_version=snap.build_code,
+        source_digest=passages[0]["digest"],
+        authorization_basis=binding["authorization_basis"])
+    return session, chain
+
+
 def _answer(session, fx, passage, chain, claims):
     fact = {"fact_id": "ev_fact", "fact_version": "v1",
             "player_uid": A, "season": SEASON,
@@ -192,6 +223,7 @@ def test_event_identity_content_backed_same_ref_conflict(fx):
         _assert(_claim(snap, "c2", "事件发生在 2026-03-15", "event_Q",
                        "fixture_doc_D1", "P3",
                        ["fixture_doc_D1:P3"]))]
+    session, chain = _reanchor([passage], snap, claims)
     layer = _layer(_answer(session, fx, passage, chain, claims))
     assert layer["status"] == "CONFLICT"
     assert layer["conflicting_claim_ids"] == ["c1", "c2"]
@@ -239,6 +271,7 @@ def test_event_identity_content_backed_distinct_refs_ok(fx):
         _assert(_claim(snap, "c2", "事件发生在 2026-03-15", "game_02",
                        "fixture_doc_D2", "P9",
                        ["fixture_doc_D2:P9"]))]
+    session, chain = _reanchor([passage, passage2], snap, claims)
     layer = _layer(_answer(session, fx, passage, chain, claims))
     assert layer["status"] == "OK"
     assert layer["conflicting_claim_ids"] == []

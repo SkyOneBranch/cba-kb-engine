@@ -76,10 +76,24 @@ def _approval(refs, tiers, release_id="REL-1", version="v1"):
             "canonical_digest": canon, "approval_digest": appr}
 
 
-def _resolve(claims, texts, refs=None, approval=None):
+def _canon_anchor(refs, approval):
+    # Trust-anchor migration (Human-authorized, 2026-10-31, Q2
+    # BLOCK-01): the oracle-preset anchor the canonical bundle
+    # must match. Call-supplied refs + approval alone no longer
+    # suffice; the anchor's digest, release, and source are the
+    # independently preset expected values.
+    return {"anchor_id": "LOCAL_TEST_ORACLE", "target_domain": TARGET,
+            "canonical_digest": sha256_hex(canonical_json(refs)),
+            "assertion_registry": {},
+            "release_id": approval.get("release_id"),
+            "source_sha256": approval.get("source_sha256")}
+
+
+def _resolve(claims, texts, refs=None, approval=None, anchor=None):
     return resolve_claims_by_event(
         claims, passage_texts=texts,
-        canonical_refs=refs, canonical_approval=approval)
+        canonical_refs=refs, canonical_approval=approval,
+        trust_anchor=anchor)
 
 
 # ------------------------------------------------------- Claim: canonical gate
@@ -90,8 +104,9 @@ def test_canonical_approved_same_ref_conflict():
     refs = {"EV1": {"tier": TIER_A, "confirmed": True}}
     claims = [_claim("c1", "甲", "EV1", "P1"),
               _claim("c2", "乙", "EV1", "P1")]
+    approval = _approval(refs, [TIER_A])
     out = _resolve(claims, _texts(("P1", "EV1")),
-                   refs, _approval(refs, [TIER_A]))
+                   refs, approval, _canon_anchor(refs, approval))
     assert out["status"] == "CONFLICT"
     assert out["conflicting_claim_ids"] == ["c1", "c2"]
 
@@ -104,8 +119,9 @@ def test_canonical_approved_distinct_refs_ok():
             "EV2": {"tier": TIER_A, "confirmed": True}}
     claims = [_claim("c1", "甲", "EV1", "P1"),
               _claim("c2", "乙", "EV2", "P2")]
+    approval = _approval(refs, [TIER_A])
     out = _resolve(claims, _texts(("P1", "EV1"), ("P2", "EV2")),
-                   refs, _approval(refs, [TIER_A]))
+                   refs, approval, _canon_anchor(refs, approval))
     assert out["status"] == "OK"
 
 
@@ -259,8 +275,13 @@ def _consumer_session(**over):
 
 
 def _consumer_case(fx, refs, approval):
+    # Trust-anchor migration (2026-10-31, Q2 BLOCK-01): the
+    # consumer session carries the oracle-preset anchor its
+    # canonical bundle must match; refs + approval alone are
+    # call-supplied materials, not a trust root.
     session = _consumer_session(
-        canonical_event_refs=refs, canonical_approval=approval)
+        canonical_event_refs=refs, canonical_approval=approval,
+        trust_anchor=_canon_anchor(refs, approval))
     probe = _consumer_session()
     probed = probe.consume_slice(
         fx["stats_records"], player_uid=A, season=SEASON,

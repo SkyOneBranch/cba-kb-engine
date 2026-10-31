@@ -91,6 +91,29 @@ def _texts(*pairs):
     return {("SRC", "r1", loc): text for loc, text in pairs}
 
 
+def _anchor(claims):
+    # Trust-anchor migration (Human-authorized, 2026-10-31, Q2
+    # BLOCK-01): the oracle-preset anchor whose registry holds
+    # the expected digests of the claims' assertions. The
+    # registry is fixed before the call under test; call inputs
+    # cannot add entries to it.
+    registry = {}
+    for c in claims:
+        a = c.get("formal_association_assertion")
+        if isinstance(a, dict):
+            registry[a["assertion_id"]] = a["assertion_digest"]
+    return {"anchor_id": "LOCAL_TEST_ORACLE", "target_domain": TARGET,
+            "canonical_digest": None, "assertion_registry": registry}
+
+
+def _canon_anchor(refs, approval):
+    return {"anchor_id": "LOCAL_TEST_ORACLE", "target_domain": TARGET,
+            "canonical_digest": sha256_hex(canonical_json(refs)),
+            "assertion_registry": {},
+            "release_id": approval.get("release_id"),
+            "source_sha256": approval.get("source_sha256")}
+
+
 def _approval(refs, tiers, release_id="REL-1", version="v1"):
     canon = sha256_hex(canonical_json(refs))
     appr = sha256_hex(canonical_json({
@@ -121,7 +144,8 @@ def test_corrective_assertion_backed_differing_conflict():
     claims = [_assert(_claim("c1", "甲", ref="EV1")),
               _assert(_claim("c2", "乙", ref="EV1"))]
     out = resolve_claims_by_event(
-        claims, passage_texts=_texts(("P1", "事件 EV1 发生。")))
+        claims, passage_texts=_texts(("P1", "事件 EV1 发生。")),
+        trust_anchor=_anchor(claims))
     assert out["status"] == "CONFLICT"
     assert out["conflicting_claim_ids"] == ["c1", "c2"]
 
@@ -296,7 +320,15 @@ def test_corrective_identity_two_uid_subset_unknown(fx):
 def test_corrective_identity_authorized_subset_unknown(fx):
     # An authorization object covering {A, B} is NOT satisfied
     # by submitting only A, even with a valid digest.
-    session = _session(identity_authorization=_auth([A, B]))
+    # Trust-anchor migration (2026-10-31, Q2 BLOCK-02, I/V
+    # separation): coverage is judged within the session's
+    # visible range V, so this test now scopes the session to
+    # the full range {A, B}; submitting only A then fails
+    # V-coverage, as before. A narrow session (V={A}) resolving
+    # A alone is the separate scoped case, covered by the
+    # session-scope test below.
+    session = _session(authorized_players={A, B},
+                       identity_authorization=_auth([A, B]))
     players = [p for p in fx["players"] if p["player_uid"] == A]
     out = session.consume_identity(
         players=players, aliases=fx["aliases"],
@@ -322,22 +354,10 @@ def test_corrective_identity_authorized_resolves(fx):
 
 
 def test_corrective_identity_authorized_clarification(fx):
-    session = _session(identity_authorization=_auth([A, B]))
-    out = session.consume_identity(
-        players=fx["players"], aliases=fx["aliases"],
-        query="林测试", query_kind="name",
-        identity_source=_identity_source(fx["players"],
-                                         fx["aliases"]),
-        all_pages_received=True)
-    assert out["payload"]["status"] == "CLARIFICATION_REQUIRED"
-    assert out["payload"]["candidates"] == sorted([A, B])
-
-
-def test_corrective_identity_auth_scope_beats_session(fx):
-    # A session scoped to {A} must NOT hide B when the
-    # authorization object covers {A, B}: filtering follows
-    # the authorization baseline, so the shared name clarifies.
-    session = _session(authorized_players={A},
+    # Trust-anchor migration (2026-10-31, Q2 BLOCK-02, I/V
+    # separation): both same-name UIDs are visible in this
+    # full-scope session, so clarification lists both.
+    session = _session(authorized_players={A, B},
                        identity_authorization=_auth([A, B]))
     out = session.consume_identity(
         players=fx["players"], aliases=fx["aliases"],
@@ -347,6 +367,29 @@ def test_corrective_identity_auth_scope_beats_session(fx):
         all_pages_received=True)
     assert out["payload"]["status"] == "CLARIFICATION_REQUIRED"
     assert out["payload"]["candidates"] == sorted([A, B])
+
+
+def test_corrective_identity_session_scope_not_leaked(fx):
+    # REWRITTEN premise (Human trust-anchor ruling, 2026-10-31,
+    # Q2 BLOCK-02, I/V separation): the previous version of
+    # this test pinned wide-index filtering, which the ruling
+    # reverses — disclosure must follow the session's visible
+    # set V, never the wider index I. A session visible only
+    # to {A} resolves the shared name within its scope only:
+    # candidates [A], explicitly session-scoped, with no trace
+    # of the out-of-scope UID anywhere in the result.
+    session = _session(authorized_players={A},
+                       identity_authorization=_auth([A, B]))
+    out = session.consume_identity(
+        players=fx["players"], aliases=fx["aliases"],
+        query="林测试", query_kind="name",
+        identity_source=_identity_source(fx["players"],
+                                         fx["aliases"]),
+        all_pages_received=True)
+    assert out["payload"]["status"] == "RESOLVED"
+    assert out["payload"]["candidates"] == [A]
+    assert out["payload"]["resolution_scope"] == "SESSION_VISIBLE_SCOPE"
+    assert B not in str(out)
 
 
 def test_corrective_identity_forged_authorization_unknown(fx):
@@ -406,7 +449,8 @@ def test_corrective_identical_assertion_backed_ok():
     claims = [_assert(_claim("c1", "同值", key="MATCH-7", ref="EV1")),
               _assert(_claim("c2", "同值", key="MATCH-7", ref="EV1"))]
     out = resolve_claims_by_event(
-        claims, passage_texts=_texts(("P1", "事件 EV1 发生。")))
+        claims, passage_texts=_texts(("P1", "事件 EV1 发生。")),
+        trust_anchor=_anchor(claims))
     assert out["status"] == "OK"
 
 
@@ -437,7 +481,8 @@ def test_corrective_ref_token_match():
         claims = [_assert(_claim("c1", "甲", ref="EV-001")),
                   _assert(_claim("c2", "乙", ref="EV-001"))]
         out = resolve_claims_by_event(
-            claims, passage_texts=_texts(("P1", text)))
+            claims, passage_texts=_texts(("P1", text)),
+            trust_anchor=_anchor(claims))
         assert out["status"] == "CONFLICT", text
 
 
@@ -496,7 +541,8 @@ def test_corrective_same_key_distinct_trusted_refs_ok():
     out = resolve_claims_by_event(
         claims, passage_texts=_texts(("P1", "事件 EV1 发生。"),
                                      ("P2", "事件 EV2 发生。")),
-        canonical_refs=refs, canonical_approval=approval)
+        canonical_refs=refs, canonical_approval=approval,
+        trust_anchor=_canon_anchor(refs, approval))
     assert out["status"] == "OK"
     assert out["conflicting_claim_ids"] == []
 
@@ -510,7 +556,8 @@ def test_corrective_same_key_same_ref_conflict():
               _claim("c2", "乙", ref="EV1", key="MATCH-7")]
     out = resolve_claims_by_event(
         claims, passage_texts=_texts(("P1", "事件 EV1 发生。")),
-        canonical_refs=refs, canonical_approval=approval)
+        canonical_refs=refs, canonical_approval=approval,
+        trust_anchor=_canon_anchor(refs, approval))
     assert out["status"] == "CONFLICT"
     assert out["conflicting_claim_ids"] == ["c1", "c2"]
 

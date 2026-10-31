@@ -217,6 +217,41 @@ def _assert(claim):
     return claim
 
 
+def _anchor(claims):
+    # Trust-anchor migration (Human-authorized, 2026-10-31, Q2
+    # BLOCK-01): the oracle-preset anchor whose registry holds
+    # the expected digests of the claims' assertions.
+    registry = {}
+    for c in claims:
+        a = c.get("formal_association_assertion")
+        if isinstance(a, dict):
+            registry[a["assertion_id"]] = a["assertion_digest"]
+    return {"anchor_id": "LOCAL_TEST_ORACLE", "target_domain": TARGET,
+            "canonical_digest": None, "assertion_registry": registry}
+
+
+def _reanchor(passage, passage_d2, snap, claims):
+    # Trust-anchor migration (2026-10-31, Q2 BLOCK-01): rebuild
+    # the session with the oracle-preset anchor BEFORE the
+    # answer call under test. The anchor is fixed at
+    # construction; call inputs cannot add registry entries.
+    # The chain is rebuilt deterministically from the same
+    # snapshot, so the receipt binding is unchanged.
+    session = _session(authorized_sources={"fixture_doc_D1",
+                                           "fixture_doc_D2"},
+                       trust_anchor=_anchor(claims))
+    session.bind_current(snap)
+    session.register_passages([passage, passage_d2])
+    binding = session.current_binding()
+    chain = evidence_chain(
+        receipt_id=binding["receipt_binding"],
+        snapshot_id=snap.snapshot_id,
+        build_version=snap.build_code,
+        source_digest=passage["digest"],
+        authorization_basis=binding["authorization_basis"])
+    return session, chain
+
+
 def _auth(uids):
     # Corrective migration (Human-authorized, 2026-10-31, Q2
     # B-02): a formal identity authorization object, digest-
@@ -372,7 +407,8 @@ def test_answer_default_requires_guarantee(fx):
 
 def test_event_resolver_same_event_diff_date_conflict():
     fn = _event_resolver()
-    out = fn(_e4b_claims())
+    claims = _e4b_claims()
+    out = fn(claims, trust_anchor=_anchor(claims))
     assert out["status"] == "CONFLICT"
     assert out["conflicting_claim_ids"] == ["t21_claim_D1", "t21_claim_D2"]
 
@@ -458,7 +494,7 @@ def test_event_resolver_three_claims_precise_members():
         # shared-ref group is trusted via formal association
         # assertions, the second contract-allowed basis.
         _assert(claim)
-    out = fn(claims)
+    out = fn(claims, trust_anchor=_anchor(claims))
     assert out["status"] == "CONFLICT"
     assert out["conflicting_claim_ids"] == ["t_a1", "t_a2", "t_b"]
 
@@ -508,8 +544,20 @@ def test_answer_event_conflict_via_entry(fx):
     # bound snapshot, so the fixture carries that snapshot id.
     session, _snap, passage, chain = _bound_session(
         fx, event_suffix=" 事件 fixture_event_E4b。")
-    out = _answer(session, fx, passage, chain,
-                  _e4b_claims(snapshot_id=_snap.snapshot_id))
+    claims = _e4b_claims(snapshot_id=_snap.snapshot_id)
+    # Trust-anchor migration (2026-10-31, Q2 BLOCK-01): the
+    # session under test carries the oracle-preset anchor for
+    # these assertions. passage_d2 is rebuilt byte-identically
+    # to _bound_session's (same source/revision/locator/text),
+    # so its digest — and therefore registration — is identical.
+    passage_d2 = build_routed_passage(
+        source_id="fixture_doc_D2", revision="rev-1", locator="P7",
+        text="第二来源文本。 事件 fixture_event_E4b。",
+        player_uid=A, aliases=["测试甲"],
+        title="fixture_doc_D2",
+        authorized_url="fixture://authorized-copy/fixture_doc_D2")
+    session, chain = _reanchor(passage, passage_d2, _snap, claims)
+    out = _answer(session, fx, passage, chain, claims)
     layer = out["payload"]["claim_layer"]
     assert layer["status"] == "CONFLICT"
     assert layer["conflicting_claim_ids"] == ["t21_claim_D1", "t21_claim_D2"]

@@ -239,6 +239,19 @@ def _assert(claim):
     return claim
 
 
+def _anchor(claims):
+    # Trust-anchor migration (Human-authorized, 2026-10-31, Q2
+    # BLOCK-01): the oracle-preset anchor whose registry holds
+    # the expected digests of the claims' assertions.
+    registry = {}
+    for c in claims:
+        a = c.get("formal_association_assertion")
+        if isinstance(a, dict):
+            registry[a["assertion_id"]] = a["assertion_digest"]
+    return {"anchor_id": "LOCAL_TEST_ORACLE", "target_domain": TARGET,
+            "canonical_digest": None, "assertion_registry": registry}
+
+
 def test_q2r2_event_fixed_hex_digest_unknown():
     # BEHAVIORAL: a merely well-formed 64-hex digest is NOT a
     # bound assertion — the digest must recompute over the bound
@@ -293,7 +306,7 @@ def test_q2r2_event_bound_digests_conflict():
         assoc["digest"] = event_association_digest(claim, assoc)
         claim["event_association"] = assoc
         claims.append(_assert(claim))
-    out = resolve_claims_by_event(claims)
+    out = resolve_claims_by_event(claims, trust_anchor=_anchor(claims))
     assert out["status"] == "CONFLICT"
     assert out["conflicting_claim_ids"] == ["q_a", "q_b"]
 
@@ -319,7 +332,7 @@ def test_q2r2_event_distinct_trusted_refs_ok():
         assoc["digest"] = event_association_digest(claim, assoc)
         claim["event_association"] = assoc
         claims.append(_assert(claim))
-    out = resolve_claims_by_event(claims)
+    out = resolve_claims_by_event(claims, trust_anchor=_anchor(claims))
     assert out["status"] == "OK"
     assert out["conflicting_claim_ids"] == []
 

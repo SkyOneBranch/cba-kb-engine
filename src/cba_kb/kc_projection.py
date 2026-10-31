@@ -559,14 +559,65 @@ def formal_association_assertion_digest(claim: Dict[str, Any],
     }))
 
 
+def _trust_anchor_valid(anchor: Any) -> bool:
+    """Structural validation for a session-bound trust anchor.
+    The anchor is preset through the trusted channel (session
+    construction / test oracle) and is immutable to call inputs;
+    this function checks SHAPE only, never provenance. The
+    provenance guarantee comes from the channel: the anchor
+    must arrive from session state, never from the claim, the
+    association, or any other per-call input. Fields:
+    anchor_id (nonempty str), target_domain (nonempty str),
+    canonical_digest (None, or a 64-hex digest of the approved
+    canonical refs), assertion_registry (dict mapping
+    assertion_id to its expected 64-hex assertion digest).
+    Release/source binding fields are optional: when present
+    they must be nonempty strings and are matched against the
+    approval object by the caller. Any defect is untrusted,
+    never an exception."""
+    if not isinstance(anchor, dict):
+        return False
+    if not (isinstance(anchor.get("anchor_id"), str)
+            and anchor.get("anchor_id")):
+        return False
+    if not (isinstance(anchor.get("target_domain"), str)
+            and anchor.get("target_domain")):
+        return False
+    canon = anchor.get("canonical_digest")
+    if not (canon is None
+            or (isinstance(canon, str) and _SHA256_RE.match(canon))):
+        return False
+    registry = anchor.get("assertion_registry")
+    if not isinstance(registry, dict):
+        return False
+    for aid, digest in registry.items():
+        if not (isinstance(aid, str) and aid
+                and isinstance(digest, str)
+                and _SHA256_RE.match(digest)):
+            return False
+    for field in ("release_id", "source_sha256"):
+        value = anchor.get(field)
+        if value is not None and not (
+                isinstance(value, str) and value):
+            return False
+    return True
+
+
 def _formal_association_assertion_valid(claim: Dict[str, Any],
-                                        assoc: Dict[str, Any]) -> bool:
+                                        assoc: Dict[str, Any],
+                                        trust_anchor: Any = None
+                                        ) -> bool:
     """True only when the claim carries a separate formal
     association assertion that binds exactly this association:
     same source, revision, locator, event ref, claim id, player
-    UID and snapshot id, with a recomputing assertion digest.
-    Any defect — including a missing assertion — is untrusted,
-    never an exception, never a downgrade."""
+    UID and snapshot id, with a recomputing assertion digest —
+    AND the assertion is registered in the session-bound trust
+    anchor. The registry lookup is the authorization-source
+    check: a self-built assertion, however internally
+    consistent, is untrusted unless its assertion_id was
+    preset in the anchor by the trusted channel. Any defect —
+    including a missing assertion or a missing anchor — is
+    untrusted, never an exception, never a downgrade."""
     assertion = claim.get("formal_association_assertion")
     if not isinstance(assertion, dict):
         return False
@@ -596,7 +647,19 @@ def _formal_association_assertion_valid(claim: Dict[str, Any],
             claim, assoc, assertion_id)
     except (TypeError, ValueError):
         return False
-    return digest == expected
+    if digest != expected:
+        return False
+    # Trust-anchor repair (Human-authorized, 2026-10-31, Q2
+    # BLOCK-01): internal consistency is not authorization.
+    # The assertion must ALSO be registered in the anchor the
+    # trusted channel preset: a caller who invents an
+    # assertion_id, or replays a registered id onto a different
+    # claim (caught above by field binding), gains nothing.
+    # Without an anchor, no assertion is trusted.
+    if not _trust_anchor_valid(trust_anchor):
+        return False
+    registry = trust_anchor.get("assertion_registry")
+    return registry.get(assertion_id) == digest
 
 
 def _ref_mentioned(ref: str, text: str) -> bool:
@@ -674,7 +737,8 @@ def _event_association_valid(claim: Dict[str, Any], *,
                              passage_anchors=None,
                              passage_texts=None,
                              canonical_refs=None,
-                             canonical_approval=None) -> bool:
+                             canonical_approval=None,
+                             trust_anchor=None) -> bool:
     assoc = claim.get("event_association")
     if not isinstance(assoc, dict):
         return False
@@ -766,10 +830,37 @@ def _event_association_valid(claim: Dict[str, Any], *,
         # binding exactly those refs. Anything else is untrusted,
         # so the claim falls back to the UNKNOWN paths, never to
         # a CONFLICT or OK on an unapproved basis.
+        # Trust-anchor repair (Human-authorized, 2026-10-31, Q2
+        # BLOCK-01): refs + approval alone are call-supplied
+        # materials. They are trusted ONLY when they match the
+        # session-bound anchor preset by the trusted channel:
+        # the refs digest must equal the anchor's canonical
+        # digest, and the approval's release/source must match
+        # the anchor's when the anchor carries them. Self-built
+        # refs + approval + recomputed digests, without an
+        # anchor, are untrusted — the digests prove the caller
+        # built a consistent bundle, not that any authority
+        # approved it.
         if canonical_refs is None or canonical_approval is None:
             return False
         if not validate_canonical_approval(canonical_approval,
                                             canonical_refs):
+            return False
+        if not _trust_anchor_valid(trust_anchor):
+            return False
+        try:
+            refs_digest = sha256_hex(canonical_json(canonical_refs))
+        except (TypeError, ValueError):
+            return False
+        if trust_anchor.get("canonical_digest") != refs_digest:
+            return False
+        if trust_anchor.get("release_id") is not None \
+                and trust_anchor.get("release_id") \
+                != canonical_approval.get("release_id"):
+            return False
+        if trust_anchor.get("source_sha256") is not None \
+                and trust_anchor.get("source_sha256") \
+                != canonical_approval.get("source_sha256"):
             return False
         entry = canonical_refs.get(ref)
         if not isinstance(entry, dict):
@@ -778,20 +869,22 @@ def _event_association_valid(claim: Dict[str, Any], *,
             return False
         if entry.get("confirmed") is not True:
             return False
-    elif not _formal_association_assertion_valid(claim, assoc):
+    elif not _formal_association_assertion_valid(claim, assoc,
+                                                 trust_anchor):
         # Corrective repair (Human-authorized, 2026-10-31, Q2
-        # B-01): the contract allows exactly two trusted
-        # positive bases — an approved canonical reference
-        # (above), or a separate formal association assertion
-        # (this check). A self-consistent association alone
-        # (content support + recomputed digest, no artifact) is
-        # NOT a basis: a caller could invent passage,
-        # association and digests together and promote the
-        # result to a trusted CONFLICT or OK. With neither
-        # basis, the association is untrusted, so the claim
-        # falls back to the UNKNOWN paths. The assertion's
-        # publisher authenticity is out-of-band, exactly as for
-        # canonical approval and identity authorization.
+        # B-01), strengthened by the trust-anchor ruling
+        # (2026-10-31, Q2 BLOCK-01): the contract allows
+        # exactly two trusted positive bases — an approved
+        # canonical reference (above), or a separate formal
+        # association assertion (this check). A self-consistent
+        # association alone (content support + recomputed
+        # digest, no artifact) is NOT a basis, and neither is
+        # a self-built assertion: the assertion must ALSO be
+        # registered in the session-bound trust anchor. With
+        # neither basis, the association is untrusted, so the
+        # claim falls back to the UNKNOWN paths. The anchor
+        # itself arrives from the trusted preset channel
+        # (session construction), never from call inputs.
         return False
     return True
 
@@ -807,7 +900,16 @@ def resolve_claims_by_event(claims: List[Dict[str, Any]], *,
                             passage_anchors=None,
                             passage_texts=None,
                             canonical_refs=None,
-                            canonical_approval=None) -> Dict[str, Any]:
+                            canonical_approval=None,
+                            trust_anchor=None) -> Dict[str, Any]:
+    """Resolve claims by event. Canonical references and formal
+    assertions are trusted ONLY against a session-bound trust
+    anchor supplied separately (see _trust_anchor_valid): call
+    materials that merely recompute their own digests, without
+    an anchor match, are untrusted. Direct callers must obtain
+    the anchor from the trusted preset channel (the session);
+    passing a self-built anchor gains nothing at the session
+    path, where only the session's own anchor is used."""
     def _valid(claim: Dict[str, Any]) -> bool:
         return _event_association_valid(
             claim, authorized_sources=authorized_sources,
@@ -816,7 +918,8 @@ def resolve_claims_by_event(claims: List[Dict[str, Any]], *,
             snapshot_id=snapshot_id,
             passage_anchors=passage_anchors,
             canonical_refs=canonical_refs,
-            canonical_approval=canonical_approval)
+            canonical_approval=canonical_approval,
+            trust_anchor=trust_anchor)
 
     conflicting: set = set()
     unresolved: set = set()
