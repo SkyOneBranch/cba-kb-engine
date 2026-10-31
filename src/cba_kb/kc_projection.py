@@ -320,6 +320,400 @@ def resolve_claims(claims: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {"status": "OK", "grain": "CLAIM", "conflicting_claim_ids": []}
 
 
+# ------------------------------------------------- v2.1.1 T2-1 (Issue #226):
+# Event-aware claim resolution (Freeze Delta Candidate Δ-02, C + A).
+#
+# resolve_claims() above is KEPT unchanged as the legacy heuristic:
+# it groups by (player_uid, date) and can neither find a same-event
+# conflict across different dates nor prove that different dates mean
+# different events. resolve_claims_by_event() is the new entry,
+# strengthened by the post-freeze Q2 (2026-10-31) B-03/B-04 fixes and
+# by the Human-authorized Q2-227-02/03 repair (2026-10-31):
+# - A claim carries a TRUSTED event association only when its
+#   event_association dict is a FORMAL assertion: a non-empty
+#   event_ref, a non-empty evidence list, AND source_id, revision,
+#   locator and a digest, with the association's source_id bound
+#   to this claim's source_id and its player_uid bound to this
+#   claim's player_uid. Bare declarations (event_ref + evidence
+#   strings only) are NOT formal proof. An event_key alone is a
+#   candidate index, never proof: it must not group claims, and it
+#   must not separate them.
+# - The digest is NO LONGER format-only: it must equal
+#   event_association_digest() recomputed over the bound content
+#   (claim_id, player_uid, source_id, revision, locator,
+#   event_ref, evidence, snapshot_id). A merely well-formed
+#   64-hex string (e.g. a fixed "f"*64) is NOT a trusted
+#   association. This binds the digest to this claim and this
+#   snapshot instead of letting any formatted string stand in for
+#   an assertion. The digest proves CONTENT BINDING only: it
+#   does NOT prove the association's formal identity, because
+#   anyone can recompute a digest over content they invented.
+#   Formal association identity requires the consumer path's
+#   passage anchoring (below). It does NOT prove the assertion
+#   against an event registry — no such registry exists in this
+#   data model, and building one would be a Truth Store, out of
+#   scope; the assertion form itself is what contract §3.1
+#   allows, and the recomputation is what makes it checkable
+#   rather than self-declared.
+# - When the consumer path supplies authorized_sources,
+#   snapshot_sources and snapshot_id, the association's source
+#   must additionally be a member of both sets and its
+#   snapshot_id must equal the bound snapshot (contract §3.1(2)).
+#   A standalone call without context enforces the recomputed
+#   digest over the association's own snapshot_id (or none); that
+#   limitation is documented, and the consumer path always
+#   supplies context.
+# - Provenance-binding repair (Human-authorized, 2026-10-31):
+#   when the consumer path additionally supplies passage_anchors
+#   — the (source_id, revision, locator) triples of its
+#   digest-validated registered passages — an association is
+#   trusted only when its claimed source, revision and locator
+#   match one such anchor. A self-consistent digest over an
+#   unregistered source passage is content binding, not a formal
+#   association, and is untrusted. The anchors come from the
+#   consumer's passage registry (registration already enforces
+#   digest validity), so the resolver itself never re-validates
+#   passage digests; a standalone call without anchors proves
+#   binding only, never formal association identity.
+# - Event-identity repair (Human-authorized, 2026-10-31, Q2
+#   H01/H02): anchor membership alone is NOT event-identity
+#   proof — it says nothing about passage content. When the
+#   consumer path additionally supplies passage_texts — the
+#   digest-bound texts of its registered passages, keyed by the
+#   same triples — a trusted association additionally requires:
+#   (a) CONTENT SUPPORT: the anchor passage's text mentions the
+#   claimed event_ref (the passage content itself must state the
+#   event; a triple match over ordinary info is not support);
+#   (b) EVIDENCE RESOLUTION: every evidence entry must resolve
+#   to a registered passage ("source_id:locator" form, and that
+#   source must be authorized and a snapshot member when those
+#   contexts are supplied). Arbitrary evidence strings prove
+#   nothing. Under this rule, distinctness is proven by distinct
+#   CONTENT-BACKED associations (each claim's own anchor text
+#   states its own event_ref, refs differ, evidence disjoint) —
+#   never by string inequality alone; and a same-ref CONFLICT
+#   requires both associations content-backed to the SHARED ref.
+#   Residual, stated plainly: mention is a content-support
+#   signal, not semantic event understanding, and passage
+#   authenticity itself remains a Phase-2 / real-source matter
+#   (the same (a)/(b) distinction the Q2 accepted for
+#   formal_registry). Canonical event references (contract
+#   §3.1(2)(a)) are consumed through an explicit canonical
+#   layer below: refs + a digest-bound approval object. A
+#   workspace CANDIDATE registry derived from real data exists
+#   (version-bound, CANDIDATE-labeled); it is NOT a formal
+#   release. Without a valid approval the layer is inert or
+#   invalid and nothing claims formal event identity. The
+#   same-key-different-events POSITIVE identification
+#   (§3.1(3) bullet 1 — proving two same-key claims are
+#   different events) still has no mechanism: ref-level gating
+#   can refuse a false CONFLICT/OK, but identifying the second
+#   event needs a second identified event. That gap is carried,
+#   not faked.
+# - Trusted claims sharing (player_uid, event_ref) form one event
+#   group; differing normalized business values (date, text) inside
+#   one group are CONFLICT, with every participating claim listed.
+# - Claims without a trusted association NO LONGER decide CONFLICT
+#   through the legacy (player_uid, date) heuristic: differing
+#   texts inside a legacy group are UNRESOLVED (UNKNOWN), because
+#   date grouping is only a candidate heuristic and cannot prove
+#   event identity, especially when date itself is disputed
+#   (contract §3.1(6)). Unlabelled claims with identical values
+#   keep the legacy OK.
+# - Q2-227-03 repair: unlabelled pairs on DIFFERENT dates NO
+#   LONGER keep the legacy OK either. Differing business values
+#   for one player where any claim lacks a trusted association
+#   are UNRESOLVED (EVENT_RELATIONSHIP_UNPROVEN): absence of a
+#   proven link is not proof of no conflict. A proven-no-conflict
+#   OK now requires positive evidence — identical values, or
+#   every claim trusted under pairwise-distinct event refs.
+#   Single claims and identical-value groups are unaffected.
+# - When event identity is explicitly invoked (an event_key or an
+#   event_association is present) but the association is unproven, or
+#   when different event refs share evidence, and the business values
+#   differ, the result is UNKNOWN — never a proven-no-conflict OK.
+def event_association_digest(claim: Dict[str, Any],
+                             assoc: Dict[str, Any]) -> str:
+    """Recomputable binding digest for a formal event association:
+    SHA-256 over the canonical JSON of exactly the content the
+    association claims to bind — this claim's id and player, the
+    association's source, revision, locator, event ref and
+    evidence, and the snapshot the association claims. Any change
+    to the bound content changes the digest, so a digest cannot be
+    replayed onto a different claim, event, or snapshot."""
+    return sha256_hex(canonical_json({
+        "claim_id": claim.get("claim_id"),
+        "player_uid": claim.get("player_uid"),
+        "source_id": assoc.get("source_id"),
+        "revision": assoc.get("revision"),
+        "locator": assoc.get("locator"),
+        "event_ref": assoc.get("event_ref"),
+        "evidence": assoc.get("evidence"),
+        "snapshot_id": assoc.get("snapshot_id"),
+    }))
+
+
+def validate_canonical_approval(approval: Any, refs: Any) -> bool:
+    """Validate a canonical-release approval object against the refs
+    it claims to approve. Returns False on ANY defect, never raises.
+
+    The approval binds {release_id, release_version, source_sha256,
+    approved_tiers, canonical_digest} with approval_digest, and
+    canonical_digest must equal SHA-256 over the canonical JSON of
+    the refs dict itself — so an approval cannot be replayed onto
+    different refs, and refs cannot be swapped under an approval.
+
+    What this does NOT prove (same (a)/(b) distinction as
+    formal_registry and identity authorization): the code verifies
+    structure and binding only. It does NOT authenticate the
+    publisher, the release, or the business correctness of the
+    refs — that authentication is out-of-band (a Human-approved
+    formal release). A digest that recomputes proves internal
+    consistency, never external authenticity. An attacker able to
+    rewrite refs and both digests together is outside this check."""
+    if not isinstance(approval, dict) or not isinstance(refs, dict):
+        return False
+    release_id = approval.get("release_id")
+    release_version = approval.get("release_version")
+    source_sha256 = approval.get("source_sha256")
+    approved_tiers = approval.get("approved_tiers")
+    canonical_digest = approval.get("canonical_digest")
+    approval_digest = approval.get("approval_digest")
+    if not (isinstance(release_id, str) and release_id
+            and isinstance(release_version, str) and release_version
+            and isinstance(source_sha256, str)
+            and _SHA256_RE.match(source_sha256)
+            and isinstance(approved_tiers, list) and approved_tiers
+            and all(isinstance(t, str) and t for t in approved_tiers)
+            and len(set(approved_tiers)) == len(approved_tiers)
+            and isinstance(canonical_digest, str)
+            and _SHA256_RE.match(canonical_digest)
+            and isinstance(approval_digest, str)
+            and _SHA256_RE.match(approval_digest)):
+        return False
+    try:
+        expected_approval = sha256_hex(canonical_json({
+            "release_id": release_id,
+            "release_version": release_version,
+            "source_sha256": source_sha256,
+            "approved_tiers": sorted(approved_tiers),
+            "canonical_digest": canonical_digest}))
+        expected_canonical = sha256_hex(canonical_json(refs))
+    except (TypeError, ValueError):
+        return False
+    return (approval_digest == expected_approval
+            and canonical_digest == expected_canonical)
+
+
+def _event_association_valid(claim: Dict[str, Any], *,
+                             authorized_sources=None,
+                             snapshot_sources=None,
+                             snapshot_id=None,
+                             passage_anchors=None,
+                             passage_texts=None,
+                             canonical_refs=None,
+                             canonical_approval=None) -> bool:
+    assoc = claim.get("event_association")
+    if not isinstance(assoc, dict):
+        return False
+    ref = assoc.get("event_ref")
+    evidence = assoc.get("evidence")
+    if not (isinstance(ref, str) and bool(ref)
+            and isinstance(evidence, list) and len(evidence) > 0
+            and all(isinstance(e, str) and bool(e) for e in evidence)):
+        return False
+    source_id = assoc.get("source_id")
+    revision = assoc.get("revision")
+    locator = assoc.get("locator")
+    digest = assoc.get("digest")
+    hexdigits = set("0123456789abcdef")
+    if not (isinstance(source_id, str) and bool(source_id)
+            and isinstance(revision, str) and bool(revision)
+            and isinstance(locator, str) and bool(locator)
+            and isinstance(digest, str) and len(digest) == 64
+            and all(ch in hexdigits for ch in digest)):
+        return False
+    if source_id != claim.get("source_id"):
+        return False
+    # Q2-227-02: the UID binding is mandatory, not conditional on
+    # the association happening to carry it. A claim with a player
+    # UID is trusted only under an association bound to that UID.
+    if claim.get("player_uid") is not None \
+            and assoc.get("player_uid") != claim.get("player_uid"):
+        return False
+    if authorized_sources is not None \
+            and source_id not in authorized_sources:
+        return False
+    if snapshot_sources is not None \
+            and source_id not in snapshot_sources:
+        return False
+    if snapshot_id is not None \
+            and assoc.get("snapshot_id") != snapshot_id:
+        return False
+    if passage_anchors is not None \
+            and (source_id, revision, locator) not in passage_anchors:
+        # The claimed source passage is not a digest-validated
+        # registered passage: the digest binds content the caller
+        # invented, not a formal association. Untrusted.
+        return False
+    if passage_texts is not None:
+        # Event-identity repair (2026-10-31, Q2 H01/H02): anchor
+        # membership says nothing about content. The anchor
+        # passage's own text must mention the claimed event_ref,
+        # and every evidence entry must resolve to a registered
+        # passage ("source_id:locator" form; that source must be
+        # authorized and a snapshot member when those contexts are
+        # supplied). An association whose evidence is arbitrary
+        # strings, or whose passage never states the event, is
+        # untrusted even when its digest recomputes.
+        anchor_text = passage_texts.get((source_id, revision, locator))
+        if not isinstance(anchor_text, str) or ref not in anchor_text:
+            return False
+        registered_locators = {(s, l) for (s, _r, l) in passage_texts}
+        for entry in evidence:
+            if not isinstance(entry, str) or ":" not in entry:
+                return False
+            ev_source, ev_locator = entry.split(":", 1)
+            if not ev_source or not ev_locator:
+                return False
+            if (ev_source, ev_locator) not in registered_locators:
+                return False
+            if authorized_sources is not None and \
+                    ev_source not in authorized_sources:
+                return False
+            if snapshot_sources is not None and \
+                    ev_source not in snapshot_sources:
+                return False
+    try:
+        expected = event_association_digest(claim, assoc)
+    except (TypeError, ValueError):
+        return False
+    if digest != expected:
+        return False
+    if canonical_refs is not None or canonical_approval is not None:
+        # Canonical layer configured (fully or partially). It is an
+        # ADDITIONAL gate, never an override: every earlier check
+        # still applies. A half-configured layer trusts nothing.
+        # A fully configured layer trusts only an event_ref that
+        # is present in the approved refs, in an approved tier,
+        # and marked confirmed — with the approval's digests
+        # binding exactly those refs. Anything else is untrusted,
+        # so the claim falls back to the UNKNOWN paths, never to
+        # a CONFLICT or OK on an unapproved basis.
+        if canonical_refs is None or canonical_approval is None:
+            return False
+        if not validate_canonical_approval(canonical_approval,
+                                            canonical_refs):
+            return False
+        entry = canonical_refs.get(ref)
+        if not isinstance(entry, dict):
+            return False
+        if entry.get("tier") not in canonical_approval["approved_tiers"]:
+            return False
+        if entry.get("confirmed") is not True:
+            return False
+    return True
+
+
+def _claim_business_value(claim: Dict[str, Any]):
+    return (claim.get("date"), claim.get("text"))
+
+
+def resolve_claims_by_event(claims: List[Dict[str, Any]], *,
+                            authorized_sources=None,
+                            snapshot_sources=None,
+                            snapshot_id=None,
+                            passage_anchors=None,
+                            passage_texts=None,
+                            canonical_refs=None,
+                            canonical_approval=None) -> Dict[str, Any]:
+    def _valid(claim: Dict[str, Any]) -> bool:
+        return _event_association_valid(
+            claim, authorized_sources=authorized_sources,
+            snapshot_sources=snapshot_sources,
+            passage_texts=passage_texts,
+            snapshot_id=snapshot_id,
+            passage_anchors=passage_anchors,
+            canonical_refs=canonical_refs,
+            canonical_approval=canonical_approval)
+
+    conflicting: set = set()
+    unresolved: set = set()
+    if claims:
+        if ((canonical_refs is None) != (canonical_approval is None)):
+            unresolved.add("CANONICAL_LAYER_HALF_CONFIGURED")
+        elif (canonical_refs is not None
+                and not validate_canonical_approval(canonical_approval,
+                                                    canonical_refs)):
+            unresolved.add("CANONICAL_APPROVAL_INVALID")
+    trusted: Dict[Any, List[Dict[str, Any]]] = {}
+    for claim in claims:
+        if _valid(claim):
+            key = (claim.get("player_uid"),
+                   claim["event_association"]["event_ref"])
+            trusted.setdefault(key, []).append(claim)
+    for members in trusted.values():
+        values = {_claim_business_value(m) for m in members}
+        if len(values) > 1:
+            conflicting.update(m.get("claim_id") for m in members
+                               if m.get("claim_id") is not None)
+    legacy: Dict[Any, List[Dict[str, Any]]] = {}
+    for claim in claims:
+        if not _valid(claim):
+            legacy.setdefault((claim.get("player_uid"),
+                               claim.get("date")), []).append(claim)
+    for members in legacy.values():
+        texts = {m.get("text") for m in members}
+        if len(texts) > 1:
+            # Post-freeze Q2 B-04 fix: the legacy heuristic must
+            # NOT decide CONFLICT. Differing texts inside a legacy
+            # group are undetermined (the grouping is only a
+            # candidate heuristic), so they are UNRESOLVED.
+            unresolved.add("LEGACY_GROUPING_UNPROVEN")
+    by_player: Dict[Any, List[Dict[str, Any]]] = {}
+    for claim in claims:
+        by_player.setdefault(claim.get("player_uid"), []).append(claim)
+    for members in by_player.values():
+        if len(members) < 2:
+            continue
+        values = {_claim_business_value(m) for m in members}
+        if len(values) <= 1:
+            continue
+        invoking = [m for m in members
+                    if "event_key" in m or "event_association" in m]
+        if invoking and any(not _valid(m) for m in invoking):
+            unresolved.add("EVENT_ASSOCIATION_UNPROVEN")
+        # Q2-227-03: differing business values with ANY claim
+        # lacking a trusted association cannot be proven to be
+        # about different events. No event fields at all is the
+        # sharpest case: the old code returned a proven-no-conflict
+        # OK here. Undetermined is UNKNOWN, not OK; a proven OK
+        # still stands when every claim is trusted under distinct
+        # event refs (no unresolved marker is added then).
+        if any(not _valid(m) for m in members):
+            unresolved.add("EVENT_RELATIONSHIP_UNPROVEN")
+        evidence_by_ref: Dict[Any, set] = {}
+        for member in members:
+            if _valid(member):
+                ref = member["event_association"]["event_ref"]
+                evidence_by_ref.setdefault(ref, set()).update(
+                    member["event_association"]["evidence"])
+        refs = list(evidence_by_ref)
+        for i in range(len(refs)):
+            for j in range(i + 1, len(refs)):
+                if evidence_by_ref[refs[i]] & evidence_by_ref[refs[j]]:
+                    unresolved.add("SHARED_EVIDENCE_DIFFERENT_EVENT_KEYS")
+    if conflicting:
+        status = "CONFLICT"
+    elif unresolved:
+        status = "UNKNOWN"
+    else:
+        status = "OK"
+    return {"status": status, "grain": "CLAIM",
+            "conflicting_claim_ids": sorted(conflicting),
+            "unresolved": sorted(unresolved)}
+
+
 # ------------------------------------------------------------ passages
 def build_passage(*, source_id: str, revision: str, locator: str,
                   text: str, player_uid: Optional[str] = None,

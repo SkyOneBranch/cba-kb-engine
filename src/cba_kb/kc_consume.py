@@ -111,7 +111,8 @@ from .kc_passages import verify_passage_text
 from .kc_projection import (
     KcError,
     canonical_json,
-    resolve_claims,
+    resolve_claims_by_event,
+    resolve_identity,
     sha256_hex,
     validate_passage,
 )
@@ -128,7 +129,7 @@ from .kc_slices import (
     build_slice_catalog,
     query_slice_metric,
 )
-from .kc_snapshot import validate_snapshot
+from .kc_snapshot import validate_fact_guarantee, validate_snapshot
 from .kc_visibility import (
     NOT_FOUND_DETAIL,
     query_visible,
@@ -184,6 +185,30 @@ def _content_digest(payload: Dict[str, Any]) -> str:
     return sha256_hex(canonical_json(_jsonable(payload)))
 
 
+def identity_evidence_digest(*, source_id: str, revision: str,
+                             target_domain: str,
+                             players: List[Dict[str, Any]],
+                             aliases: List[Dict[str, Any]]) -> str:
+    """Recomputable binding digest for identity evidence: SHA-256
+    over the canonical JSON of the claimed source triple AND the
+    actual submitted identity content (players and aliases, sorted
+    by their canonical bytes so list order cannot change the
+    digest). A digest computed for one identity payload cannot be
+    replayed onto different players, aliases, or approval content:
+    any content change changes the digest. This binds the digest
+    to the submitted page content; it does NOT prove the submitted
+    set is the complete formal index — that completeness still
+    needs a formal index input this interface does not carry, so
+    E4a remains HOLD for complete-entry proof."""
+    def _sorted(entries: List[Any]) -> List[Any]:
+        return sorted(entries, key=lambda e: canonical_json(_jsonable(e)))
+
+    return sha256_hex(canonical_json({
+        "source_id": source_id, "revision": revision,
+        "target_domain": target_domain,
+        "players": _sorted(players), "aliases": _sorted(aliases)}))
+
+
 class ConsumeSession:
     """One controlled consumption session — one target domain, three
     authorized sets (players, sources, objects), one store-owned
@@ -197,12 +222,22 @@ class ConsumeSession:
                  authorized_players: Any = (),
                  authorized_sources: Any = (),
                  authorized_objects: Any = (),
-                 authorization_basis: str = DEFAULT_AUTHORIZATION_BASIS):
+                 authorization_basis: str = DEFAULT_AUTHORIZATION_BASIS,
+                 canonical_event_refs: Any = None,
+                 canonical_approval: Any = None):
         self.target_domain = target_domain
         self.authorized_players = set(authorized_players)
         self.authorized_sources = set(authorized_sources)
         self.authorized_objects = set(authorized_objects)
         self.authorization_basis = authorization_basis
+        # Canonical layer inputs are deep-copied at bind time so a
+        # later caller mutation cannot move the binding, mirroring
+        # how snapshots are deep-copied on bind. None/None keeps
+        # the pre-canonical behavior unchanged.
+        self._canonical_event_refs = copy.deepcopy(canonical_event_refs) \
+            if canonical_event_refs is not None else None
+        self._canonical_approval = copy.deepcopy(canonical_approval) \
+            if canonical_approval is not None else None
         self.session_id = uuid.uuid4().hex
         self._store: SimulatedCurrentStore = SimulatedCurrentStore(
             target_domain=target_domain)
@@ -394,6 +429,103 @@ class ConsumeSession:
             return dict(UNIFORM_NOT_FOUND)
         return self._wrap("consume_catalog", out)
 
+    # ---- v2.1.1 T2-1 (Issue #226): controlled identity entry ----
+    # Freeze Delta Candidate Δ-03 (B-first): reuse resolve_identity,
+    # but only after target-first filtering, with pagination and
+    # evidence completeness enforced fail-closed. This is NOT a new
+    # public wrapper around the primitives: it is an entry method of
+    # the controlled surface, and it adds no new API outside this
+    # session. Counts are never included in a consumer result, so an
+    # unauthorized-existing candidate and a nonexistent candidate
+    # return the identical uniform UNKNOWN (F-02). The session's
+    # snapshot binding is reported as a SEPARATE field and is never
+    # presented as identity evidence.
+    def consume_identity(self, *, players: List[Dict[str, Any]],
+                         aliases: List[Dict[str, Any]], query: str,
+                         query_kind: str,
+                         identity_source: Any = None,
+                         all_pages_received: bool = True
+                         ) -> Dict[str, Any]:
+        def unknown(reason: str) -> Dict[str, Any]:
+            self._last_diagnostic = {"cause": reason,
+                                     "entry": "consume_identity"}
+            return {"status": "UNKNOWN", "grain": "IDENTITY",
+                    "candidates": [], "relation": "UNDECIDED",
+                    "reason": reason}
+
+        if all_pages_received is not True:
+            return unknown("PAGINATION_INCOMPLETE")
+        # Post-freeze Q2 B-05 fix: the caller's boolean alone does
+        # NOT prove pagination completeness. The supplied players
+        # and aliases must also cover the whole authorized player
+        # set; a page set that omits authorized players is
+        # unproven, even when the caller claims all pages arrived.
+        supplied_uids = set()
+        for entry in list(players) + list(aliases):
+            if isinstance(entry, dict) and entry.get("player_uid"):
+                supplied_uids.add(entry.get("player_uid"))
+        if not set(self.authorized_players) <= supplied_uids:
+            return unknown("IDENTITY_COVERAGE_INCOMPLETE")
+        if not isinstance(identity_source, dict):
+            return unknown("IDENTITY_EVIDENCE_NOT_BOUND")
+        source_id = identity_source.get("source_id")
+        revision = identity_source.get("revision")
+        digest = identity_source.get("digest")
+        hexdigits = set("0123456789abcdef")
+        if not (isinstance(source_id, str) and source_id
+                and isinstance(revision, str) and revision
+                and isinstance(digest, str) and len(digest) == 64
+                and all(ch in hexdigits for ch in digest)):
+            return unknown("IDENTITY_EVIDENCE_NOT_BOUND")
+        # Q2-227-04 repair (Human-authorized, 2026-10-31): a
+        # merely well-formed 64-hex string is NOT evidence
+        # binding, and neither is a digest recomputed from the
+        # claimed triple alone — the old rule let one digest cover
+        # any player/alias content under the same source, revision
+        # and domain. The digest must now be recomputable from the
+        # triple AND the actual submitted players and aliases
+        # (identity_evidence_digest, shared with the producer).
+        # This proves the digest corresponds to this submitted
+        # page content; it does NOT prove the submitted set is
+        # the complete formal index — full index verification
+        # still needs an index input this interface does not
+        # carry, so E4a remains HOLD for complete-entry proof.
+        try:
+            expected_digest = identity_evidence_digest(
+                source_id=source_id, revision=revision,
+                target_domain=self.target_domain,
+                players=players, aliases=aliases)
+        except (TypeError, ValueError):
+            return unknown("IDENTITY_EVIDENCE_DIGEST_MISMATCH")
+        if digest != expected_digest:
+            return unknown("IDENTITY_EVIDENCE_DIGEST_MISMATCH")
+        # Target-first: filter BEFORE any resolution, summary, or
+        # candidate list is derived. Unauthorized entries never reach
+        # the primitive, so they cannot leak through a candidate,
+        # a count, or a clarification list.
+        filtered_players = [p for p in players
+                            if isinstance(p, dict)
+                            and p.get("player_uid")
+                            in self.authorized_players]
+        filtered_aliases = [a for a in aliases
+                            if isinstance(a, dict)
+                            and a.get("player_uid")
+                            in self.authorized_players]
+        resolved = resolve_identity(filtered_players, filtered_aliases,
+                                    query=query, query_kind=query_kind)
+        if resolved["status"] == "UNKNOWN":
+            return dict(resolved)
+        payload = dict(resolved)
+        payload["authorization_scope"] = "AUTHORIZED_PLAYERS_ONLY"
+        payload["evidence_binding"] = {
+            "source_id": source_id, "revision": revision,
+            "digest": digest, "kind": "KC_IDENTITY_EVIDENCE"}
+        payload["session_snapshot_id"] = self._bound_snapshot_id
+        payload["binding_separation"] = (
+            "SESSION_SNAPSHOT_BINDING_IS_NOT_IDENTITY_EVIDENCE")
+        self._last_diagnostic = None
+        return self._wrap("consume_identity", payload)
+
     def consume_object(self, objects: List[Dict[str, Any]],
                        object_id: str) -> Dict[str, Any]:
         """Consumer object lookup: the target-first view already
@@ -515,7 +647,9 @@ class ConsumeSession:
                        passage: Dict[str, Any], source_text: str,
                        chain: Dict[str, Any],
                        claims: List[Dict[str, Any]],
-                       team_id: Optional[str] = None) -> Dict[str, Any]:
+                       team_id: Optional[str] = None,
+                       fact_guarantee: Any = None
+                       ) -> Dict[str, Any]:
         """Integrated cross-source answer through the entry. Stats
         come from consume_slice, Document from consume_citation, Fact
         is deep-copied and never mutated — but only if it validates
@@ -600,6 +734,152 @@ class ConsumeSession:
             and source_bound
             and slice_bound
         )
+        # v2.1.1 T2-1 (Issue #226) Δ-01, strengthened by the
+        # post-freeze Q2 (2026-10-31) B-02 fix and closed by the
+        # Human B-01 option (a) decision (2026-10-31): the Fact
+        # layer ALWAYS requires a guarantee sidecar bound to THIS
+        # session's current snapshot AND to the ACTUAL output Fact:
+        # same fact_id, same source identifier, a field_scope
+        # covering every output Fact field, and — when the Fact's
+        # source is the cited passage's source — the same file
+        # version as that passage's revision. There is no opt-out:
+        # the former require_fact_guarantee parameter was removed
+        # because its only remaining use would have been an
+        # explicit bypass of this gate, which contract §2.1 leaves
+        # unapproved, and no in-repo caller needed it (producer
+        # real path and v211 tests all passed True). A sidecar
+        # that is merely self-consistent (valid digest,
+        # snapshot-bound source) but bound to another source, a
+        # partial scope, or a different file version does NOT
+        # validate the Fact. A missing, tampered, or mis-bound
+        # guarantee turns ONLY the Fact layer UNKNOWN; Stats and
+        # Document below are computed independently and are
+        # untouched (contract §2.1(5)).
+        # Q2-227-01 repair (Human-authorized, 2026-10-31):
+        # validate_fact_guarantee() alone is only sidecar
+        # self-consistency (digest, snapshot membership, domain);
+        # it is NOT authorization, and the gate below adds the
+        # authoritative binding the contract §2.1 requires. Three
+        # gaps the post-freeze Q2 exposed are closed here, reusing
+        # only existing machinery (the bound snapshot's entry
+        # digests, the session's registered passages, the cited
+        # passage):
+        # - source_digest is REQUIRED and must be a digest of the
+        #   bound snapshot for the guarantee's source. A digest
+        #   of None used to pass the validator; it can no longer
+        #   authorize a Fact.
+        # - fact_version is REQUIRED on the Fact and must equal
+        #   the guarantee's. The Fact version field already
+        #   exists in this data model (the producer's real path
+        #   requires it); a version-less Fact is legacy and stays
+        #   UNKNOWN per §2.1(6) — no schema change is made, and
+        #   no version is invented for it.
+        # - file_version must be corroborated by an actual
+        #   passage object carrying the guarantee's source_digest
+        #   (the cited passage, or a passage registered in this
+        #   session): the passage's revision must equal the
+        #   file_version. The old code checked this only when
+        #   the Fact's source happened to equal the cited
+        #   passage's source, so a cross-source Fact could carry
+        #   any declared file_version. A passage digest binds
+        #   {source_id, revision, locator, text} (validate_passage
+        #   recomputes it), so a matching digest plus a matching
+        #   revision is real version evidence, not a declaration.
+        #   If no passage corroborates the file_version, the Fact
+        #   is UNKNOWN — the gate never upgrades a declaration.
+        if fact_valid:
+            guarantee_ok = False
+            guarantee_reason = "FACT_GUARANTEE_MISSING_OR_INVALID"
+            if isinstance(fact_guarantee, dict) \
+                    and isinstance(fact, dict) \
+                    and self._bound_snapshot_id is not None:
+                current = self._store.current_snapshot()
+                if current is not None:
+                    checked = validate_fact_guarantee(
+                        fact_guarantee, snapshot=current)
+                    if checked["valid"] is not True:
+                        guarantee_reason = checked["reason"]
+                    elif fact_guarantee.get("fact_id") \
+                            != fact.get("fact_id"):
+                        guarantee_reason = \
+                            "FACT_GUARANTEE_FACT_ID_MISMATCH"
+                    else:
+                        fact_source = fact.get("source_id") \
+                            or fact.get("source")
+                        scope = fact_guarantee.get("field_scope")
+                        if fact_source is None or \
+                                fact_guarantee.get("source_id") \
+                                != fact_source:
+                            guarantee_reason = \
+                                "FACT_GUARANTEE_SOURCE_MISMATCH"
+                        elif not isinstance(scope, list) \
+                                or not set(fact.keys()) \
+                                <= set(scope):
+                            guarantee_reason = \
+                                "FACT_GUARANTEE_SCOPE_INCOMPLETE"
+                        elif not isinstance(
+                                fact.get("fact_version"), str) \
+                                or not fact.get("fact_version") \
+                                or fact_guarantee.get("fact_version") \
+                                != fact.get("fact_version"):
+                            guarantee_reason = \
+                                "FACT_GUARANTEE_VERSION_MISMATCH"
+                        elif not isinstance(
+                                fact_guarantee.get("source_digest"),
+                                str) \
+                                or not fact_guarantee.get(
+                                    "source_digest"):
+                            guarantee_reason = \
+                                "FACT_GUARANTEE_SOURCE_DIGEST_MISSING"
+                        else:
+                            digest = fact_guarantee.get(
+                                "source_digest")
+                            file_version = fact_guarantee.get(
+                                "file_version")
+                            corroborated = False
+                            if isinstance(passage, dict) \
+                                    and passage.get("digest") \
+                                    == digest \
+                                    and passage.get("source_id") \
+                                    == fact_source \
+                                    and passage.get("revision") \
+                                    == file_version:
+                                # The cited passage corroborates
+                                # only if its own digest
+                                # recomputes from {source_id,
+                                # revision, locator, text}:
+                                # a dict merely CLAIMING the entry
+                                # digest with a different revision
+                                # or text proves nothing.
+                                try:
+                                    cited_ok = validate_passage(
+                                        passage)["valid"] is True
+                                except (KeyError, TypeError,
+                                        ValueError):
+                                    cited_ok = False
+                                corroborated = cited_ok
+                            if not corroborated:
+                                registered = self._passages.get(
+                                    digest)
+                                if isinstance(registered, dict) \
+                                        and registered.get(
+                                            "source_id") \
+                                        == fact_source \
+                                        and registered.get(
+                                            "revision") \
+                                        == file_version:
+                                    corroborated = True
+                            if not corroborated:
+                                guarantee_reason = (
+                                    "FACT_GUARANTEE_FILE_VERSION_"
+                                    "UNCORROBORATED")
+                            else:
+                                guarantee_ok = True
+            if not guarantee_ok:
+                fact_valid = False
+                self._last_diagnostic = {
+                    "cause": guarantee_reason,
+                    "entry": "consume_answer"}
         fact_layer = fact_copy if fact_valid else dict(UNIFORM_NOT_FOUND)
         cited = self.consume_citation(passage=passage,
                                       source_text=source_text,
@@ -615,13 +895,62 @@ class ConsumeSession:
             }
         else:
             doc_layer = dict(cited)
-        resolved = resolve_claims(claims)
+        # v2.1.1 T2-1 (Issue #226) Δ-02: claims resolve through the
+        # event-aware resolver (legacy behaviour preserved for
+        # unlabelled claims). Δ-D mis-rejection fix: provenance
+        # fields and the kind label are NOT business collisions — a
+        # claim differing from the Fact only in source, source_id,
+        # digest, locator, revision, claim_id, fact_id, or kind is
+        # not a merge attempt and is not refused. Genuine business
+        # differences (player_uid, season, team_id, ...) still are.
+        # Post-freeze Q2 B-03 fix: the event resolver receives this
+        # session's authorization and snapshot context, so a claim
+        # association is trusted only when its source is both
+        # authorized and a member of the bound snapshot (in
+        # addition to the resolver's formal-field checks). A
+        # standalone resolver call without context enforces the
+        # formal fields only; that limitation is documented on the
+        # resolver, and the consumer path always supplies context.
+        # Provenance-binding repair (Human-authorized, 2026-10-31):
+        # the resolver additionally receives this session's
+        # passage anchors — the (source, revision, locator)
+        # triples of passages that passed digest validation at
+        # registration. An association whose claimed passage was
+        # never registered is untrusted even when its digest
+        # recomputes: a recomputed digest proves content binding,
+        # not formal association identity.
+        # Event-identity repair (Human-authorized, 2026-10-31,
+        # Q2 H01/H02): the resolver additionally receives the
+        # digest-bound texts of those same passages. Anchor
+        # membership alone says nothing about content; a trusted
+        # association now also requires the anchor passage's text
+        # to mention the claimed event_ref, and every evidence
+        # entry to resolve to a registered passage.
+        passage_anchors = {
+            (p.get("source_id"), p.get("revision"), p.get("locator"))
+            for p in self._passages.values()}
+        passage_texts = {
+            (p.get("source_id"), p.get("revision"), p.get("locator")):
+                p.get("text")
+            for p in self._passages.values()}
+        resolved = resolve_claims_by_event(
+            claims, authorized_sources=self.authorized_sources,
+            snapshot_sources=set(manifest.keys()),
+            snapshot_id=self._bound_snapshot_id,
+            passage_anchors=passage_anchors,
+            passage_texts=passage_texts,
+            canonical_refs=self._canonical_event_refs,
+            canonical_approval=self._canonical_approval)
         refusals = []
+        _PROVENANCE_EXCLUDED = frozenset({
+            "source", "source_id", "digest", "locator", "revision",
+            "claim_id", "fact_id", "kind"})
         for claim in claims:
             if not isinstance(claim, dict):
                 continue
             collision = any(
-                key in fact_copy and claim.get(key) != fact_copy.get(key)
+                key in fact_copy and key not in _PROVENANCE_EXCLUDED
+                and claim.get(key) != fact_copy.get(key)
                 for key in claim)
             if collision:
                 try:
@@ -641,6 +970,8 @@ class ConsumeSession:
             "refusals": refusals,
             "claims": copy.deepcopy(claims),
         }
+        if resolved.get("unresolved"):
+            claim_layer["unresolved"] = list(resolved["unresolved"])
         handling = treat_as_data(
             passage.get("text", "") if isinstance(passage, dict) else "")
         payload = {
