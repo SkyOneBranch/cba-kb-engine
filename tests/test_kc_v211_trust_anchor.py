@@ -258,7 +258,7 @@ def test_anchor_registered_assertion_bidirectional():
 
 
 def _build_snapshot(fx, passage):
-    # Snapshot construction needs no session: the probe session
+    # Snapshot construction needs no session object - the probe
     # only computes the justifying slice digest.
     probe = ConsumeSession(
         target_domain=TARGET, authorized_players={A},
@@ -342,7 +342,7 @@ def test_anchor_session_uses_only_session_anchor(fx):
         text=fx["passages"][0]["text"] + " 事件 event_Q。",
         player_uid=A, aliases=["测试甲"], title="fixture_doc_D1",
         authorized_url="fixture://authorized-copy/fixture_doc_D1")
-    # No-anchor session: self-built assertions stay UNKNOWN.
+    # No-anchor session - self-built assertions stay UNKNOWN.
     snap = _build_snapshot(fx, passage)
     session = _new_session(None)
     chain = _bind(session, snap, passage)
@@ -351,7 +351,7 @@ def test_anchor_session_uses_only_session_anchor(fx):
     layer = _answer(session, fx, passage, chain, claims
                     )["payload"]["claim_layer"]
     assert layer["status"] == "UNKNOWN"
-    # Anchored session: the oracle presets the registry for
+    # Anchored session - the oracle presets the registry for
     # these claims before the call; the same claims yield
     # CONFLICT. (Snapshot rebuilt so the claims' snapshot
     # binding matches the bound snapshot.)
