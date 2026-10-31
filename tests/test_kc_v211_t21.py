@@ -86,7 +86,11 @@ def _bound_session(fx):
     B-03 fix: the session also authorizes fixture_doc_D2 and the
     snapshot carries a D2 entry, because the E4b entry test resolves
     a D1+D2 claim pair through the consumer's authorization and
-    snapshot context."""
+    snapshot context. Provenance-binding repair (2026-10-31):
+    the D2 passage itself is registered too — the D2
+    association (fixture_doc_D2, rev-1, P7) must anchor to a
+    digest-validated registered passage, not merely to a
+    snapshot entry and a recomputed digest."""
     session = _session(authorized_sources={"fixture_doc_D1",
                                            "fixture_doc_D2"})
     passage = build_routed_passage(
@@ -94,6 +98,11 @@ def _bound_session(fx):
         text=fx["passages"][0]["text"], player_uid=A, aliases=["测试甲"],
         title="fixture_doc_D1",
         authorized_url="fixture://authorized-copy/fixture_doc_D1")
+    passage_d2 = build_routed_passage(
+        source_id="fixture_doc_D2", revision="rev-1", locator="P7",
+        text="第二来源文本。", player_uid=A, aliases=["测试甲"],
+        title="fixture_doc_D2",
+        authorized_url="fixture://authorized-copy/fixture_doc_D2")
     probe = _session()
     probed = probe.consume_slice(
         fx["stats_records"], player_uid=A, season=SEASON,
@@ -107,11 +116,11 @@ def _bound_session(fx):
         {"entry_id": "entry-doc-D1", "sha256": passage["digest"],
          "authority": "canonical", "rights": "public",
          "source_id": "fixture_doc_D1"},
-        {"entry_id": "entry-doc-D2", "sha256": "e" * 64,
+        {"entry_id": "entry-doc-D2", "sha256": passage_d2["digest"],
          "authority": "canonical", "rights": "public",
          "source_id": "fixture_doc_D2"}]))
     session.bind_current(snap)
-    session.register_passages([passage])
+    session.register_passages([passage, passage_d2])
     binding = session.current_binding()
     chain = evidence_chain(
         receipt_id=binding["receipt_binding"],

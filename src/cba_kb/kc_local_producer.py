@@ -23,13 +23,35 @@ LOCAL ONLY, by construction:
 - Phase-2 questions (real connector readability, real P0, cross-
   account ACL) are NOT answered by this module; they remain
   NOT_VERIFIED and need their own authorizations and tests.
-- Q2-227-05 distinction: by default every passage is a synthetic
-  fixture declaration (authority "derived"). Only passages with a
-  caller-supplied formal_source_bindings record matching revision
-  and digest exactly become authority "canonical", and the
-  manifest, index and summary report the formal/synthetic split
-  per source plus whether the answer Fact itself is formally
-  sourced. A synthetic-only run never claims formal sourcing.
+- Provenance-binding distinction (Q2-227-05, superseded in form
+  by the Human-authorized 2026-10-31 provenance repair): by
+  default every passage is a synthetic fixture declaration
+  (authority "derived"). A passage becomes authority "canonical"
+  ONLY when it is bound to a separately supplied, validated
+  canonical registry + manifest pair: the registry must pass
+  canonical_registry validation (schema, authority, policy,
+  lineage, manifest resolution), the passage's source must match
+  a canonical route's artifact_key or file_id, the passage's
+  digest must recompute from its content, and it must equal the
+  manifest row's content_hash for that route. The old mechanism
+  — a caller dict of {revision, digest} taken from the passage
+  itself — was mutual consistency, not formal proof, and no
+  longer confers anything: a passage plus a self-made binding
+  pair is synthetic, never canonical. The manifest, index and
+  summary report the formal/synthetic split per source, the
+  registry release identity, and whether the answer Fact itself
+  is formally sourced. A synthetic-only run never claims formal
+  sourcing.
+- Residual risk, stated plainly: in this local scope the registry
+  pair itself is caller-supplied. The producer validates its
+  structure and checks passage digests against its manifest, but
+  it does NOT authenticate the registry release — a forged pair
+  with a different release_id would still validate. The formal
+  claim is therefore checkable out-of-band (compare the reported
+  registry_version / registry_release_id and route against the
+  published registry), not proven in-band. Authenticating the
+  published registry release is a Phase-2 readback item and
+  remains NOT_VERIFIED here.
 
 The snapshot is built from slice + passage entries only. Object
 visibility uses target-first filtering (target domain + APPROVED
@@ -43,12 +65,13 @@ import json
 import os
 from typing import Any, Dict, List
 
+from .canonical_registry import canonical_routes, manifest_index
 from .kc_consume import (
     ConsumeSession,
     _content_digest,
     identity_evidence_digest,
 )
-from .kc_passages import evidence_chain
+from .kc_passages import evidence_chain, validate_passage
 from .kc_projection import canonical_json, sha256_hex
 from .kc_snapshot import (
     build_fact_guarantee,
@@ -63,6 +86,31 @@ COMPETITION = "CBA"
 
 class KcLocalProducerError(RuntimeError):
     """Fail-closed local producer contract violation."""
+
+
+def _formal_routes(formal_registry: Any) -> Any:
+    """Validate a canonical registry + manifest pair and return
+    (registry, canonical routes, manifest index). The pair is a
+    SEPARATE artifact from the passages: it is validated whole
+    (schema, authority, policy, lineage, manifest resolution) and
+    read read-only — never derived from, or written from, the
+    passages being bound. Any validation failure is a build
+    failure, never a silent synthetic fallback."""
+    if not isinstance(formal_registry, dict):
+        raise KcLocalProducerError(
+            "LOCAL_PROJECTION_FORMAL_REGISTRY_MALFORMED")
+    registry = formal_registry.get("registry")
+    manifest = formal_registry.get("manifest")
+    if registry is None or manifest is None:
+        raise KcLocalProducerError(
+            "LOCAL_PROJECTION_FORMAL_REGISTRY_MALFORMED")
+    try:
+        routes = canonical_routes(registry, manifest)
+        index = manifest_index(manifest)
+    except ValueError as exc:
+        raise KcLocalProducerError(
+            "LOCAL_PROJECTION_FORMAL_REGISTRY_INVALID") from exc
+    return registry, routes, index
 
 
 def _snapshot_dict(snap: Any) -> Dict[str, Any]:
@@ -114,7 +162,7 @@ def build_local_projection(*, fixture: Dict[str, Any],
                            data_release: str = "SIMULATED_DATA_RELEASE_1",
                            engine_candidate: str = "SIMULATED_ENGINE_CANDIDATE_1",
                            build_code: str = "SIMULATED_BUILD_CODE_1",
-                           formal_source_bindings: Any = None
+                           formal_registry: Any = None
                            ) -> Dict[str, Any]:
     """Build one local materialisation from a fixture dict and write
     it to output_dir. Returns a summary including the snapshot id,
@@ -149,24 +197,38 @@ def build_local_projection(*, fixture: Dict[str, Any],
     if "payload" not in probed or probed["payload"].get("status") != "OK":
         raise KcLocalProducerError("LOCAL_PROJECTION_SLICE_NOT_OK")
     slice_digest = _content_digest(probed["payload"])
-    # Q2-227-05 repair (Human-authorized, 2026-10-31): formal
-    # and synthetic inputs are DISTINGUISHED, not merged. A
-    # passage is formally bound only when the caller supplies a
-    # formal source record for it (revision + digest, the same
-    # shape a canonical registry would carry) AND the passage
-    # matches that record exactly; anything else is a synthetic
-    # fixture declaration. A mismatch is a build failure, never a
-    # silent downgrade. Formally-bound entries carry
+    # Provenance-binding repair (Human-authorized, 2026-10-31):
+    # formal and synthetic inputs are DISTINGUISHED, not merged,
+    # and the formal binding is INDEPENDENT of the passage being
+    # bound. A passage is formally bound only when a separately
+    # supplied, validated canonical registry + manifest pair
+    # contains a canonical route for it (artifact_key or file_id
+    # equals the passage source) AND the passage's digest —
+    # recomputed from its content — equals the manifest row's
+    # content_hash for that route. A caller dict of {revision,
+    # digest} copied from the passage itself is mutual
+    # consistency, not proof, and no longer confers formal
+    # status at all. A route present with a mismatching hash, a
+    # passage whose digest does not recompute, or an invalid
+    # registry pair is a build failure, never a silent
+    # downgrade. Formally-bound entries carry
     # authority="canonical" (an existing allowed value); synthetic
     # entries keep authority="derived", and their rights are
     # fixture declarations, NOT authorization grants — the
-    # manifest, index and summary all say so explicitly. No
-    # self-declared fixture input is ever upgraded to a formal
-    # authorization proof by this producer.
-    bindings = formal_source_bindings or {}
-    if not isinstance(bindings, dict):
-        raise KcLocalProducerError(
-            "LOCAL_PROJECTION_FORMAL_BINDINGS_MALFORMED")
+    # manifest, index and summary all say so explicitly.
+    # Residual: the registry pair's release authenticity is NOT
+    # proven in-band (see module docstring); the reported
+    # release identity is what an out-of-band check compares.
+    formal_registry_info = None
+    routes: Dict[str, Any] = {}
+    row_index: Dict[str, Any] = {}
+    if formal_registry is not None:
+        registry, routes, row_index = _formal_routes(formal_registry)
+        formal_registry_info = {
+            "registry_version": registry.get("registry_version"),
+            "registry_release_id": registry.get("registry_release_id"),
+            "formal_routes": sorted(
+                {r["artifact_key"] for r in routes.values()})}
     formal_sources: List[str] = []
     synthetic_sources: List[str] = []
     entries = [{
@@ -175,11 +237,19 @@ def build_local_projection(*, fixture: Dict[str, Any],
         "sha256": slice_digest, "authority": "derived",
         "rights": "public", "source_id": "simulated-slice"}]
     for passage in passages:
-        binding = bindings.get(passage["source_id"])
-        if binding is not None:
-            if not isinstance(binding, dict) \
-                    or binding.get("revision") != passage["revision"] \
-                    or binding.get("digest") != passage["digest"]:
+        route = None
+        for candidate in routes.values():
+            if passage["source_id"] in (candidate["artifact_key"],
+                                        candidate["file_id"]):
+                route = candidate
+                break
+        if route is not None:
+            if validate_passage(passage)["valid"] is not True:
+                raise KcLocalProducerError(
+                    "LOCAL_PROJECTION_FORMAL_PASSAGE_DIGEST_INVALID")
+            row = row_index.get(route["artifact_key"])
+            if row is None \
+                    or row.get("content_hash") != passage["digest"]:
                 raise KcLocalProducerError(
                     "LOCAL_PROJECTION_FORMAL_BINDING_MISMATCH")
             authority = "canonical"
@@ -200,7 +270,8 @@ def build_local_projection(*, fixture: Dict[str, Any],
     input_provenance = {
         "mode": provenance_mode,
         "formal_sources": sorted(formal_sources),
-        "synthetic_sources": sorted(synthetic_sources)}
+        "synthetic_sources": sorted(synthetic_sources),
+        "formal_registry": formal_registry_info}
     snap = build_snapshot(
         entries=entries, target_domain=target_domain,
         capabilities=["stats", "identity", "document", "answer"],
@@ -384,6 +455,9 @@ def build_local_projection(*, fixture: Dict[str, Any],
         "synthetic-fixture sources: %s)"
         % (provenance_mode, ",".join(sorted(formal_sources)) or "-",
            ",".join(sorted(synthetic_sources)) or "-"),
+        "- formal registry release (out-of-band check identity; "
+        "the producer does NOT authenticate the release itself): %s"
+        % (formal_registry_info or "none"),
         "- synthetic entries' authority/rights are fixture "
         "declarations, NOT authorization grants.",
         "",

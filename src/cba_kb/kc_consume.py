@@ -901,10 +901,22 @@ class ConsumeSession:
         # standalone resolver call without context enforces the
         # formal fields only; that limitation is documented on the
         # resolver, and the consumer path always supplies context.
+        # Provenance-binding repair (Human-authorized, 2026-10-31):
+        # the resolver additionally receives this session's
+        # passage anchors — the (source, revision, locator)
+        # triples of passages that passed digest validation at
+        # registration. An association whose claimed passage was
+        # never registered is untrusted even when its digest
+        # recomputes: a recomputed digest proves content binding,
+        # not formal association identity.
+        passage_anchors = {
+            (p.get("source_id"), p.get("revision"), p.get("locator"))
+            for p in self._passages.values()}
         resolved = resolve_claims_by_event(
             claims, authorized_sources=self.authorized_sources,
             snapshot_sources=set(manifest.keys()),
-            snapshot_id=self._bound_snapshot_id)
+            snapshot_id=self._bound_snapshot_id,
+            passage_anchors=passage_anchors)
         refusals = []
         _PROVENANCE_EXCLUDED = frozenset({
             "source", "source_id", "digest", "locator", "revision",

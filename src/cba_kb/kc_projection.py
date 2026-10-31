@@ -345,12 +345,16 @@ def resolve_claims(claims: List[Dict[str, Any]]) -> Dict[str, Any]:
 #   64-hex string (e.g. a fixed "f"*64) is NOT a trusted
 #   association. This binds the digest to this claim and this
 #   snapshot instead of letting any formatted string stand in for
-#   an assertion. It does NOT prove the assertion against an
-#   event registry — no such registry exists in this data model,
-#   and building one would be a Truth Store, out of scope; the
-#   assertion form itself is what contract §3.1 allows, and the
-#   recomputation is what makes it checkable rather than
-#   self-declared.
+#   an assertion. The digest proves CONTENT BINDING only: it
+#   does NOT prove the association's formal identity, because
+#   anyone can recompute a digest over content they invented.
+#   Formal association identity requires the consumer path's
+#   passage anchoring (below). It does NOT prove the assertion
+#   against an event registry — no such registry exists in this
+#   data model, and building one would be a Truth Store, out of
+#   scope; the assertion form itself is what contract §3.1
+#   allows, and the recomputation is what makes it checkable
+#   rather than self-declared.
 # - When the consumer path supplies authorized_sources,
 #   snapshot_sources and snapshot_id, the association's source
 #   must additionally be a member of both sets and its
@@ -359,6 +363,18 @@ def resolve_claims(claims: List[Dict[str, Any]]) -> Dict[str, Any]:
 #   digest over the association's own snapshot_id (or none); that
 #   limitation is documented, and the consumer path always
 #   supplies context.
+# - Provenance-binding repair (Human-authorized, 2026-10-31):
+#   when the consumer path additionally supplies passage_anchors
+#   — the (source_id, revision, locator) triples of its
+#   digest-validated registered passages — an association is
+#   trusted only when its claimed source, revision and locator
+#   match one such anchor. A self-consistent digest over an
+#   unregistered source passage is content binding, not a formal
+#   association, and is untrusted. The anchors come from the
+#   consumer's passage registry (registration already enforces
+#   digest validity), so the resolver itself never re-validates
+#   passage digests; a standalone call without anchors proves
+#   binding only, never formal association identity.
 # - Trusted claims sharing (player_uid, event_ref) form one event
 #   group; differing normalized business values (date, text) inside
 #   one group are CONFLICT, with every participating claim listed.
@@ -405,7 +421,8 @@ def event_association_digest(claim: Dict[str, Any],
 def _event_association_valid(claim: Dict[str, Any], *,
                              authorized_sources=None,
                              snapshot_sources=None,
-                             snapshot_id=None) -> bool:
+                             snapshot_id=None,
+                             passage_anchors=None) -> bool:
     assoc = claim.get("event_association")
     if not isinstance(assoc, dict):
         return False
@@ -443,6 +460,12 @@ def _event_association_valid(claim: Dict[str, Any], *,
     if snapshot_id is not None \
             and assoc.get("snapshot_id") != snapshot_id:
         return False
+    if passage_anchors is not None \
+            and (source_id, revision, locator) not in passage_anchors:
+        # The claimed source passage is not a digest-validated
+        # registered passage: the digest binds content the caller
+        # invented, not a formal association. Untrusted.
+        return False
     try:
         expected = event_association_digest(claim, assoc)
     except (TypeError, ValueError):
@@ -459,12 +482,14 @@ def _claim_business_value(claim: Dict[str, Any]):
 def resolve_claims_by_event(claims: List[Dict[str, Any]], *,
                             authorized_sources=None,
                             snapshot_sources=None,
-                            snapshot_id=None) -> Dict[str, Any]:
+                            snapshot_id=None,
+                            passage_anchors=None) -> Dict[str, Any]:
     def _valid(claim: Dict[str, Any]) -> bool:
         return _event_association_valid(
             claim, authorized_sources=authorized_sources,
             snapshot_sources=snapshot_sources,
-            snapshot_id=snapshot_id)
+            snapshot_id=snapshot_id,
+            passage_anchors=passage_anchors)
 
     conflicting: set = set()
     unresolved: set = set()

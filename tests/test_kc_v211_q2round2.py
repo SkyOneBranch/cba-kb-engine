@@ -9,8 +9,11 @@ Falsification labelling (honest, per test):
 - Tests marked PIN pass on both old and new code; they document
   preserved positive capability and are NOT falsification evidence.
 - Tests marked NEW-CAPABILITY exercise a new seam (formal source
-  bindings); on the old HEAD they fail at the call boundary, which
-  is expected and is NOT claimed as business falsification.
+  binding, now via a validated canonical registry pair per the
+  2026-10-31 provenance-binding repair, which supersedes the
+  original caller-dict mechanism); on the old HEAD they fail at
+  the call boundary, which is expected and is NOT claimed as
+  business falsification.
 
 All fixtures are clean-room synthetic. All artifacts SIMULATED.
 No Drive, no real data, no P0 claim, no production claim.
@@ -351,16 +354,45 @@ def _eligible_fixture(fx):
             "source_objects": []}
 
 
+def _formal_registry_for(passage, content_hash=None):
+    # A validated canonical registry + manifest pair whose
+    # canonical route is the passage's own source and whose
+    # manifest row carries the passage's digest. This pair is a
+    # SEPARATE artifact from the passage: the producer validates
+    # it whole and checks the passage digest against its manifest
+    # row. (Provenance-binding repair, Human-authorized
+    # 2026-10-31: the previous caller {revision, digest} dict
+    # taken from the passage itself was mutual consistency, not
+    # formal proof, and no longer confers formal status.)
+    return {
+        "registry": {
+            "registry_version": "1",
+            "registry_release_id": "v-test-1",
+            "products": [{
+                "product_id": "doc_d1", "semantic_grain": "document",
+                "authority": "canonical",
+                "business_key": ["source_id"],
+                "artifact_key": "fixture_doc_D1",
+                "generated_from": [], "deprecated_by": None,
+                "read_policy": "canonical_only",
+                "current_eligible": True,
+                "independent_write_allowed": True}]},
+        "manifest": [{
+            "uid": "fixture_doc_D1", "drive_file_id": "file-D1",
+            "content_hash": passage["digest"]
+            if content_hash is None else content_hash}]}
+
+
 def test_q2r2_producer_formal_path(fx, tmp_path):
-    # NEW-CAPABILITY: with a matching formal source record, the
-    # passage is formally bound, the manifest says so, and the
-    # answer Fact is reported as formally sourced.
+    # NEW-CAPABILITY (mechanism replaced 2026-10-31 by the
+    # provenance-binding repair): with a validated canonical
+    # registry pair whose manifest row matches the passage
+    # digest, the passage is formally bound, the manifest says
+    # so, and the answer Fact is reported as formally sourced.
     passage = fx["passages"][0]
     out = build_local_projection(
         fixture=_eligible_fixture(fx), output_dir=str(tmp_path),
-        formal_source_bindings={
-            "fixture_doc_D1": {"revision": passage["revision"],
-                               "digest": passage["digest"]}})
+        formal_registry=_formal_registry_for(passage))
     assert verify_local_projection(str(tmp_path))["valid"] is True
     assert out["answer_fact_status"] == "OK"
     assert out["answer_fact_guaranteed"] is True
@@ -370,10 +402,12 @@ def test_q2r2_producer_formal_path(fx, tmp_path):
     assert manifest["input_provenance"]["formal_sources"] == \
         ["fixture_doc_D1"]
     assert manifest["answer_fact"]["formally_sourced"] is True
+    assert manifest["input_provenance"]["formal_registry"][
+        "registry_release_id"] == "v-test-1"
 
 
 def test_q2r2_producer_synthetic_path_labelled(fx, tmp_path):
-    # NEW-CAPABILITY: without formal records the same eligible
+    # NEW-CAPABILITY: without a registry pair the same eligible
     # run still works (sidecar coverage intact) but is labelled
     # synthetic-only and never claims formal sourcing.
     out = build_local_projection(
@@ -389,13 +423,12 @@ def test_q2r2_producer_synthetic_path_labelled(fx, tmp_path):
 
 
 def test_q2r2_producer_binding_mismatch_raises(fx, tmp_path):
-    # NEW-CAPABILITY: a formal record that does NOT match the
-    # passage is a fail-closed build failure, never a silent
-    # downgrade to synthetic.
+    # NEW-CAPABILITY: a registry route whose manifest row does
+    # NOT match the passage digest is a fail-closed build
+    # failure, never a silent downgrade to synthetic.
     passage = fx["passages"][0]
     with pytest.raises(KcLocalProducerError):
         build_local_projection(
             fixture=_eligible_fixture(fx), output_dir=str(tmp_path),
-            formal_source_bindings={
-                "fixture_doc_D1": {"revision": "rev-999",
-                                   "digest": passage["digest"]}})
+            formal_registry=_formal_registry_for(
+                passage, content_hash="0" * 64))
