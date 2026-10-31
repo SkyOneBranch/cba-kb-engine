@@ -36,7 +36,8 @@ import pytest
 from cba_kb.kc_cleanroom import A, B, QUOTE, SEASON, build_cleanroom_fixture
 from cba_kb.kc_consume import ConsumeSession, _content_digest
 from cba_kb.kc_passages import build_routed_passage, evidence_chain
-from cba_kb.kc_projection import build_passage, resolve_claims
+from cba_kb.kc_projection import (build_passage, canonical_json,
+                                  resolve_claims, sha256_hex)
 from cba_kb.kc_snapshot import build_snapshot
 
 PROVIDER = "CBA_OFFICIAL"
@@ -76,8 +77,13 @@ def _snapshot_kwargs(**over):
 def _bound_session(fx):
     """Session bound to a snapshot that actually contains the cited
     Document source and the justifying slice digest (same corrected
-    fixture pattern as the PR-B consume tests)."""
-    session = _session()
+    fixture pattern as the PR-B consume tests). Post-freeze Q2
+    B-03 fix: the session also authorizes fixture_doc_D2 and the
+    snapshot carries a D2 entry, because the E4b entry test resolves
+    a D1+D2 claim pair through the consumer's authorization and
+    snapshot context."""
+    session = _session(authorized_sources={"fixture_doc_D1",
+                                           "fixture_doc_D2"})
     passage = build_routed_passage(
         source_id="fixture_doc_D1", revision="rev-1", locator="P3",
         text=fx["passages"][0]["text"], player_uid=A, aliases=["测试甲"],
@@ -95,7 +101,10 @@ def _bound_session(fx):
          "source_id": "fixture_stats"},
         {"entry_id": "entry-doc-D1", "sha256": passage["digest"],
          "authority": "canonical", "rights": "public",
-         "source_id": "fixture_doc_D1"}]))
+         "source_id": "fixture_doc_D1"},
+        {"entry_id": "entry-doc-D2", "sha256": "e" * 64,
+         "authority": "canonical", "rights": "public",
+         "source_id": "fixture_doc_D2"}]))
     session.bind_current(snap)
     session.register_passages([passage])
     binding = session.current_binding()
@@ -145,15 +154,26 @@ def _event_resolver():
 
 
 def _identity_source():
+    # Post-freeze Q2 B-05 fix: the digest is recomputed from the
+    # claimed source, revision and this test session's target
+    # domain (the producer's digest rule), not an arbitrary 64-hex
+    # string — an arbitrary string is now correctly rejected.
     return {"source_id": "fixture_canonical_registry",
             "revision": "rev-1",
-            "digest": "b" * 64}
+            "digest": sha256_hex(canonical_json({
+                "source_id": "fixture_canonical_registry",
+                "revision": "rev-1", "target_domain": TARGET}))}
 
 
 def _e4b_claims():
+    # Post-freeze Q2 B-03 fix: the associations are FORMAL
+    # assertions (source_id bound to each claim's own source,
+    # revision, locator, digest), not bare event_ref + evidence
+    # declarations — bare declarations no longer prove association.
     assoc = {"event_ref": "fixture_event_E4b",
              "evidence": ["fixture_doc_D1:P3", "fixture_doc_D2:P7"],
-             "source_id": "fixture_doc_D1", "revision": "rev-1"}
+             "source_id": "fixture_doc_D1", "revision": "rev-1",
+             "locator": "P3", "digest": "d" * 64}
     return [
         {"claim_id": "t21_claim_D1", "player_uid": A, "date": "2026-03-10",
          "text": "事件发生在 2026-03-10", "source_id": "fixture_doc_D1",
@@ -162,7 +182,8 @@ def _e4b_claims():
         {"claim_id": "t21_claim_D2", "player_uid": A, "date": "2026-03-15",
          "text": "事件发生在 2026-03-15", "source_id": "fixture_doc_D2",
          "event_key": "fixture_event_E4b",
-         "event_association": dict(assoc, source_id="fixture_doc_D2")},
+         "event_association": dict(assoc, source_id="fixture_doc_D2",
+                                    locator="P7")},
     ]
 
 
@@ -204,9 +225,13 @@ def test_guarantee_binding_failures(fx):
 def test_answer_requires_guarantee_when_asked(fx):
     build, validate = _guarantee_fns()
     session, snap, passage, chain = _bound_session(fx)
+    # Post-freeze Q2 B-02 fix: the scope must cover EVERY output
+    # Fact field (fact_id, player_uid, season, team_id, kind,
+    # source); a partial scope no longer validates the Fact.
     guarantee = build(fact_id="t21_fact", fact_version="v1",
                       source_id="fixture_doc_D1", file_version="rev-1",
-                      field_scope=["player_uid", "season", "team_id"],
+                      field_scope=["fact_id", "player_uid", "season",
+                                   "team_id", "kind", "source"],
                       authorization_domain=TARGET,
                       snapshot_id=snap.snapshot_id)
     assert validate(guarantee, snapshot=snap)["valid"] is True
@@ -247,6 +272,12 @@ def test_answer_tampered_guarantee_means_unknown_fact_only(fx):
 def test_answer_default_does_not_require_guarantee(fx):
     # PIN (passes pre- and post-fix): the default entry path is
     # unchanged; only the opt-in required path enforces guarantees.
+    # B-01 RESIDUAL, deliberately not closed here: the default
+    # bypass remains, because making the gate mandatory by default
+    # would break main-baseline consume tests that assert Fact OK
+    # without a guarantee, and migrating those tests exceeds this
+    # repair's authorized scope. Closing it needs a Human decision
+    # on that migration.
     session, _snap, passage, chain = _bound_session(fx)
     out = _answer(session, fx, passage, chain, [])
     assert out["payload"]["grains"]["CANONICAL_FACT"].get("fact_id") \
@@ -262,7 +293,12 @@ def test_event_resolver_same_event_diff_date_conflict():
     assert out["conflicting_claim_ids"] == ["t21_claim_D1", "t21_claim_D2"]
 
 
-def test_event_resolver_different_refs_no_shared_evidence_ok():
+def test_event_resolver_different_refs_bare_declarations_unknown():
+    # Post-freeze Q2 B-03 correction: bare declarations (event_ref
+    # + evidence strings only, no formal source/revision/locator/
+    # digest binding) cannot prove that two refs are different
+    # events either — event identity invoked but unproven means
+    # UNKNOWN, not a proven-no-conflict OK.
     fn = _event_resolver()
     claims = [
         {"claim_id": "ev_a", "player_uid": A, "date": "2026-03-10",
@@ -275,7 +311,7 @@ def test_event_resolver_different_refs_no_shared_evidence_ok():
                                "evidence": ["src_B:P1"]}},
     ]
     out = fn(claims)
-    assert out["status"] == "OK"
+    assert out["status"] == "UNKNOWN"
     assert out["conflicting_claim_ids"] == []
 
 
@@ -309,22 +345,37 @@ def test_event_resolver_key_without_association_unknown():
 
 def test_event_resolver_three_claims_precise_members():
     fn = _event_resolver()
+    # Post-freeze Q2 B-03 fix: the association is formal (source
+    # bound to each claim's own source, revision, locator, digest)
+    # so the shared-ref group is trusted and the conflict lists
+    # exactly its members.
     assoc = {"event_ref": "event_T",
-             "evidence": ["src_T:P1"]}
+             "evidence": ["src_T:P1"], "source_id": "src_T",
+             "revision": "rev-1", "locator": "P1", "digest": "f" * 64}
     claims = [
         {"claim_id": "t_a1", "player_uid": A, "date": "2026-03-10",
-         "text": "同一说法", "event_association": dict(assoc)},
+         "text": "同一说法", "source_id": "src_T",
+         "event_association": dict(assoc)},
         {"claim_id": "t_a2", "player_uid": A, "date": "2026-03-10",
-         "text": "同一说法", "event_association": dict(assoc)},
+         "text": "同一说法", "source_id": "src_T",
+         "event_association": dict(assoc)},
         {"claim_id": "t_b", "player_uid": A, "date": "2026-03-15",
-         "text": "不同说法", "event_association": dict(assoc)},
+         "text": "不同说法", "source_id": "src_T",
+         "event_association": dict(assoc)},
     ]
     out = fn(claims)
     assert out["status"] == "CONFLICT"
     assert out["conflicting_claim_ids"] == ["t_a1", "t_a2", "t_b"]
 
 
-def test_event_resolver_legacy_same_date_still_conflict():
+def test_event_resolver_legacy_same_date_unknown():
+    # Post-freeze Q2 B-04 correction: the legacy (player_uid,
+    # date) heuristic must NOT decide CONFLICT. Differing texts
+    # inside a legacy group are undetermined (the grouping is only
+    # a candidate heuristic, and date itself may be the disputed
+    # field), so they are UNRESOLVED. The legacy resolve_claims()
+    # function itself is unchanged; only the new consumer-path
+    # resolver stops promoting the heuristic to a decision.
     fn = _event_resolver()
     out = fn([
         {"claim_id": "lg_1", "player_uid": A, "date": "2026-03-10",
@@ -332,8 +383,8 @@ def test_event_resolver_legacy_same_date_still_conflict():
         {"claim_id": "lg_2", "player_uid": A, "date": "2026-03-10",
          "text": "说法二"},
     ])
-    assert out["status"] == "CONFLICT"
-    assert out["conflicting_claim_ids"] == ["lg_1", "lg_2"]
+    assert out["status"] == "UNKNOWN"
+    assert out["conflicting_claim_ids"] == []
 
 
 def test_event_resolver_legacy_diff_date_no_event_fields_ok():

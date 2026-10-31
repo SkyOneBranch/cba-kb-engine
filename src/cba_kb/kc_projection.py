@@ -326,45 +326,97 @@ def resolve_claims(claims: List[Dict[str, Any]]) -> Dict[str, Any]:
 # resolve_claims() above is KEPT unchanged as the legacy heuristic:
 # it groups by (player_uid, date) and can neither find a same-event
 # conflict across different dates nor prove that different dates mean
-# different events. resolve_claims_by_event() is the new entry:
+# different events. resolve_claims_by_event() is the new entry,
+# strengthened by the post-freeze Q2 (2026-10-31) B-03/B-04 fixes:
 # - A claim carries a TRUSTED event association only when its
-#   event_association dict has a non-empty event_ref AND a non-empty
-#   evidence list. An event_key alone is a candidate index, never
-#   proof: it must not group claims, and it must not separate them.
+#   event_association dict is a FORMAL assertion: a non-empty
+#   event_ref, a non-empty evidence list, AND source_id, revision,
+#   locator and a 64-hex digest, with the association's source_id
+#   bound to this claim's source_id (and its player_uid, when
+#   present, bound to this claim's player_uid). Bare declarations
+#   (event_ref + evidence strings only) are NOT formal proof.
+#   An event_key alone is a candidate index, never proof: it must
+#   not group claims, and it must not separate them.
+# - When the consumer path supplies authorized_sources and
+#   snapshot_sources, the association's source must additionally
+#   be a member of both (binding to authorization scope and to
+#   the bound snapshot, per contract §3.1(2)). A standalone call
+#   without context enforces the formal fields only; that
+#   limitation is documented, and the consumer path always
+#   supplies context. The digest is format-checked, not
+#   recomputed against an event registry: no such registry exists
+#   in this data model, and building one would be a Truth Store,
+#   out of scope.
 # - Trusted claims sharing (player_uid, event_ref) form one event
 #   group; differing normalized business values (date, text) inside
 #   one group are CONFLICT, with every participating claim listed.
-# - Claims without a trusted association keep the legacy heuristic
-#   grouping by (player_uid, date), so pre-existing behaviour for
-#   unlabelled claims is unchanged.
+# - Claims without a trusted association NO LONGER decide CONFLICT
+#   through the legacy (player_uid, date) heuristic: differing
+#   texts inside a legacy group are UNRESOLVED (UNKNOWN), because
+#   date grouping is only a candidate heuristic and cannot prove
+#   event identity, especially when date itself is disputed
+#   (contract §3.1(6)). Unlabelled claims with identical values
+#   keep the legacy OK, and unlabelled pairs on different dates
+#   keep the legacy OK: the resolver does not invent UNKNOWN for
+#   every unlabelled pair, and that limitation is documented.
 # - When event identity is explicitly invoked (an event_key or an
 #   event_association is present) but the association is unproven, or
 #   when different event refs share evidence, and the business values
 #   differ, the result is UNKNOWN — never a proven-no-conflict OK.
-#   A single unlabelled pair with no event fields at all keeps the
-#   legacy OK: the resolver does not invent UNKNOWN for every
-#   unlabelled pair, and that limitation is documented, not hidden.
-def _event_association_valid(claim: Dict[str, Any]) -> bool:
+def _event_association_valid(claim: Dict[str, Any], *,
+                             authorized_sources=None,
+                             snapshot_sources=None) -> bool:
     assoc = claim.get("event_association")
     if not isinstance(assoc, dict):
         return False
     ref = assoc.get("event_ref")
     evidence = assoc.get("evidence")
-    return (isinstance(ref, str) and bool(ref)
+    if not (isinstance(ref, str) and bool(ref)
             and isinstance(evidence, list) and len(evidence) > 0
-            and all(isinstance(e, str) and bool(e) for e in evidence))
+            and all(isinstance(e, str) and bool(e) for e in evidence)):
+        return False
+    source_id = assoc.get("source_id")
+    revision = assoc.get("revision")
+    locator = assoc.get("locator")
+    digest = assoc.get("digest")
+    hexdigits = set("0123456789abcdef")
+    if not (isinstance(source_id, str) and bool(source_id)
+            and isinstance(revision, str) and bool(revision)
+            and isinstance(locator, str) and bool(locator)
+            and isinstance(digest, str) and len(digest) == 64
+            and all(ch in hexdigits for ch in digest)):
+        return False
+    if source_id != claim.get("source_id"):
+        return False
+    if "player_uid" in assoc \
+            and assoc.get("player_uid") != claim.get("player_uid"):
+        return False
+    if authorized_sources is not None \
+            and source_id not in authorized_sources:
+        return False
+    if snapshot_sources is not None \
+            and source_id not in snapshot_sources:
+        return False
+    return True
 
 
 def _claim_business_value(claim: Dict[str, Any]):
     return (claim.get("date"), claim.get("text"))
 
 
-def resolve_claims_by_event(claims: List[Dict[str, Any]]) -> Dict[str, Any]:
+def resolve_claims_by_event(claims: List[Dict[str, Any]], *,
+                            authorized_sources=None,
+                            snapshot_sources=None) -> Dict[str, Any]:
+    def _valid(claim: Dict[str, Any]) -> bool:
+        return _event_association_valid(
+            claim, authorized_sources=authorized_sources,
+            snapshot_sources=snapshot_sources)
+
     conflicting: set = set()
     unresolved: set = set()
     trusted: Dict[Any, List[Dict[str, Any]]] = {}
     for claim in claims:
-        if _event_association_valid(claim):
+        if _valid(claim):
             key = (claim.get("player_uid"),
                    claim["event_association"]["event_ref"])
             trusted.setdefault(key, []).append(claim)
@@ -375,14 +427,17 @@ def resolve_claims_by_event(claims: List[Dict[str, Any]]) -> Dict[str, Any]:
                                if m.get("claim_id") is not None)
     legacy: Dict[Any, List[Dict[str, Any]]] = {}
     for claim in claims:
-        if not _event_association_valid(claim):
+        if not _valid(claim):
             legacy.setdefault((claim.get("player_uid"),
                                claim.get("date")), []).append(claim)
     for members in legacy.values():
         texts = {m.get("text") for m in members}
         if len(texts) > 1:
-            conflicting.update(m.get("claim_id") for m in members
-                               if m.get("claim_id") is not None)
+            # Post-freeze Q2 B-04 fix: the legacy heuristic must
+            # NOT decide CONFLICT. Differing texts inside a legacy
+            # group are undetermined (the grouping is only a
+            # candidate heuristic), so they are UNRESOLVED.
+            unresolved.add("LEGACY_GROUPING_UNPROVEN")
     by_player: Dict[Any, List[Dict[str, Any]]] = {}
     for claim in claims:
         by_player.setdefault(claim.get("player_uid"), []).append(claim)
@@ -394,12 +449,11 @@ def resolve_claims_by_event(claims: List[Dict[str, Any]]) -> Dict[str, Any]:
             continue
         invoking = [m for m in members
                     if "event_key" in m or "event_association" in m]
-        if invoking and any(not _event_association_valid(m)
-                            for m in invoking):
+        if invoking and any(not _valid(m) for m in invoking):
             unresolved.add("EVENT_ASSOCIATION_UNPROVEN")
         evidence_by_ref: Dict[Any, set] = {}
         for member in members:
-            if _event_association_valid(member):
+            if _valid(member):
                 ref = member["event_association"]["event_ref"]
                 evidence_by_ref.setdefault(ref, set()).update(
                     member["event_association"]["evidence"])

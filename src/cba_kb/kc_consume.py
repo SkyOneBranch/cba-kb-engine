@@ -421,6 +421,17 @@ class ConsumeSession:
 
         if all_pages_received is not True:
             return unknown("PAGINATION_INCOMPLETE")
+        # Post-freeze Q2 B-05 fix: the caller's boolean alone does
+        # NOT prove pagination completeness. The supplied players
+        # and aliases must also cover the whole authorized player
+        # set; a page set that omits authorized players is
+        # unproven, even when the caller claims all pages arrived.
+        supplied_uids = set()
+        for entry in list(players) + list(aliases):
+            if isinstance(entry, dict) and entry.get("player_uid"):
+                supplied_uids.add(entry.get("player_uid"))
+        if not set(self.authorized_players) <= supplied_uids:
+            return unknown("IDENTITY_COVERAGE_INCOMPLETE")
         if not isinstance(identity_source, dict):
             return unknown("IDENTITY_EVIDENCE_NOT_BOUND")
         source_id = identity_source.get("source_id")
@@ -432,6 +443,20 @@ class ConsumeSession:
                 and isinstance(digest, str) and len(digest) == 64
                 and all(ch in hexdigits for ch in digest)):
             return unknown("IDENTITY_EVIDENCE_NOT_BOUND")
+        # Post-freeze Q2 B-05 fix: a merely well-formed 64-hex
+        # string is NOT evidence binding. The digest must be
+        # recomputable from the claimed source, revision and this
+        # session's target domain (the producer's existing digest
+        # rule, reused here). This proves the digest corresponds
+        # to the claimed triple; it does NOT prove the registry
+        # itself is authorized or real — full index verification
+        # still needs an index input this interface does not carry,
+        # so E4a remains HOLD for complete entry proof.
+        expected_digest = sha256_hex(canonical_json({
+            "source_id": source_id, "revision": revision,
+            "target_domain": self.target_domain}))
+        if digest != expected_digest:
+            return unknown("IDENTITY_EVIDENCE_DIGEST_MISMATCH")
         # Target-first: filter BEFORE any resolution, summary, or
         # candidate list is derived. Unauthorized entries never reach
         # the primitive, so they cannot leak through a candidate,
@@ -668,13 +693,33 @@ class ConsumeSession:
             and source_bound
             and slice_bound
         )
-        # v2.1.1 T2-1 (Issue #226) Δ-01: when the caller opts in, the
-        # Fact layer additionally requires a valid guarantee sidecar
-        # bound to THIS session's current snapshot and to the same
-        # fact_id. A missing, tampered, or mis-bound guarantee turns
-        # ONLY the Fact layer UNKNOWN; Stats and Document below are
-        # computed independently and are untouched. The default path
-        # (require_fact_guarantee=False) is unchanged.
+        # v2.1.1 T2-1 (Issue #226) Δ-01, strengthened by the
+        # post-freeze Q2 (2026-10-31) B-02 fix: when the caller opts
+        # in, the Fact layer requires a guarantee sidecar bound to
+        # THIS session's current snapshot AND to the ACTUAL output
+        # Fact: same fact_id, same source identifier, a field_scope
+        # covering every output Fact field, and — when the Fact's
+        # source is the cited passage's source — the same file
+        # version as that passage's revision. A sidecar that is
+        # merely self-consistent (valid digest, snapshot-bound
+        # source) but bound to another source, a partial scope, or
+        # a different file version does NOT validate the Fact.
+        # A missing, tampered, or mis-bound guarantee turns ONLY
+        # the Fact layer UNKNOWN; Stats and Document below are
+        # computed independently and are untouched.
+        # B-01 residual (NOT changed here): the default path
+        # (require_fact_guarantee=False) still does not run this
+        # gate, because making it mandatory by default would break
+        # main-baseline consume_answer tests that assert Fact OK
+        # without a guarantee, and migrating those tests exceeds
+        # this repair's authorized scope. Closing the default
+        # bypass needs a Human decision on that migration.
+        # fact_version limitation: Fact dicts in this codebase
+        # carry no version field, so the guarantee's fact_version
+        # cannot be compared against an actual Fact version with
+        # existing data (adding one would be a canonical schema
+        # change, D-class, not approved); when a Fact DOES carry
+        # fact_version, equality is enforced below.
         if fact_valid and require_fact_guarantee:
             guarantee_ok = False
             guarantee_reason = "FACT_GUARANTEE_MISSING_OR_INVALID"
@@ -685,12 +730,45 @@ class ConsumeSession:
                 if current is not None:
                     checked = validate_fact_guarantee(
                         fact_guarantee, snapshot=current)
-                    guarantee_ok = (
-                        checked["valid"] is True
-                        and fact_guarantee.get("fact_id")
-                        == fact.get("fact_id"))
-                    if checked["reason"] is not None:
+                    if checked["valid"] is not True:
                         guarantee_reason = checked["reason"]
+                    elif fact_guarantee.get("fact_id") \
+                            != fact.get("fact_id"):
+                        guarantee_reason = \
+                            "FACT_GUARANTEE_FACT_ID_MISMATCH"
+                    else:
+                        fact_source = fact.get("source_id") \
+                            or fact.get("source")
+                        scope = fact_guarantee.get("field_scope")
+                        if fact_source is None or \
+                                fact_guarantee.get("source_id") \
+                                != fact_source:
+                            guarantee_reason = \
+                                "FACT_GUARANTEE_SOURCE_MISMATCH"
+                        elif not isinstance(scope, list) \
+                                or not set(fact.keys()) \
+                                <= set(scope):
+                            guarantee_reason = \
+                                "FACT_GUARANTEE_SCOPE_INCOMPLETE"
+                        elif "fact_version" in fact and \
+                                fact_guarantee.get("fact_version") \
+                                != fact.get("fact_version"):
+                            guarantee_reason = \
+                                "FACT_GUARANTEE_VERSION_MISMATCH"
+                        elif isinstance(passage, dict) \
+                                and fact_source is not None \
+                                and fact_source == passage.get(
+                                    "source_id") \
+                                and isinstance(
+                                    passage.get("revision"), str) \
+                                and passage.get("revision") \
+                                and fact_guarantee.get(
+                                    "file_version") \
+                                != passage.get("revision"):
+                            guarantee_reason = \
+                                "FACT_GUARANTEE_FILE_VERSION_MISMATCH"
+                        else:
+                            guarantee_ok = True
             if not guarantee_ok:
                 fact_valid = False
                 self._last_diagnostic = {
@@ -719,7 +797,17 @@ class ConsumeSession:
         # digest, locator, revision, claim_id, fact_id, or kind is
         # not a merge attempt and is not refused. Genuine business
         # differences (player_uid, season, team_id, ...) still are.
-        resolved = resolve_claims_by_event(claims)
+        # Post-freeze Q2 B-03 fix: the event resolver receives this
+        # session's authorization and snapshot context, so a claim
+        # association is trusted only when its source is both
+        # authorized and a member of the bound snapshot (in
+        # addition to the resolver's formal-field checks). A
+        # standalone resolver call without context enforces the
+        # formal fields only; that limitation is documented on the
+        # resolver, and the consumer path always supplies context.
+        resolved = resolve_claims_by_event(
+            claims, authorized_sources=self.authorized_sources,
+            snapshot_sources=set(manifest.keys()))
         refusals = []
         _PROVENANCE_EXCLUDED = frozenset({
             "source", "source_id", "digest", "locator", "revision",

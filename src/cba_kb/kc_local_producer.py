@@ -10,9 +10,16 @@ LOCAL ONLY, by construction:
   consumer surface: slice, catalog, identity, citation, answer. It
   never renders raw primitives. A Fact whose source is not bound to
   the snapshot stays UNKNOWN in the sample answer — the producer
-  does not invent a binding for it. A valid guarantee sidecar for a
-  snapshot-bound producer fact is written separately (guarantee.json)
-  and re-validated by verify_local_projection().
+  does not invent a binding for it. A guarantee sidecar is written
+  separately (guarantee.json) and re-validated by
+  verify_local_projection(). When the fixture Fact declares an id
+  and a version and its source is a snapshot passage, the sidecar
+  is built from that Fact itself and the answer is consumed through
+  the guarantee gate, so the sidecar genuinely covers the answer's
+  Fact. Otherwise the answer's Fact stays UNKNOWN and
+  guarantee.json holds a separately-labelled sample sidecar for
+  verifier exercise only: it does NOT cover the answer's Fact, and
+  the summary, manifest and index all say so explicitly.
 - Phase-2 questions (real connector readability, real P0, cross-
   account ACL) are NOT answered by this module; they remain
   NOT_VERIFIED and need their own authorizations and tests.
@@ -184,24 +191,92 @@ def build_local_projection(*, fixture: Dict[str, Any],
     cited = session.consume_citation(
         passage=target_passage, source_text=target_passage["text"],
         chain=chain)
-    answer = session.consume_answer(
-        records=records, player_uid=first_player, season=season,
-        match_type="REGULAR", scope="WHOLE_SEASON",
-        provider=PROVIDER, competition=COMPETITION,
-        metric="points_per_game", fact=fact, passage=target_passage,
-        source_text=target_passage["text"], chain=chain, claims=claims)
-    guarantee = build_fact_guarantee(
-        fact_id="producer_fact", fact_version="v1",
-        source_id=target_passage["source_id"],
-        file_version=target_passage["revision"],
-        field_scope=["player_uid", "season"],
-        authorization_domain=target_domain,
-        snapshot_id=snap.snapshot_id,
-        source_digest=target_passage["digest"])
+    # Post-freeze Q2 B-06 fix: the guarantee must be wired to the
+    # ACTUAL answer Fact, never a fixed disconnected sidecar.
+    # Real path: when the fixture Fact declares an id AND a version
+    # AND its source is a snapshot passage, the guarantee is built
+    # from the Fact's own identifiers and field keys, and the
+    # answer is consumed THROUGH the guarantee gate
+    # (fact_guarantee + require_fact_guarantee=True), so a valid
+    # guarantee genuinely means this answer's Fact passed the gate.
+    # Fallback path: when the fixture Fact cannot be genuinely
+    # guaranteed (no declared version, or an unbound source — as
+    # with the clean-room fixture, whose source is an unbound URI),
+    # the producer does NOT invent identifiers. The answer is
+    # consumed without a guarantee (its Fact stays UNKNOWN, which
+    # is honest), and guarantee.json holds a SEPARATE sample
+    # sidecar that exists only to exercise the verifier. That
+    # sample sidecar is explicitly labelled as NOT covering the
+    # answer's Fact, in the summary, the manifest and the index,
+    # so guarantee_valid=True can never be misread as proof that
+    # the answer's Fact passed the gate.
+    fact_source = None
+    if isinstance(fact, dict):
+        fact_source = fact.get("source_id") or fact.get("source")
+    fact_passage = None
+    for passage in passages:
+        if passage.get("source_id") == fact_source:
+            fact_passage = passage
+            break
+    eligible = (isinstance(fact, dict)
+                and isinstance(fact.get("fact_id"), str)
+                and bool(fact.get("fact_id"))
+                and isinstance(fact.get("fact_version"), str)
+                and bool(fact.get("fact_version"))
+                and fact_passage is not None)
+    if eligible:
+        guarantee = build_fact_guarantee(
+            fact_id=fact["fact_id"],
+            fact_version=fact["fact_version"],
+            source_id=fact_source,
+            file_version=fact_passage["revision"],
+            field_scope=sorted(fact.keys()),
+            authorization_domain=target_domain,
+            snapshot_id=snap.snapshot_id,
+            source_digest=fact_passage["digest"])
+        answer = session.consume_answer(
+            records=records, player_uid=first_player, season=season,
+            match_type="REGULAR", scope="WHOLE_SEASON",
+            provider=PROVIDER, competition=COMPETITION,
+            metric="points_per_game", fact=fact,
+            passage=target_passage,
+            source_text=target_passage["text"], chain=chain,
+            claims=claims, fact_guarantee=guarantee,
+            require_fact_guarantee=True)
+        covers_answer_fact = True
+    else:
+        answer = session.consume_answer(
+            records=records, player_uid=first_player, season=season,
+            match_type="REGULAR", scope="WHOLE_SEASON",
+            provider=PROVIDER, competition=COMPETITION,
+            metric="points_per_game", fact=fact,
+            passage=target_passage,
+            source_text=target_passage["text"], chain=chain,
+            claims=claims)
+        guarantee = build_fact_guarantee(
+            fact_id="sample_producer_fact", fact_version="v1",
+            source_id=target_passage["source_id"],
+            file_version=target_passage["revision"],
+            field_scope=["player_uid", "season"],
+            authorization_domain=target_domain,
+            snapshot_id=snap.snapshot_id,
+            source_digest=target_passage["digest"])
+        covers_answer_fact = False
     guarantee_valid = validate_fact_guarantee(
         guarantee, snapshot=snap)["valid"] is True
     if not guarantee_valid:
         raise KcLocalProducerError("LOCAL_PROJECTION_GUARANTEE_INVALID")
+    fact_grain = answer["payload"]["grains"]["CANONICAL_FACT"]
+    answer_fact_id = fact.get("fact_id") \
+        if isinstance(fact, dict) else None
+    answer_fact_status = "UNKNOWN" \
+        if isinstance(fact_grain, dict) \
+        and fact_grain.get("status") == "UNKNOWN" else "OK"
+    answer_fact_guaranteed = bool(
+        covers_answer_fact and guarantee_valid
+        and isinstance(fact_grain, dict)
+        and fact_grain.get("fact_id") == answer_fact_id
+        and answer_fact_status == "OK")
     slice_json = session.render_verified(sliced, kind="slice_json")
     slice_md = session.render_verified(sliced, kind="slice_markdown")
     catalog_md = session.render_verified(catalog, kind="catalog")
@@ -233,8 +308,11 @@ def build_local_projection(*, fixture: Dict[str, Any],
         "- target_domain: %s" % target_domain,
         "- build_time: %s" % build_time,
         "- identity: %s %s" % (identity_status, identity_candidates),
-        "- answer CANONICAL_FACT status: %s"
-        % answer["payload"]["grains"]["CANONICAL_FACT"].get("status"),
+        "- answer CANONICAL_FACT status: %s" % answer_fact_status,
+        "- answer Fact guaranteed by its own guarantee: %s"
+        % answer_fact_guaranteed,
+        "- sample guarantee covers the answer Fact: %s"
+        % covers_answer_fact,
         "",
         "## Files",
         "",
@@ -265,8 +343,12 @@ def build_local_projection(*, fixture: Dict[str, Any],
         "drive_publication": False,
         "identity": {"status": identity_status,
                      "candidates": identity_candidates},
+        "answer_fact": {"fact_id": answer_fact_id,
+                        "status": answer_fact_status,
+                        "guaranteed": answer_fact_guaranteed},
         "guarantee": {"fact_id": guarantee["fact_id"],
-                      "valid": guarantee_valid},
+                      "valid": guarantee_valid,
+                      "covers_answer_fact": covers_answer_fact},
         "files": manifest_files,
     }
     manifest["manifest_sha256"] = sha256_hex(
@@ -283,8 +365,9 @@ def build_local_projection(*, fixture: Dict[str, Any],
         "identity": {"status": identity_status,
                      "candidates": identity_candidates},
         "guarantee_valid": guarantee_valid,
-        "answer_fact_status":
-            answer["payload"]["grains"]["CANONICAL_FACT"].get("status"),
+        "answer_fact_id": answer_fact_id,
+        "answer_fact_status": answer_fact_status,
+        "answer_fact_guaranteed": answer_fact_guaranteed,
     }
 
 
