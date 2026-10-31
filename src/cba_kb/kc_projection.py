@@ -327,26 +327,38 @@ def resolve_claims(claims: List[Dict[str, Any]]) -> Dict[str, Any]:
 # it groups by (player_uid, date) and can neither find a same-event
 # conflict across different dates nor prove that different dates mean
 # different events. resolve_claims_by_event() is the new entry,
-# strengthened by the post-freeze Q2 (2026-10-31) B-03/B-04 fixes:
+# strengthened by the post-freeze Q2 (2026-10-31) B-03/B-04 fixes and
+# by the Human-authorized Q2-227-02/03 repair (2026-10-31):
 # - A claim carries a TRUSTED event association only when its
 #   event_association dict is a FORMAL assertion: a non-empty
 #   event_ref, a non-empty evidence list, AND source_id, revision,
-#   locator and a 64-hex digest, with the association's source_id
-#   bound to this claim's source_id (and its player_uid, when
-#   present, bound to this claim's player_uid). Bare declarations
-#   (event_ref + evidence strings only) are NOT formal proof.
-#   An event_key alone is a candidate index, never proof: it must
-#   not group claims, and it must not separate them.
-# - When the consumer path supplies authorized_sources and
-#   snapshot_sources, the association's source must additionally
-#   be a member of both (binding to authorization scope and to
-#   the bound snapshot, per contract §3.1(2)). A standalone call
-#   without context enforces the formal fields only; that
+#   locator and a digest, with the association's source_id bound
+#   to this claim's source_id and its player_uid bound to this
+#   claim's player_uid. Bare declarations (event_ref + evidence
+#   strings only) are NOT formal proof. An event_key alone is a
+#   candidate index, never proof: it must not group claims, and it
+#   must not separate them.
+# - The digest is NO LONGER format-only: it must equal
+#   event_association_digest() recomputed over the bound content
+#   (claim_id, player_uid, source_id, revision, locator,
+#   event_ref, evidence, snapshot_id). A merely well-formed
+#   64-hex string (e.g. a fixed "f"*64) is NOT a trusted
+#   association. This binds the digest to this claim and this
+#   snapshot instead of letting any formatted string stand in for
+#   an assertion. It does NOT prove the assertion against an
+#   event registry — no such registry exists in this data model,
+#   and building one would be a Truth Store, out of scope; the
+#   assertion form itself is what contract §3.1 allows, and the
+#   recomputation is what makes it checkable rather than
+#   self-declared.
+# - When the consumer path supplies authorized_sources,
+#   snapshot_sources and snapshot_id, the association's source
+#   must additionally be a member of both sets and its
+#   snapshot_id must equal the bound snapshot (contract §3.1(2)).
+#   A standalone call without context enforces the recomputed
+#   digest over the association's own snapshot_id (or none); that
 #   limitation is documented, and the consumer path always
-#   supplies context. The digest is format-checked, not
-#   recomputed against an event registry: no such registry exists
-#   in this data model, and building one would be a Truth Store,
-#   out of scope.
+#   supplies context.
 # - Trusted claims sharing (player_uid, event_ref) form one event
 #   group; differing normalized business values (date, text) inside
 #   one group are CONFLICT, with every participating claim listed.
@@ -356,16 +368,44 @@ def resolve_claims(claims: List[Dict[str, Any]]) -> Dict[str, Any]:
 #   date grouping is only a candidate heuristic and cannot prove
 #   event identity, especially when date itself is disputed
 #   (contract §3.1(6)). Unlabelled claims with identical values
-#   keep the legacy OK, and unlabelled pairs on different dates
-#   keep the legacy OK: the resolver does not invent UNKNOWN for
-#   every unlabelled pair, and that limitation is documented.
+#   keep the legacy OK.
+# - Q2-227-03 repair: unlabelled pairs on DIFFERENT dates NO
+#   LONGER keep the legacy OK either. Differing business values
+#   for one player where any claim lacks a trusted association
+#   are UNRESOLVED (EVENT_RELATIONSHIP_UNPROVEN): absence of a
+#   proven link is not proof of no conflict. A proven-no-conflict
+#   OK now requires positive evidence — identical values, or
+#   every claim trusted under pairwise-distinct event refs.
+#   Single claims and identical-value groups are unaffected.
 # - When event identity is explicitly invoked (an event_key or an
 #   event_association is present) but the association is unproven, or
 #   when different event refs share evidence, and the business values
 #   differ, the result is UNKNOWN — never a proven-no-conflict OK.
+def event_association_digest(claim: Dict[str, Any],
+                             assoc: Dict[str, Any]) -> str:
+    """Recomputable binding digest for a formal event association:
+    SHA-256 over the canonical JSON of exactly the content the
+    association claims to bind — this claim's id and player, the
+    association's source, revision, locator, event ref and
+    evidence, and the snapshot the association claims. Any change
+    to the bound content changes the digest, so a digest cannot be
+    replayed onto a different claim, event, or snapshot."""
+    return sha256_hex(canonical_json({
+        "claim_id": claim.get("claim_id"),
+        "player_uid": claim.get("player_uid"),
+        "source_id": assoc.get("source_id"),
+        "revision": assoc.get("revision"),
+        "locator": assoc.get("locator"),
+        "event_ref": assoc.get("event_ref"),
+        "evidence": assoc.get("evidence"),
+        "snapshot_id": assoc.get("snapshot_id"),
+    }))
+
+
 def _event_association_valid(claim: Dict[str, Any], *,
                              authorized_sources=None,
-                             snapshot_sources=None) -> bool:
+                             snapshot_sources=None,
+                             snapshot_id=None) -> bool:
     assoc = claim.get("event_association")
     if not isinstance(assoc, dict):
         return False
@@ -388,7 +428,10 @@ def _event_association_valid(claim: Dict[str, Any], *,
         return False
     if source_id != claim.get("source_id"):
         return False
-    if "player_uid" in assoc \
+    # Q2-227-02: the UID binding is mandatory, not conditional on
+    # the association happening to carry it. A claim with a player
+    # UID is trusted only under an association bound to that UID.
+    if claim.get("player_uid") is not None \
             and assoc.get("player_uid") != claim.get("player_uid"):
         return False
     if authorized_sources is not None \
@@ -396,6 +439,15 @@ def _event_association_valid(claim: Dict[str, Any], *,
         return False
     if snapshot_sources is not None \
             and source_id not in snapshot_sources:
+        return False
+    if snapshot_id is not None \
+            and assoc.get("snapshot_id") != snapshot_id:
+        return False
+    try:
+        expected = event_association_digest(claim, assoc)
+    except (TypeError, ValueError):
+        return False
+    if digest != expected:
         return False
     return True
 
@@ -406,11 +458,13 @@ def _claim_business_value(claim: Dict[str, Any]):
 
 def resolve_claims_by_event(claims: List[Dict[str, Any]], *,
                             authorized_sources=None,
-                            snapshot_sources=None) -> Dict[str, Any]:
+                            snapshot_sources=None,
+                            snapshot_id=None) -> Dict[str, Any]:
     def _valid(claim: Dict[str, Any]) -> bool:
         return _event_association_valid(
             claim, authorized_sources=authorized_sources,
-            snapshot_sources=snapshot_sources)
+            snapshot_sources=snapshot_sources,
+            snapshot_id=snapshot_id)
 
     conflicting: set = set()
     unresolved: set = set()
@@ -451,6 +505,15 @@ def resolve_claims_by_event(claims: List[Dict[str, Any]], *,
                     if "event_key" in m or "event_association" in m]
         if invoking and any(not _valid(m) for m in invoking):
             unresolved.add("EVENT_ASSOCIATION_UNPROVEN")
+        # Q2-227-03: differing business values with ANY claim
+        # lacking a trusted association cannot be proven to be
+        # about different events. No event fields at all is the
+        # sharpest case: the old code returned a proven-no-conflict
+        # OK here. Undetermined is UNKNOWN, not OK; a proven OK
+        # still stands when every claim is trusted under distinct
+        # event refs (no unresolved marker is added then).
+        if any(not _valid(m) for m in members):
+            unresolved.add("EVENT_RELATIONSHIP_UNPROVEN")
         evidence_by_ref: Dict[Any, set] = {}
         for member in members:
             if _valid(member):

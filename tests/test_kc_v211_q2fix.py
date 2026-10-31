@@ -255,20 +255,27 @@ def test_q2fix_claim_bare_different_refs_unknown():
 
 # ------------------------------------------------------- B-05: Identity
 
-def _identity_source_real():
+def _identity_source_real(players, aliases):
+    # Q2-227-04 correction: the digest covers the claimed triple
+    # AND the actual submitted players and aliases (the consumer
+    # entry's rule), computed over the lists actually passed.
+    from cba_kb.kc_consume import identity_evidence_digest
     return {"source_id": "fixture_canonical_registry",
             "revision": "rev-1",
-            "digest": sha256_hex(canonical_json({
-                "source_id": "fixture_canonical_registry",
-                "revision": "rev-1", "target_domain": TARGET}))}
+            "digest": identity_evidence_digest(
+                source_id="fixture_canonical_registry",
+                revision="rev-1", target_domain=TARGET,
+                players=players, aliases=aliases)}
 
 
 def _identity(session, fx, **kw):
     call = dict(players=fx["players"], aliases=fx["aliases"],
                 query="测试甲", query_kind="alias",
-                identity_source=_identity_source_real(),
                 all_pages_received=True)
     call.update(kw)
+    if "identity_source" not in kw:
+        call["identity_source"] = _identity_source_real(
+            call["players"], call["aliases"])
     return session.consume_identity(**call)
 
 

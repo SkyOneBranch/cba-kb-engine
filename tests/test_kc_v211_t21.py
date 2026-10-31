@@ -19,6 +19,11 @@ Falsification labelling (honest, per group):
 - PIN tests pass on both old and new code; they document
   no-false-refusal / backward-compatibility behaviour and are NOT
   falsification evidence.
+- 2026-10-31 Q2-227 test-hygiene correction: the getattr
+  presence checks in the _guarantee_fns / _event_resolver /
+  _identity / _producer helpers were removed — a missing
+  attribute now surfaces as an error, never as falsification
+  evidence. Old-SHA falsification below is behavioral only.
 
 All fixtures are clean-room synthetic. All artifacts SIMULATED.
 No Drive, no real data, no P0 claim, no production claim.
@@ -135,56 +140,73 @@ def _answer(session, fx, passage, chain, claims, fact=None, **kw):
 
 
 def _guarantee_fns():
+    # Q2-227 test-hygiene correction (2026-10-31): no
+    # INTERFACE-DELTA presence claim is used as falsification
+    # evidence. These functions exist on the current HEAD; a
+    # missing attribute surfaces as an AttributeError, not as a
+    # business-semantic failure, and no test below counts it as
+    # one.
     mod = importlib.import_module("cba_kb.kc_snapshot")
-    build = getattr(mod, "build_fact_guarantee", None)
-    validate = getattr(mod, "validate_fact_guarantee", None)
-    assert build is not None and validate is not None, (
-        "Fact guarantee sidecar missing on baseline HEAD "
-        "(INTERFACE-DELTA: new surface, not yet built)")
-    return build, validate
+    return mod.build_fact_guarantee, mod.validate_fact_guarantee
 
 
 def _event_resolver():
+    # Same test-hygiene correction as _guarantee_fns: direct
+    # attribute access, no presence-as-falsification claim.
     mod = importlib.import_module("cba_kb.kc_projection")
-    fn = getattr(mod, "resolve_claims_by_event", None)
-    assert fn is not None, (
-        "Event-aware claim resolver missing on baseline HEAD "
-        "(INTERFACE-DELTA: new surface, not yet built)")
-    return fn
+    return mod.resolve_claims_by_event
 
 
-def _identity_source():
-    # Post-freeze Q2 B-05 fix: the digest is recomputed from the
-    # claimed source, revision and this test session's target
-    # domain (the producer's digest rule), not an arbitrary 64-hex
-    # string — an arbitrary string is now correctly rejected.
+def _association_digest():
+    mod = importlib.import_module("cba_kb.kc_projection")
+    return mod.event_association_digest
+
+
+def _identity_source(players, aliases):
+    # Q2-227-04 correction: the digest is recomputed from the
+    # claimed source, revision, target domain AND the actual
+    # submitted players and aliases (the consumer entry's rule),
+    # not from the triple alone and not from an arbitrary 64-hex
+    # string — a digest for one payload cannot be replayed onto
+    # different identity content.
+    from cba_kb.kc_consume import identity_evidence_digest
     return {"source_id": "fixture_canonical_registry",
             "revision": "rev-1",
-            "digest": sha256_hex(canonical_json({
-                "source_id": "fixture_canonical_registry",
-                "revision": "rev-1", "target_domain": TARGET}))}
+            "digest": identity_evidence_digest(
+                source_id="fixture_canonical_registry",
+                revision="rev-1", target_domain=TARGET,
+                players=players, aliases=aliases)}
 
 
-def _e4b_claims():
-    # Post-freeze Q2 B-03 fix: the associations are FORMAL
-    # assertions (source_id bound to each claim's own source,
-    # revision, locator, digest), not bare event_ref + evidence
-    # declarations — bare declarations no longer prove association.
-    assoc = {"event_ref": "fixture_event_E4b",
-             "evidence": ["fixture_doc_D1:P3", "fixture_doc_D2:P7"],
-             "source_id": "fixture_doc_D1", "revision": "rev-1",
-             "locator": "P3", "digest": "d" * 64}
-    return [
+def _e4b_claims(snapshot_id=None):
+    # Post-freeze Q2 B-03 fix, completed by the Q2-227-02 repair:
+    # the associations are FORMAL assertions bound to each
+    # claim's own source, revision, locator, player UID and
+    # snapshot, with a digest RECOMPUTED over that bound content
+    # — not a fixed hex string, and not a bare event_ref +
+    # evidence declaration.
+    digest_of = _association_digest()
+    base = {"event_ref": "fixture_event_E4b",
+            "evidence": ["fixture_doc_D1:P3", "fixture_doc_D2:P7"],
+            "revision": "rev-1"}
+    claims = [
         {"claim_id": "t21_claim_D1", "player_uid": A, "date": "2026-03-10",
          "text": "事件发生在 2026-03-10", "source_id": "fixture_doc_D1",
          "event_key": "fixture_event_E4b",
-         "event_association": dict(assoc)},
+         "event_association": dict(
+             base, source_id="fixture_doc_D1", locator="P3",
+             player_uid=A, snapshot_id=snapshot_id)},
         {"claim_id": "t21_claim_D2", "player_uid": A, "date": "2026-03-15",
          "text": "事件发生在 2026-03-15", "source_id": "fixture_doc_D2",
          "event_key": "fixture_event_E4b",
-         "event_association": dict(assoc, source_id="fixture_doc_D2",
-                                    locator="P7")},
+         "event_association": dict(
+             base, source_id="fixture_doc_D2", locator="P7",
+             player_uid=A, snapshot_id=snapshot_id)},
     ]
+    for claim in claims:
+        claim["event_association"]["digest"] = digest_of(
+            claim, claim["event_association"])
+    return claims
 
 
 # ------------------------------------------------------- A: Fact guarantee
@@ -226,17 +248,22 @@ def test_answer_requires_guarantee_when_asked(fx):
     build, validate = _guarantee_fns()
     session, snap, passage, chain = _bound_session(fx)
     # Post-freeze Q2 B-02 fix: the scope must cover EVERY output
-    # Fact field (fact_id, player_uid, season, team_id, kind,
-    # source); a partial scope no longer validates the Fact.
+    # Fact field; Q2-227-01 repair: the Fact itself must carry
+    # the version the sidecar claims, and the sidecar must carry
+    # the snapshot-bound source digest — a version-less Fact or
+    # a digest-less sidecar no longer passes the gate.
+    fact = dict(_fact(), fact_version="v1")
     guarantee = build(fact_id="t21_fact", fact_version="v1",
                       source_id="fixture_doc_D1", file_version="rev-1",
                       field_scope=["fact_id", "player_uid", "season",
-                                   "team_id", "kind", "source"],
+                                   "team_id", "kind", "source",
+                                   "fact_version"],
                       authorization_domain=TARGET,
-                      snapshot_id=snap.snapshot_id)
+                      snapshot_id=snap.snapshot_id,
+                      source_digest=passage["digest"])
     assert validate(guarantee, snapshot=snap)["valid"] is True
     with_guarantee = _answer(session, fx, passage, chain, [],
-                             fact_guarantee=guarantee)
+                             fact=fact, fact_guarantee=guarantee)
     grains = with_guarantee["payload"]["grains"]
     assert grains["CANONICAL_FACT"].get("fact_id") == "t21_fact"
     # B-01 fix: the gate is unconditional now; the no-guarantee
@@ -347,24 +374,31 @@ def test_event_resolver_key_without_association_unknown():
 
 def test_event_resolver_three_claims_precise_members():
     fn = _event_resolver()
-    # Post-freeze Q2 B-03 fix: the association is formal (source
-    # bound to each claim's own source, revision, locator, digest)
-    # so the shared-ref group is trusted and the conflict lists
-    # exactly its members.
-    assoc = {"event_ref": "event_T",
-             "evidence": ["src_T:P1"], "source_id": "src_T",
-             "revision": "rev-1", "locator": "P1", "digest": "f" * 64}
+    digest_of = _association_digest()
+    # Q2-227-02 correction: the association is formal (source
+    # bound to each claim's own source, revision, locator, UID)
+    # AND its digest is recomputed over that bound content per
+    # claim — the old fixed "f"*64 string was exactly the
+    # format-only defect, so it cannot remain the fixture for a
+    # trusted group. The shared-ref group is trusted and the
+    # conflict lists exactly its members.
+    base = {"event_ref": "event_T",
+            "evidence": ["src_T:P1"], "source_id": "src_T",
+            "revision": "rev-1", "locator": "P1", "player_uid": A}
     claims = [
         {"claim_id": "t_a1", "player_uid": A, "date": "2026-03-10",
          "text": "同一说法", "source_id": "src_T",
-         "event_association": dict(assoc)},
+         "event_association": dict(base)},
         {"claim_id": "t_a2", "player_uid": A, "date": "2026-03-10",
          "text": "同一说法", "source_id": "src_T",
-         "event_association": dict(assoc)},
+         "event_association": dict(base)},
         {"claim_id": "t_b", "player_uid": A, "date": "2026-03-15",
          "text": "不同说法", "source_id": "src_T",
-         "event_association": dict(assoc)},
+         "event_association": dict(base)},
     ]
+    for claim in claims:
+        claim["event_association"]["digest"] = digest_of(
+            claim, claim["event_association"])
     out = fn(claims)
     assert out["status"] == "CONFLICT"
     assert out["conflicting_claim_ids"] == ["t_a1", "t_a2", "t_b"]
@@ -389,11 +423,14 @@ def test_event_resolver_legacy_same_date_unknown():
     assert out["conflicting_claim_ids"] == []
 
 
-def test_event_resolver_legacy_diff_date_no_event_fields_ok():
-    # PIN (documented limitation, passes pre- and post-fix): with no
-    # event fields at all, the old heuristic cannot prove a same-event
-    # link, and the event-aware resolver preserves the legacy OK
-    # rather than inventing an UNKNOWN for every unlabelled pair.
+def test_event_resolver_legacy_diff_date_no_event_fields_unknown():
+    # Q2-227-03 correction (BEHAVIORAL red-first): with no event
+    # fields at all and differing business values, the old
+    # legacy OK was itself the defect — absence of a proven link
+    # is not proof of no conflict, so the result is UNKNOWN, not
+    # a proven-no-conflict OK. This test's old OK expectation is
+    # superseded, not preserved. (Identical values and
+    # single-claim inputs still keep OK.)
     fn = _event_resolver()
     out = fn([
         {"claim_id": "lg_1", "player_uid": A, "date": "2026-03-10",
@@ -401,14 +438,18 @@ def test_event_resolver_legacy_diff_date_no_event_fields_ok():
         {"claim_id": "lg_2", "player_uid": A, "date": "2026-03-15",
          "text": "说法二"},
     ])
-    assert out["status"] == "OK"
+    assert out["status"] == "UNKNOWN"
+    assert out["conflicting_claim_ids"] == []
 
 
 def test_answer_event_conflict_via_entry(fx):
     # BEHAVIORAL: baseline consume_answer resolves these as OK
     # (different dates, different groups) — the miss itself.
+    # Q2-227-02: the consumer path binds associations to the
+    # bound snapshot, so the fixture carries that snapshot id.
     session, _snap, passage, chain = _bound_session(fx)
-    out = _answer(session, fx, passage, chain, _e4b_claims())
+    out = _answer(session, fx, passage, chain,
+                  _e4b_claims(snapshot_id=_snap.snapshot_id))
     layer = out["payload"]["claim_layer"]
     assert layer["status"] == "CONFLICT"
     assert layer["conflicting_claim_ids"] == ["t21_claim_D1", "t21_claim_D2"]
@@ -445,15 +486,20 @@ def test_answer_business_diff_still_refused(fx):
 # ------------------------------------------------------- C: Identity entry
 
 def _identity(session, fx, **kw):
-    fn = getattr(session, "consume_identity", None)
-    assert fn is not None, (
-        "ConsumeSession.consume_identity missing on baseline HEAD "
-        "(INTERFACE-DELTA: new entry, not yet built)")
+    # Test-hygiene correction: direct method access, no
+    # presence-as-falsification claim. The identity digest is
+    # computed over the ACTUAL players/aliases being passed
+    # (after kw overrides), unless the caller explicitly supplies
+    # its own identity_source — otherwise a subset-players test
+    # would fail on digest mismatch instead of on coverage.
+    fn = session.consume_identity
     call = dict(players=fx["players"], aliases=fx["aliases"],
                 query="测试甲", query_kind="alias",
-                identity_source=_identity_source(),
                 all_pages_received=True)
     call.update(kw)
+    if "identity_source" not in kw:
+        call["identity_source"] = _identity_source(
+            call["players"], call["aliases"])
     return fn(**call)
 
 
@@ -525,13 +571,10 @@ def test_identity_alias_for_unauthorized_player_not_resolved(fx):
 # ------------------------------------------------------- D: Local producer
 
 def _producer():
+    # Test-hygiene correction: direct attribute access, no
+    # presence-as-falsification claim (see _guarantee_fns).
     mod = importlib.import_module("cba_kb.kc_local_producer")
-    build = getattr(mod, "build_local_projection", None)
-    verify = getattr(mod, "verify_local_projection", None)
-    assert build is not None and verify is not None, (
-        "Local producer missing on baseline HEAD "
-        "(INTERFACE-DELTA: new surface, not yet built)")
-    return build, verify
+    return mod.build_local_projection, mod.verify_local_projection
 
 
 def test_local_producer_builds_and_verifies(fx, tmp_path):

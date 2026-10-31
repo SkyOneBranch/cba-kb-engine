@@ -23,6 +23,13 @@ LOCAL ONLY, by construction:
 - Phase-2 questions (real connector readability, real P0, cross-
   account ACL) are NOT answered by this module; they remain
   NOT_VERIFIED and need their own authorizations and tests.
+- Q2-227-05 distinction: by default every passage is a synthetic
+  fixture declaration (authority "derived"). Only passages with a
+  caller-supplied formal_source_bindings record matching revision
+  and digest exactly become authority "canonical", and the
+  manifest, index and summary report the formal/synthetic split
+  per source plus whether the answer Fact itself is formally
+  sourced. A synthetic-only run never claims formal sourcing.
 
 The snapshot is built from slice + passage entries only. Object
 visibility uses target-first filtering (target domain + APPROVED
@@ -36,7 +43,11 @@ import json
 import os
 from typing import Any, Dict, List
 
-from .kc_consume import ConsumeSession, _content_digest
+from .kc_consume import (
+    ConsumeSession,
+    _content_digest,
+    identity_evidence_digest,
+)
 from .kc_passages import evidence_chain
 from .kc_projection import canonical_json, sha256_hex
 from .kc_snapshot import (
@@ -82,15 +93,18 @@ def _snapshot_dict(snap: Any) -> Dict[str, Any]:
     }
 
 
-def _identity_digest(target_domain: str) -> str:
-    """Synthetic identity-evidence digest for the local sample: the
-    digest of the canonical JSON describing the identity source
-    (source_id, revision, target domain). It binds the identity
-    evidence to a version string; it is NOT a Drive readback and
-    proves nothing about a real registry."""
-    return sha256_hex(canonical_json({
-        "source_id": "fixture_canonical_registry",
-        "revision": "rev-1", "target_domain": target_domain}))
+def _identity_digest(target_domain: str, players: List[Dict[str, Any]],
+                     aliases: List[Dict[str, Any]]) -> str:
+    """Identity-evidence digest for the local sample, computed by
+    the SAME rule the consumer entry enforces
+    (identity_evidence_digest): the claimed source triple AND the
+    actual submitted players and aliases. A digest for one
+    identity payload cannot be replayed onto different content.
+    It is NOT a Drive readback and proves nothing about a real
+    registry or about the completeness of a formal index."""
+    return identity_evidence_digest(
+        source_id="fixture_canonical_registry", revision="rev-1",
+        target_domain=target_domain, players=players, aliases=aliases)
 
 
 def build_local_projection(*, fixture: Dict[str, Any],
@@ -99,7 +113,8 @@ def build_local_projection(*, fixture: Dict[str, Any],
                            build_time: str = "2026-10-30T00:00:00+00:00",
                            data_release: str = "SIMULATED_DATA_RELEASE_1",
                            engine_candidate: str = "SIMULATED_ENGINE_CANDIDATE_1",
-                           build_code: str = "SIMULATED_BUILD_CODE_1"
+                           build_code: str = "SIMULATED_BUILD_CODE_1",
+                           formal_source_bindings: Any = None
                            ) -> Dict[str, Any]:
     """Build one local materialisation from a fixture dict and write
     it to output_dir. Returns a summary including the snapshot id,
@@ -134,16 +149,58 @@ def build_local_projection(*, fixture: Dict[str, Any],
     if "payload" not in probed or probed["payload"].get("status") != "OK":
         raise KcLocalProducerError("LOCAL_PROJECTION_SLICE_NOT_OK")
     slice_digest = _content_digest(probed["payload"])
+    # Q2-227-05 repair (Human-authorized, 2026-10-31): formal
+    # and synthetic inputs are DISTINGUISHED, not merged. A
+    # passage is formally bound only when the caller supplies a
+    # formal source record for it (revision + digest, the same
+    # shape a canonical registry would carry) AND the passage
+    # matches that record exactly; anything else is a synthetic
+    # fixture declaration. A mismatch is a build failure, never a
+    # silent downgrade. Formally-bound entries carry
+    # authority="canonical" (an existing allowed value); synthetic
+    # entries keep authority="derived", and their rights are
+    # fixture declarations, NOT authorization grants — the
+    # manifest, index and summary all say so explicitly. No
+    # self-declared fixture input is ever upgraded to a formal
+    # authorization proof by this producer.
+    bindings = formal_source_bindings or {}
+    if not isinstance(bindings, dict):
+        raise KcLocalProducerError(
+            "LOCAL_PROJECTION_FORMAL_BINDINGS_MALFORMED")
+    formal_sources: List[str] = []
+    synthetic_sources: List[str] = []
     entries = [{
         "entry_id": "slice:%s|%s|REGULAR|WHOLE_SEASON"
         % (first_player, season),
         "sha256": slice_digest, "authority": "derived",
         "rights": "public", "source_id": "simulated-slice"}]
     for passage in passages:
+        binding = bindings.get(passage["source_id"])
+        if binding is not None:
+            if not isinstance(binding, dict) \
+                    or binding.get("revision") != passage["revision"] \
+                    or binding.get("digest") != passage["digest"]:
+                raise KcLocalProducerError(
+                    "LOCAL_PROJECTION_FORMAL_BINDING_MISMATCH")
+            authority = "canonical"
+            formal_sources.append(passage["source_id"])
+        else:
+            authority = "derived"
+            synthetic_sources.append(passage["source_id"])
         entries.append({
             "entry_id": "passage:" + passage["source_id"],
-            "sha256": passage["digest"], "authority": "derived",
+            "sha256": passage["digest"], "authority": authority,
             "rights": "public", "source_id": passage["source_id"]})
+    if formal_sources and synthetic_sources:
+        provenance_mode = "mixed"
+    elif formal_sources:
+        provenance_mode = "formal"
+    else:
+        provenance_mode = "synthetic-only"
+    input_provenance = {
+        "mode": provenance_mode,
+        "formal_sources": sorted(formal_sources),
+        "synthetic_sources": sorted(synthetic_sources)}
     snap = build_snapshot(
         entries=entries, target_domain=target_domain,
         capabilities=["stats", "identity", "document", "answer"],
@@ -168,7 +225,8 @@ def build_local_projection(*, fixture: Dict[str, Any],
             identity_source={
                 "source_id": "fixture_canonical_registry",
                 "revision": "rev-1",
-                "digest": _identity_digest(target_domain)},
+                "digest": _identity_digest(target_domain, players,
+                                           aliases)},
             all_pages_received=True)
     else:
         identity = {"status": "UNKNOWN", "grain": "IDENTITY",
@@ -276,6 +334,14 @@ def build_local_projection(*, fixture: Dict[str, Any],
         and isinstance(fact_grain, dict)
         and fact_grain.get("fact_id") == answer_fact_id
         and answer_fact_status == "OK")
+    # Q2-227-05: sidecar coverage (the guarantee genuinely covers
+    # this answer's Fact) is NOT formal-source coverage. The
+    # answer Fact is formally sourced only when its source
+    # passage was formally bound above; a synthetic-only run
+    # never reports formal sourcing, however valid its sidecar.
+    answer_fact_formally_sourced = bool(
+        covers_answer_fact and answer_fact_status == "OK"
+        and fact_source in formal_sources)
     slice_json = session.render_verified(sliced, kind="slice_json")
     slice_md = session.render_verified(sliced, kind="slice_markdown")
     catalog_md = session.render_verified(catalog, kind="catalog")
@@ -312,6 +378,14 @@ def build_local_projection(*, fixture: Dict[str, Any],
         % answer_fact_guaranteed,
         "- sample guarantee covers the answer Fact: %s"
         % covers_answer_fact,
+        "- answer Fact formally sourced (formal source binding): %s"
+        % answer_fact_formally_sourced,
+        "- input provenance mode: %s (formal sources: %s; "
+        "synthetic-fixture sources: %s)"
+        % (provenance_mode, ",".join(sorted(formal_sources)) or "-",
+           ",".join(sorted(synthetic_sources)) or "-"),
+        "- synthetic entries' authority/rights are fixture "
+        "declarations, NOT authorization grants.",
         "",
         "## Files",
         "",
@@ -344,10 +418,13 @@ def build_local_projection(*, fixture: Dict[str, Any],
                      "candidates": identity_candidates},
         "answer_fact": {"fact_id": answer_fact_id,
                         "status": answer_fact_status,
-                        "guaranteed": answer_fact_guaranteed},
+                        "guaranteed": answer_fact_guaranteed,
+                        "formally_sourced":
+                            answer_fact_formally_sourced},
         "guarantee": {"fact_id": guarantee["fact_id"],
                       "valid": guarantee_valid,
                       "covers_answer_fact": covers_answer_fact},
+        "input_provenance": input_provenance,
         "files": manifest_files,
     }
     manifest["manifest_sha256"] = sha256_hex(
@@ -367,6 +444,8 @@ def build_local_projection(*, fixture: Dict[str, Any],
         "answer_fact_id": answer_fact_id,
         "answer_fact_status": answer_fact_status,
         "answer_fact_guaranteed": answer_fact_guaranteed,
+        "answer_fact_formally_sourced": answer_fact_formally_sourced,
+        "input_provenance": input_provenance,
     }
 
 

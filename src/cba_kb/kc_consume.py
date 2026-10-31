@@ -185,6 +185,30 @@ def _content_digest(payload: Dict[str, Any]) -> str:
     return sha256_hex(canonical_json(_jsonable(payload)))
 
 
+def identity_evidence_digest(*, source_id: str, revision: str,
+                             target_domain: str,
+                             players: List[Dict[str, Any]],
+                             aliases: List[Dict[str, Any]]) -> str:
+    """Recomputable binding digest for identity evidence: SHA-256
+    over the canonical JSON of the claimed source triple AND the
+    actual submitted identity content (players and aliases, sorted
+    by their canonical bytes so list order cannot change the
+    digest). A digest computed for one identity payload cannot be
+    replayed onto different players, aliases, or approval content:
+    any content change changes the digest. This binds the digest
+    to the submitted page content; it does NOT prove the submitted
+    set is the complete formal index — that completeness still
+    needs a formal index input this interface does not carry, so
+    E4a remains HOLD for complete-entry proof."""
+    def _sorted(entries: List[Any]) -> List[Any]:
+        return sorted(entries, key=lambda e: canonical_json(_jsonable(e)))
+
+    return sha256_hex(canonical_json({
+        "source_id": source_id, "revision": revision,
+        "target_domain": target_domain,
+        "players": _sorted(players), "aliases": _sorted(aliases)}))
+
+
 class ConsumeSession:
     """One controlled consumption session — one target domain, three
     authorized sets (players, sources, objects), one store-owned
@@ -443,18 +467,26 @@ class ConsumeSession:
                 and isinstance(digest, str) and len(digest) == 64
                 and all(ch in hexdigits for ch in digest)):
             return unknown("IDENTITY_EVIDENCE_NOT_BOUND")
-        # Post-freeze Q2 B-05 fix: a merely well-formed 64-hex
-        # string is NOT evidence binding. The digest must be
-        # recomputable from the claimed source, revision and this
-        # session's target domain (the producer's existing digest
-        # rule, reused here). This proves the digest corresponds
-        # to the claimed triple; it does NOT prove the registry
-        # itself is authorized or real — full index verification
-        # still needs an index input this interface does not carry,
-        # so E4a remains HOLD for complete entry proof.
-        expected_digest = sha256_hex(canonical_json({
-            "source_id": source_id, "revision": revision,
-            "target_domain": self.target_domain}))
+        # Q2-227-04 repair (Human-authorized, 2026-10-31): a
+        # merely well-formed 64-hex string is NOT evidence
+        # binding, and neither is a digest recomputed from the
+        # claimed triple alone — the old rule let one digest cover
+        # any player/alias content under the same source, revision
+        # and domain. The digest must now be recomputable from the
+        # triple AND the actual submitted players and aliases
+        # (identity_evidence_digest, shared with the producer).
+        # This proves the digest corresponds to this submitted
+        # page content; it does NOT prove the submitted set is
+        # the complete formal index — full index verification
+        # still needs an index input this interface does not
+        # carry, so E4a remains HOLD for complete-entry proof.
+        try:
+            expected_digest = identity_evidence_digest(
+                source_id=source_id, revision=revision,
+                target_domain=self.target_domain,
+                players=players, aliases=aliases)
+        except (TypeError, ValueError):
+            return unknown("IDENTITY_EVIDENCE_DIGEST_MISMATCH")
         if digest != expected_digest:
             return unknown("IDENTITY_EVIDENCE_DIGEST_MISMATCH")
         # Target-first: filter BEFORE any resolution, summary, or
@@ -713,15 +745,38 @@ class ConsumeSession:
         # guarantee turns ONLY the Fact layer UNKNOWN; Stats and
         # Document below are computed independently and are
         # untouched (contract §2.1(5)).
-        # fact_version limitation: Fact dicts in this codebase
-        # carry no version field, so the guarantee's fact_version
-        # cannot be compared against an actual Fact version with
-        # existing data (adding one would be a canonical schema
-        # change, D-class, not approved); when a Fact DOES carry
-        # fact_version, equality is enforced below. The sidecar's
-        # version is digest-bound and snapshot-bound by
-        # validate_fact_guarantee, but it is sidecar-declared,
-        # not Fact-corroborated, for version-less Facts.
+        # Q2-227-01 repair (Human-authorized, 2026-10-31):
+        # validate_fact_guarantee() alone is only sidecar
+        # self-consistency (digest, snapshot membership, domain);
+        # it is NOT authorization, and the gate below adds the
+        # authoritative binding the contract §2.1 requires. Three
+        # gaps the post-freeze Q2 exposed are closed here, reusing
+        # only existing machinery (the bound snapshot's entry
+        # digests, the session's registered passages, the cited
+        # passage):
+        # - source_digest is REQUIRED and must be a digest of the
+        #   bound snapshot for the guarantee's source. A digest
+        #   of None used to pass the validator; it can no longer
+        #   authorize a Fact.
+        # - fact_version is REQUIRED on the Fact and must equal
+        #   the guarantee's. The Fact version field already
+        #   exists in this data model (the producer's real path
+        #   requires it); a version-less Fact is legacy and stays
+        #   UNKNOWN per §2.1(6) — no schema change is made, and
+        #   no version is invented for it.
+        # - file_version must be corroborated by an actual
+        #   passage object carrying the guarantee's source_digest
+        #   (the cited passage, or a passage registered in this
+        #   session): the passage's revision must equal the
+        #   file_version. The old code checked this only when
+        #   the Fact's source happened to equal the cited
+        #   passage's source, so a cross-source Fact could carry
+        #   any declared file_version. A passage digest binds
+        #   {source_id, revision, locator, text} (validate_passage
+        #   recomputes it), so a matching digest plus a matching
+        #   revision is real version evidence, not a declaration.
+        #   If no passage corroborates the file_version, the Fact
+        #   is UNKNOWN — the gate never upgrades a declaration.
         if fact_valid:
             guarantee_ok = False
             guarantee_reason = "FACT_GUARANTEE_MISSING_OR_INVALID"
@@ -752,25 +807,64 @@ class ConsumeSession:
                                 <= set(scope):
                             guarantee_reason = \
                                 "FACT_GUARANTEE_SCOPE_INCOMPLETE"
-                        elif "fact_version" in fact and \
-                                fact_guarantee.get("fact_version") \
+                        elif not isinstance(
+                                fact.get("fact_version"), str) \
+                                or not fact.get("fact_version") \
+                                or fact_guarantee.get("fact_version") \
                                 != fact.get("fact_version"):
                             guarantee_reason = \
                                 "FACT_GUARANTEE_VERSION_MISMATCH"
-                        elif isinstance(passage, dict) \
-                                and fact_source is not None \
-                                and fact_source == passage.get(
-                                    "source_id") \
-                                and isinstance(
-                                    passage.get("revision"), str) \
-                                and passage.get("revision") \
-                                and fact_guarantee.get(
-                                    "file_version") \
-                                != passage.get("revision"):
+                        elif not isinstance(
+                                fact_guarantee.get("source_digest"),
+                                str) \
+                                or not fact_guarantee.get(
+                                    "source_digest"):
                             guarantee_reason = \
-                                "FACT_GUARANTEE_FILE_VERSION_MISMATCH"
+                                "FACT_GUARANTEE_SOURCE_DIGEST_MISSING"
                         else:
-                            guarantee_ok = True
+                            digest = fact_guarantee.get(
+                                "source_digest")
+                            file_version = fact_guarantee.get(
+                                "file_version")
+                            corroborated = False
+                            if isinstance(passage, dict) \
+                                    and passage.get("digest") \
+                                    == digest \
+                                    and passage.get("source_id") \
+                                    == fact_source \
+                                    and passage.get("revision") \
+                                    == file_version:
+                                # The cited passage corroborates
+                                # only if its own digest
+                                # recomputes from {source_id,
+                                # revision, locator, text}:
+                                # a dict merely CLAIMING the entry
+                                # digest with a different revision
+                                # or text proves nothing.
+                                try:
+                                    cited_ok = validate_passage(
+                                        passage)["valid"] is True
+                                except (KeyError, TypeError,
+                                        ValueError):
+                                    cited_ok = False
+                                corroborated = cited_ok
+                            if not corroborated:
+                                registered = self._passages.get(
+                                    digest)
+                                if isinstance(registered, dict) \
+                                        and registered.get(
+                                            "source_id") \
+                                        == fact_source \
+                                        and registered.get(
+                                            "revision") \
+                                        == file_version:
+                                    corroborated = True
+                            if not corroborated:
+                                guarantee_reason = (
+                                    "FACT_GUARANTEE_FILE_VERSION_"
+                                    "UNCORROBORATED")
+                            else:
+                                guarantee_ok = True
             if not guarantee_ok:
                 fact_valid = False
                 self._last_diagnostic = {
@@ -809,7 +903,8 @@ class ConsumeSession:
         # resolver, and the consumer path always supplies context.
         resolved = resolve_claims_by_event(
             claims, authorized_sources=self.authorized_sources,
-            snapshot_sources=set(manifest.keys()))
+            snapshot_sources=set(manifest.keys()),
+            snapshot_id=self._bound_snapshot_id)
         refusals = []
         _PROVENANCE_EXCLUDED = frozenset({
             "source", "source_id", "digest", "locator", "revision",

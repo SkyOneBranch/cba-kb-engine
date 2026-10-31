@@ -433,8 +433,12 @@ def test_entry_answer_claim_conflict_keeps_fact(fx):
     # keeps every other field (including team_id) identical, so the
     # byte-identity, team_id, and claim-separation properties below
     # are preserved, not weakened; the unmodified fixture Fact is
-    # asserted untouched at the end.
-    bound_fact = dict(fx["fact"], source="fixture_doc_D1")
+    # asserted untouched at the end. Q2-227-01 migration
+    # (Human-authorized, 2026-10-31): the bound Fact also
+    # carries fact_version="v1", which the guarantee gate
+    # enforces — fixture-only addition, no assertion changed.
+    bound_fact = dict(fx["fact"], source="fixture_doc_D1",
+                      fact_version="v1")
     fact_before = copy.deepcopy(bound_fact)
     conflicting_claim = {
         "claim_id": "fixture_claim_ATTACK", "player_uid": A,
@@ -826,18 +830,23 @@ def test_directed_answer_renders_end_to_end(fx):
 def _bound_fact(fx):
     """The positive answer Fact with a snapshot-bound authorized
     source (see the contract correction on
-    test_entry_answer_claim_conflict_keeps_fact)."""
-    return dict(fx["fact"], source="fixture_doc_D1")
+    test_entry_answer_claim_conflict_keeps_fact). Q2-227-01
+    migration (Human-authorized, 2026-10-31): the Fact now
+    carries fact_version="v1", which the guarantee gate enforces
+    against the sidecar — a version-less Fact is legacy and stays
+    UNKNOWN per §2.1(6). Fixture-only change; no assertion below
+    is deleted or changed."""
+    return dict(fx["fact"], source="fixture_doc_D1",
+                fact_version="v1")
 
 
 def _bound_guarantee(snap, passage, fact):
     """Valid guarantee fixture for a snapshot-bound Fact (B-01
-    migration, Human option (a), 2026-10-31): built from the Fact's
-    own identifiers and full field keys, so the migrated tests'
-    Fact-OK assertions are preserved, not weakened — no assertion
-    is deleted or changed. The guarantee's version is
-    sidecar-declared (Facts carry no version field; see the B-02
-    residual note in kc_consume)."""
+    migration, Human option (a), 2026-10-31; version binding
+    completed by the Q2-227-01 repair, 2026-10-31): built from the
+    Fact's own identifiers, its own fact_version, and full field
+    keys, so the migrated tests' Fact-OK assertions are preserved,
+    not weakened — no assertion is deleted or changed."""
     return build_fact_guarantee(
         fact_id=fact["fact_id"], fact_version="v1",
         source_id=fact["source"], file_version=passage["revision"],

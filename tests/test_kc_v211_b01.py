@@ -144,8 +144,12 @@ def test_b01_default_no_guarantee_fact_unknown(fx):
 
 def test_b01_default_valid_guarantee_fact_ok(fx):
     # PIN: a genuinely valid guarantee on the default path passes.
+    # Q2-227-01 correction (2026-10-31): the positive path now
+    # requires a VERSIONED Fact — a version-less Fact is legacy
+    # and stays UNKNOWN per §2.1(6), so the old version-less
+    # positive expectation was itself the defect, not a PIN.
     session, snap, passage, chain = _bound_session(fx)
-    fact = _fact()
+    fact = _fact(fact_version="v1")
     out = _answer(session, fx, passage, chain, fact,
                   fact_guarantee=_guarantee(snap, passage, fact))
     grains = out["payload"]["grains"]
