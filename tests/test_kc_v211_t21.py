@@ -236,12 +236,13 @@ def test_answer_requires_guarantee_when_asked(fx):
                       snapshot_id=snap.snapshot_id)
     assert validate(guarantee, snapshot=snap)["valid"] is True
     with_guarantee = _answer(session, fx, passage, chain, [],
-                             fact_guarantee=guarantee,
-                             require_fact_guarantee=True)
+                             fact_guarantee=guarantee)
     grains = with_guarantee["payload"]["grains"]
     assert grains["CANONICAL_FACT"].get("fact_id") == "t21_fact"
-    without = _answer(session, fx, passage, chain, [],
-                      require_fact_guarantee=True)
+    # B-01 fix: the gate is unconditional now; the no-guarantee
+    # call below passes no kwargs at all (the old opt-in kwarg is
+    # removed) and still yields Fact UNKNOWN.
+    without = _answer(session, fx, passage, chain, [])
     grains = without["payload"]["grains"]
     assert grains["CANONICAL_FACT"]["status"] == "UNKNOWN"
     assert grains["CANONICAL_FACT"].get("fact_id") is None
@@ -262,26 +263,27 @@ def test_answer_tampered_guarantee_means_unknown_fact_only(fx):
                       snapshot_id=snap.snapshot_id)
     tampered = dict(guarantee, file_version="rev-999")
     out = _answer(session, fx, passage, chain, [],
-                  fact_guarantee=tampered, require_fact_guarantee=True)
+                  fact_guarantee=tampered)
     grains = out["payload"]["grains"]
     assert grains["CANONICAL_FACT"]["status"] == "UNKNOWN"
     assert grains["STATS"]["status"] == "OK"
     assert grains["DOCUMENT"]["status"] == "OK"
 
 
-def test_answer_default_does_not_require_guarantee(fx):
-    # PIN (passes pre- and post-fix): the default entry path is
-    # unchanged; only the opt-in required path enforces guarantees.
-    # B-01 RESIDUAL, deliberately not closed here: the default
-    # bypass remains, because making the gate mandatory by default
-    # would break main-baseline consume tests that assert Fact OK
-    # without a guarantee, and migrating those tests exceeds this
-    # repair's authorized scope. Closing it needs a Human decision
-    # on that migration.
+def test_answer_default_requires_guarantee(fx):
+    # B-01 fix (Human option (a), 2026-10-31): this test's old
+    # expectation — default path returns Fact OK without a
+    # guarantee — WAS the B-01 defect itself, so it is superseded,
+    # not preserved. The default path now enforces the gate: no
+    # guarantee means Fact UNKNOWN, with Stats and Document
+    # untouched (contract §2.1(5)).
     session, _snap, passage, chain = _bound_session(fx)
     out = _answer(session, fx, passage, chain, [])
-    assert out["payload"]["grains"]["CANONICAL_FACT"].get("fact_id") \
-        == "t21_fact"
+    grains = out["payload"]["grains"]
+    assert grains["CANONICAL_FACT"]["status"] == "UNKNOWN"
+    assert grains["CANONICAL_FACT"].get("fact_id") is None
+    assert grains["STATS"]["status"] == "OK"
+    assert grains["DOCUMENT"]["status"] == "OK"
 
 
 # ------------------------------------------------------- B: Claim events

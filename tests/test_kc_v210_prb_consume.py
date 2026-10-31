@@ -48,7 +48,7 @@ from cba_kb.kc_cleanroom import (
     build_cleanroom_fixture,
 )
 from cba_kb.kc_current import KcCurrentError, SimulatedCurrentStore
-from cba_kb.kc_snapshot import build_snapshot
+from cba_kb.kc_snapshot import build_fact_guarantee, build_snapshot
 from cba_kb.kc_passages import build_routed_passage, cite_verbatim
 from cba_kb.kc_projection import build_passage
 from cba_kb.kc_slices import build_slice
@@ -446,7 +446,8 @@ def test_entry_answer_claim_conflict_keeps_fact(fx):
         match_type="REGULAR", scope="WHOLE_SEASON",
         provider=PROVIDER, competition=COMPETITION,
         metric="points_per_game", fact=bound_fact, passage=passage,
-        source_text=QUOTE, chain=chain, claims=[conflicting_claim])
+        source_text=QUOTE, chain=chain, claims=[conflicting_claim],
+        fact_guarantee=_bound_guarantee(snap, passage, bound_fact))
     payload = out["payload"]
     # Authoritative layers byte-identical to their inputs.
     assert payload["grains"]["CANONICAL_FACT"] == fact_before
@@ -829,6 +830,22 @@ def _bound_fact(fx):
     return dict(fx["fact"], source="fixture_doc_D1")
 
 
+def _bound_guarantee(snap, passage, fact):
+    """Valid guarantee fixture for a snapshot-bound Fact (B-01
+    migration, Human option (a), 2026-10-31): built from the Fact's
+    own identifiers and full field keys, so the migrated tests'
+    Fact-OK assertions are preserved, not weakened — no assertion
+    is deleted or changed. The guarantee's version is
+    sidecar-declared (Facts carry no version field; see the B-02
+    residual note in kc_consume)."""
+    return build_fact_guarantee(
+        fact_id=fact["fact_id"], fact_version="v1",
+        source_id=fact["source"], file_version=passage["revision"],
+        field_scope=sorted(fact.keys()),
+        authorization_domain=TARGET, snapshot_id=snap.snapshot_id,
+        source_digest=passage["digest"])
+
+
 def test_directed2_answer_rejects_fabricated_source(fx):
     mod = _entry_or_fail()
     session, snap, passage, chain = _bound_session(mod, fx)
@@ -945,9 +962,11 @@ def test_directed2_render_refuses_revoked_answer_source(fx):
 def test_directed2_render_refuses_revoked_answer_player(fx):
     mod = _entry_or_fail()
     session, snap, passage, chain = _bound_session(mod, fx)
+    fact = _bound_fact(fx)
     out = session.consume_answer(
         **_answer_args(mod, fx, session, snap, passage, chain,
-                       _bound_fact(fx), []))
+                       fact, []),
+        fact_guarantee=_bound_guarantee(snap, passage, fact))
     assert out["payload"]["grains"]["CANONICAL_FACT"]["player_uid"] == A
     session.authorized_players.discard(A)
     with pytest.raises(mod.KcConsumeError):
@@ -1026,9 +1045,11 @@ def test_directed3_answer_refuses_revoked_player_stats_ok_fact_ok(fx):
     # the Fact branch refuses with ARTIFACT_PLAYER_NOT_AUTHORIZED.)
     mod = _entry_or_fail()
     session, snap, passage, chain = _bound_session(mod, fx)
+    fact = _bound_fact(fx)
     out = session.consume_answer(
         **_answer_args(mod, fx, session, snap, passage, chain,
-                       _bound_fact(fx), []))
+                       fact, []),
+        fact_guarantee=_bound_guarantee(snap, passage, fact))
     grains = out["payload"]["grains"]
     assert grains["CANONICAL_FACT"]["player_uid"] == A
     assert grains["DOCUMENT"]["status"] == "OK"

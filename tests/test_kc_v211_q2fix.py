@@ -161,7 +161,7 @@ def test_q2fix_fact_partial_scope_unknown(fx):
     assert validate_fact_guarantee(guarantee, snapshot=snap)["valid"] \
         is True  # sidecar self-consistency alone still holds
     out = _answer(session, fx, passage, chain, [],
-                  fact_guarantee=guarantee, require_fact_guarantee=True)
+                  fact_guarantee=guarantee)
     assert out["payload"]["grains"]["CANONICAL_FACT"].get("status") \
         == "UNKNOWN"
     assert out["payload"]["grains"]["STATS"]["status"] == "OK"
@@ -175,7 +175,7 @@ def test_q2fix_fact_wrong_source_unknown(fx):
     assert validate_fact_guarantee(guarantee, snapshot=snap)["valid"] \
         is True  # fixture_stats IS in the snapshot; binding is the gap
     out = _answer(session, fx, passage, chain, [],
-                  fact_guarantee=guarantee, require_fact_guarantee=True)
+                  fact_guarantee=guarantee)
     assert out["payload"]["grains"]["CANONICAL_FACT"].get("status") \
         == "UNKNOWN"
 
@@ -190,7 +190,7 @@ def test_q2fix_fact_wrong_file_version_unknown(fx):
     assert validate_fact_guarantee(guarantee, snapshot=snap)["valid"] \
         is True  # digest is valid for rev-999; revision binding is gap
     out = _answer(session, fx, passage, chain, [],
-                  fact_guarantee=guarantee, require_fact_guarantee=True)
+                  fact_guarantee=guarantee)
     assert out["payload"]["grains"]["CANONICAL_FACT"].get("status") \
         == "UNKNOWN"
 

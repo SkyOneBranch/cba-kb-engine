@@ -196,9 +196,9 @@ def build_local_projection(*, fixture: Dict[str, Any],
     # Real path: when the fixture Fact declares an id AND a version
     # AND its source is a snapshot passage, the guarantee is built
     # from the Fact's own identifiers and field keys, and the
-    # answer is consumed THROUGH the guarantee gate
-    # (fact_guarantee + require_fact_guarantee=True), so a valid
-    # guarantee genuinely means this answer's Fact passed the gate.
+    # answer is consumed THROUGH the (now unconditional) guarantee
+    # gate, so a valid guarantee genuinely means this answer's
+    # Fact passed the gate.
     # Fallback path: when the fixture Fact cannot be genuinely
     # guaranteed (no declared version, or an unbound source — as
     # with the clean-room fixture, whose source is an unbound URI),
@@ -241,8 +241,7 @@ def build_local_projection(*, fixture: Dict[str, Any],
             metric="points_per_game", fact=fact,
             passage=target_passage,
             source_text=target_passage["text"], chain=chain,
-            claims=claims, fact_guarantee=guarantee,
-            require_fact_guarantee=True)
+            claims=claims, fact_guarantee=guarantee)
         covers_answer_fact = True
     else:
         answer = session.consume_answer(

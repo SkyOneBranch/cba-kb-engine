@@ -606,8 +606,7 @@ class ConsumeSession:
                        chain: Dict[str, Any],
                        claims: List[Dict[str, Any]],
                        team_id: Optional[str] = None,
-                       fact_guarantee: Any = None,
-                       require_fact_guarantee: bool = False
+                       fact_guarantee: Any = None
                        ) -> Dict[str, Any]:
         """Integrated cross-source answer through the entry. Stats
         come from consume_slice, Document from consume_citation, Fact
@@ -694,33 +693,36 @@ class ConsumeSession:
             and slice_bound
         )
         # v2.1.1 T2-1 (Issue #226) Δ-01, strengthened by the
-        # post-freeze Q2 (2026-10-31) B-02 fix: when the caller opts
-        # in, the Fact layer requires a guarantee sidecar bound to
-        # THIS session's current snapshot AND to the ACTUAL output
-        # Fact: same fact_id, same source identifier, a field_scope
+        # post-freeze Q2 (2026-10-31) B-02 fix and closed by the
+        # Human B-01 option (a) decision (2026-10-31): the Fact
+        # layer ALWAYS requires a guarantee sidecar bound to THIS
+        # session's current snapshot AND to the ACTUAL output Fact:
+        # same fact_id, same source identifier, a field_scope
         # covering every output Fact field, and — when the Fact's
         # source is the cited passage's source — the same file
-        # version as that passage's revision. A sidecar that is
-        # merely self-consistent (valid digest, snapshot-bound
-        # source) but bound to another source, a partial scope, or
-        # a different file version does NOT validate the Fact.
-        # A missing, tampered, or mis-bound guarantee turns ONLY
-        # the Fact layer UNKNOWN; Stats and Document below are
-        # computed independently and are untouched.
-        # B-01 residual (NOT changed here): the default path
-        # (require_fact_guarantee=False) still does not run this
-        # gate, because making it mandatory by default would break
-        # main-baseline consume_answer tests that assert Fact OK
-        # without a guarantee, and migrating those tests exceeds
-        # this repair's authorized scope. Closing the default
-        # bypass needs a Human decision on that migration.
+        # version as that passage's revision. There is no opt-out:
+        # the former require_fact_guarantee parameter was removed
+        # because its only remaining use would have been an
+        # explicit bypass of this gate, which contract §2.1 leaves
+        # unapproved, and no in-repo caller needed it (producer
+        # real path and v211 tests all passed True). A sidecar
+        # that is merely self-consistent (valid digest,
+        # snapshot-bound source) but bound to another source, a
+        # partial scope, or a different file version does NOT
+        # validate the Fact. A missing, tampered, or mis-bound
+        # guarantee turns ONLY the Fact layer UNKNOWN; Stats and
+        # Document below are computed independently and are
+        # untouched (contract §2.1(5)).
         # fact_version limitation: Fact dicts in this codebase
         # carry no version field, so the guarantee's fact_version
         # cannot be compared against an actual Fact version with
         # existing data (adding one would be a canonical schema
         # change, D-class, not approved); when a Fact DOES carry
-        # fact_version, equality is enforced below.
-        if fact_valid and require_fact_guarantee:
+        # fact_version, equality is enforced below. The sidecar's
+        # version is digest-bound and snapshot-bound by
+        # validate_fact_guarantee, but it is sidecar-declared,
+        # not Fact-corroborated, for version-less Facts.
+        if fact_valid:
             guarantee_ok = False
             guarantee_reason = "FACT_GUARANTEE_MISSING_OR_INVALID"
             if isinstance(fact_guarantee, dict) \
