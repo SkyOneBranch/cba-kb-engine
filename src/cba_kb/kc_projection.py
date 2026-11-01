@@ -35,6 +35,7 @@ import hashlib
 import json
 import math
 import re
+from collections.abc import Mapping
 from typing import Any, Callable, Dict, List, Optional
 
 from .stats import (DEFAULT_COMPETITION, PROVIDER_CBA_OFFICIAL,
@@ -575,7 +576,10 @@ def _trust_anchor_valid(anchor: Any) -> bool:
     they must be nonempty strings and are matched against the
     approval object by the caller. Any defect is untrusted,
     never an exception."""
-    if not isinstance(anchor, dict):
+    # Release-ruling repair (BLOCK-03): session-stored anchors are
+    # frozen mappings (MappingProxyType), not plain dicts, so the
+    # shape check accepts any Mapping.
+    if not isinstance(anchor, Mapping):
         return False
     if not (isinstance(anchor.get("anchor_id"), str)
             and anchor.get("anchor_id")):
@@ -588,7 +592,7 @@ def _trust_anchor_valid(anchor: Any) -> bool:
             or (isinstance(canon, str) and _SHA256_RE.match(canon))):
         return False
     registry = anchor.get("assertion_registry")
-    if not isinstance(registry, dict):
+    if not isinstance(registry, Mapping):
         return False
     for aid, digest in registry.items():
         if not (isinstance(aid, str) and aid
@@ -902,14 +906,28 @@ def resolve_claims_by_event(claims: List[Dict[str, Any]], *,
                             canonical_refs=None,
                             canonical_approval=None,
                             trust_anchor=None) -> Dict[str, Any]:
-    """Resolve claims by event. Canonical references and formal
-    assertions are trusted ONLY against a session-bound trust
-    anchor supplied separately (see _trust_anchor_valid): call
-    materials that merely recompute their own digests, without
-    an anchor match, are untrusted. Direct callers must obtain
-    the anchor from the trusted preset channel (the session);
-    passing a self-built anchor gains nothing at the session
-    path, where only the session's own anchor is used."""
+    """INTERNAL PROJECTION PRIMITIVE — not a trusted consumer verdict.
+
+    This function computes a projection over claims: which claim groups
+    are mutually exclusive under the supplied materials. Its return
+    value is a computation, NOT a trusted consumer verdict, and no
+    product surface may adopt it as one. The only trusted consumer
+    verdicts come from ConsumeSession.consume_answer, which supplies
+    ONLY the session's own provisioned anchor, passage anchors, and
+    passage texts — never per-call material — and wraps the result
+    with an entry verification record.
+
+    Canonical references and formal assertions are trusted ONLY
+    against a session-bound trust anchor supplied separately (see
+    _trust_anchor_valid): call materials that merely recompute their
+    own digests, without an anchor match, are untrusted. A direct
+    caller that supplies its own anchor proves nothing about
+    authorization provenance, because the anchor and the material
+    come from the same call; a matching anchor here demonstrates
+    internal consistency only. The product call graph has exactly
+    one caller (ConsumeSession.consume_answer); any future product
+    caller must be treated as a new trusted-entry decision, not a
+    silent reuse (guarded by test_kc_v211_release_ruling)."""
     def _valid(claim: Dict[str, Any]) -> bool:
         return _event_association_valid(
             claim, authorized_sources=authorized_sources,

@@ -104,6 +104,7 @@ import copy
 import hashlib
 import json
 import uuid
+from types import MappingProxyType
 from typing import Any, Dict, List, Optional
 
 from .kc_current import KcCurrentError, SimulatedCurrentStore
@@ -141,6 +142,32 @@ from .kc_visibility import (
 )
 
 DEFAULT_AUTHORIZATION_BASIS = "SIMULATED_TARGET_SCOPE"
+
+
+def _freeze_authorization(value: Any) -> Any:
+    """Recursively freeze a session-provisioned authorization value.
+
+    Release-ruling repair (Human-authorized, 2026-11-01, Q2 BLOCK-03):
+    the trust anchor is the trust root for canonical/assertion verdicts,
+    and no product feature mutates it after construction, so it is stored
+    frozen — dicts become MappingProxyType, sets become frozenset, lists
+    and tuples become tuples. Item assignment then raises TypeError even
+    for code holding a session reference. This is deliberately scoped to
+    the anchor: the authorized sets stay owner-mutable on purpose (the
+    revocation feature — render_verified revalidates CURRENT authorization
+    — depends on discard(); widening is re-checked per call by the V⊆I
+    rule), and stopping a reference-holding same-process actor from
+    rebinding attributes outright would need a process boundary, which
+    is out of scope for this round by the release ruling.
+    """
+    if isinstance(value, dict):
+        return MappingProxyType(
+            {k: _freeze_authorization(v) for k, v in value.items()})
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_authorization(v) for v in value)
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_authorization(v) for v in value)
+    return value
 
 UNIFORM_NOT_FOUND: Dict[str, Any] = {
     "status": "UNKNOWN",
@@ -262,7 +289,11 @@ class ConsumeSession:
             candidate = copy.deepcopy(trust_anchor)
             if _trust_anchor_valid(candidate) \
                     and candidate.get("target_domain") == target_domain:
-                self._trust_anchor = candidate
+                # Release-ruling repair (BLOCK-03): store the anchor
+                # frozen, so later code — including code holding this
+                # session reference — cannot rewrite the registry or
+                # any anchor field after construction.
+                self._trust_anchor = _freeze_authorization(candidate)
             else:
                 self._trust_anchor_invalid = True
         self.session_id = uuid.uuid4().hex
@@ -567,7 +598,21 @@ class ConsumeSession:
         auth_players = set(formal["authorized_players"])
         visible = set(self.authorized_players)
         if not visible <= auth_players:
-            return unknown("IDENTITY_AUTHORIZATION_SCOPE_MISMATCH")
+            # Release-ruling repair (Human-authorized, 2026-11-01, Q2
+            # BLOCK-02): the code comment above already required this,
+            # but unknown() wrote the specific cause into the payload
+            # as well. The specific cause now lives ONLY in the
+            # internal diagnostic (same pattern as
+            # consume_passage.fail()); the external result is the
+            # generic uniform reason for unprovable coverage, so a
+            # caller cannot observe the session/index configuration
+            # fact from the result.
+            self._last_diagnostic = {
+                "cause": "IDENTITY_AUTHORIZATION_SCOPE_MISMATCH",
+                "entry": "consume_identity"}
+            return {"status": "UNKNOWN", "grain": "IDENTITY",
+                    "candidates": [], "relation": "UNDECIDED",
+                    "reason": "IDENTITY_COVERAGE_UNPROVEN"}
         # Target-first, filtered to the VISIBLE set only:
         # entries outside V never reach resolution or
         # disclosure, so an index wider than the session can

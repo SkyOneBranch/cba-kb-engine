@@ -9,6 +9,8 @@ identity disclosure follows the session's visible set V, never
 the wider index I. Every test below states which side of the
 boundary its materials come from.
 """
+import json
+
 import pytest
 
 from cba_kb.kc_cleanroom import (
@@ -433,12 +435,21 @@ def _identify(session, players, aliases, query, kind):
 def test_anchor_identity_visible_subset_of_index_mismatch(fx):
     # V reaching outside I is a session misconfiguration:
     # uniform UNKNOWN, never a wider disclosure license.
+    # Release-ruling repair (2026-11-01, BLOCK-02): the specific
+    # cause lives ONLY in the internal diagnostic; the external
+    # result is the generic uniform reason (this migrates the old
+    # assertion, which pinned the specific reason externally —
+    # that was the leak the Q2 caught, and the code comment above
+    # the V-block already required internal-only).
     session = _session(authorized_players={B},
                        identity_authorization=_auth([A]))
     out = _identify(session, fx["players"], fx["aliases"],
                     "测试甲", "alias")
     assert out["status"] == "UNKNOWN"
-    assert out["reason"] == "IDENTITY_AUTHORIZATION_SCOPE_MISMATCH"
+    assert out["reason"] == "IDENTITY_COVERAGE_UNPROVEN"
+    assert "SCOPE_MISMATCH" not in json.dumps(out, ensure_ascii=False)
+    assert session._last_diagnostic["cause"] == \
+        "IDENTITY_AUTHORIZATION_SCOPE_MISMATCH"
 
 
 def test_anchor_identity_narrow_session_scoped_resolve(fx):
