@@ -35,6 +35,7 @@ import hashlib
 import json
 import math
 import re
+from collections.abc import Mapping
 from typing import Any, Callable, Dict, List, Optional
 
 from .stats import (DEFAULT_COMPETITION, PROVIDER_CBA_OFFICIAL,
@@ -406,10 +407,17 @@ def resolve_claims(claims: List[Dict[str, Any]]) -> Dict[str, Any]:
 #   invalid and nothing claims formal event identity. The
 #   same-key-different-events POSITIVE identification
 #   (§3.1(3) bullet 1 — proving two same-key claims are
-#   different events) still has no mechanism: ref-level gating
-#   can refuse a false CONFLICT/OK, but identifying the second
-#   event needs a second identified event. That gap is carried,
-#   not faked.
+#   different events) IS supported through the canonical path:
+#   grouping is by (player_uid, event_ref), so two claims
+#   sharing an event_key but carrying distinct canonical-
+#   approved refs are proven different events (OK, not
+#   CONFLICT) — proven by tests/test_kc_v211_corrective.py
+#   §3.1(3) cases and the drill P2 control. What remains
+#   unproven is the KEY-ONLY case: a claim carrying only an
+#   event_key, with no canonical ref and no formal assertion,
+#   cannot be positively identified as the same or a different
+#   event, and stays UNKNOWN. That data-side gap is carried,
+#   not faked, and keeps B-1 RELEASE blocked.
 # - Trusted claims sharing (player_uid, event_ref) form one event
 #   group; differing normalized business values (date, text) inside
 #   one group are CONFLICT, with every participating claim listed.
@@ -451,6 +459,227 @@ def event_association_digest(claim: Dict[str, Any],
         "evidence": assoc.get("evidence"),
         "snapshot_id": assoc.get("snapshot_id"),
     }))
+
+
+def validate_identity_authorization(auth: Any) -> Dict[str, Any]:
+    """Shared formal identity authorization validator (moved here
+    from kc_local_producer so the consumer can reuse it without a
+    circular import; the producer keeps a thin wrapper that
+    converts ValueError to its build error).
+
+    The object is a SEPARATE artifact from the players/aliases
+    being resolved — it is the authorization baseline, never
+    derived from the resolution input. It carries an index
+    identity (index_id, index_version), the authorized player
+    set, and an index_digest recomputed over the canonical JSON
+    of {index_id, index_version, authorized_players sorted,
+    approved_aliases normalized-or-None}. Any structural defect
+    or digest mismatch raises ValueError with the producer's
+    legacy code string, never a silent downgrade. Structure and
+    binding are verified; the index itself is NOT authenticated
+    — the reported index identity is what an out-of-band check
+    compares (the same (a)/(b) distinction the Q2 accepted for
+    formal_registry). When present, approved_aliases is the
+    approved alias set: aliases outside it are filtered before
+    resolution, never trusted as approved bindings."""
+    if not isinstance(auth, dict):
+        raise ValueError(
+            "LOCAL_PROJECTION_IDENTITY_AUTHORIZATION_MALFORMED")
+    index_id = auth.get("index_id")
+    index_version = auth.get("index_version")
+    players = auth.get("authorized_players")
+    if not (isinstance(index_id, str) and index_id
+            and isinstance(index_version, str) and index_version
+            and isinstance(players, list) and players
+            and all(isinstance(p, str) and p for p in players)
+            and len(set(players)) == len(players)):
+        raise ValueError(
+            "LOCAL_PROJECTION_IDENTITY_AUTHORIZATION_MALFORMED")
+    approved = auth.get("approved_aliases")
+    normalized_approved = None
+    if approved is not None:
+        if not isinstance(approved, list):
+            raise ValueError(
+                "LOCAL_PROJECTION_IDENTITY_AUTHORIZATION_MALFORMED")
+        pairs = []
+        for entry in approved:
+            if not isinstance(entry, dict) \
+                    or not (isinstance(entry.get("alias"), str)
+                            and entry.get("alias")) \
+                    or not (isinstance(entry.get("player_uid"), str)
+                            and entry.get("player_uid")):
+                raise ValueError(
+                    "LOCAL_PROJECTION_IDENTITY_AUTHORIZATION_MALFORMED")
+            pairs.append({"alias": entry["alias"],
+                          "player_uid": entry["player_uid"]})
+        if len({(p["alias"], p["player_uid"]) for p in pairs}) \
+                != len(pairs):
+            raise ValueError(
+                "LOCAL_PROJECTION_IDENTITY_AUTHORIZATION_MALFORMED")
+        normalized_approved = sorted(
+            pairs, key=lambda p: (p["alias"], p["player_uid"]))
+    digest = auth.get("index_digest")
+    expected = sha256_hex(canonical_json({
+        "index_id": index_id, "index_version": index_version,
+        "authorized_players": sorted(players),
+        "approved_aliases": normalized_approved}))
+    if not (isinstance(digest, str) and digest == expected):
+        raise ValueError(
+            "LOCAL_PROJECTION_IDENTITY_AUTHORIZATION_INVALID")
+    return {"index_id": index_id, "index_version": index_version,
+            "authorized_players": sorted(players),
+            "approved_aliases": normalized_approved,
+            "index_digest": digest}
+
+
+def formal_association_assertion_digest(claim: Dict[str, Any],
+                                        assoc: Dict[str, Any],
+                                        assertion_id: str) -> str:
+    """Digest binding a formal association assertion to the exact
+    association it authorizes: SHA-256 over the canonical JSON of
+    {assertion_id, claim_id, player_uid, source_id, revision,
+    locator, event_ref, snapshot_id, association_digest}, where
+    association_digest is event_association_digest(claim, assoc).
+    The assertion is a SEPARATE artifact from the association:
+    it cannot authorize a different claim, event, source
+    version, locator, snapshot, or evidence set, because any of
+    those changes the association digest. It proves structure
+    and binding only — not who issued it; publisher
+    authenticity is out-of-band, exactly as for canonical
+    approval and identity authorization."""
+    return sha256_hex(canonical_json({
+        "assertion_id": assertion_id,
+        "claim_id": claim.get("claim_id"),
+        "player_uid": claim.get("player_uid"),
+        "source_id": assoc.get("source_id"),
+        "revision": assoc.get("revision"),
+        "locator": assoc.get("locator"),
+        "event_ref": assoc.get("event_ref"),
+        "snapshot_id": assoc.get("snapshot_id"),
+        "association_digest": event_association_digest(claim, assoc),
+    }))
+
+
+def _trust_anchor_valid(anchor: Any) -> bool:
+    """Structural validation for a session-bound trust anchor.
+    The anchor is preset through the trusted channel (session
+    construction / test oracle) and is immutable to call inputs;
+    this function checks SHAPE only, never provenance. The
+    provenance guarantee comes from the channel: the anchor
+    must arrive from session state, never from the claim, the
+    association, or any other per-call input. Fields:
+    anchor_id (nonempty str), target_domain (nonempty str),
+    canonical_digest (None, or a 64-hex digest of the approved
+    canonical refs), assertion_registry (dict mapping
+    assertion_id to its expected 64-hex assertion digest).
+    Release/source binding fields are optional: when present
+    they must be nonempty strings and are matched against the
+    approval object by the caller. Any defect is untrusted,
+    never an exception."""
+    # Release-ruling repair (BLOCK-03): session-stored anchors are
+    # frozen mappings (MappingProxyType), not plain dicts, so the
+    # shape check accepts any Mapping.
+    if not isinstance(anchor, Mapping):
+        return False
+    if not (isinstance(anchor.get("anchor_id"), str)
+            and anchor.get("anchor_id")):
+        return False
+    if not (isinstance(anchor.get("target_domain"), str)
+            and anchor.get("target_domain")):
+        return False
+    canon = anchor.get("canonical_digest")
+    if not (canon is None
+            or (isinstance(canon, str) and _SHA256_RE.match(canon))):
+        return False
+    registry = anchor.get("assertion_registry")
+    if not isinstance(registry, Mapping):
+        return False
+    for aid, digest in registry.items():
+        if not (isinstance(aid, str) and aid
+                and isinstance(digest, str)
+                and _SHA256_RE.match(digest)):
+            return False
+    for field in ("release_id", "source_sha256"):
+        value = anchor.get(field)
+        if value is not None and not (
+                isinstance(value, str) and value):
+            return False
+    return True
+
+
+def _formal_association_assertion_valid(claim: Dict[str, Any],
+                                        assoc: Dict[str, Any],
+                                        trust_anchor: Any = None
+                                        ) -> bool:
+    """True only when the claim carries a separate formal
+    association assertion that binds exactly this association:
+    same source, revision, locator, event ref, claim id, player
+    UID and snapshot id, with a recomputing assertion digest —
+    AND the assertion is registered in the session-bound trust
+    anchor. The registry lookup is the authorization-source
+    check: a self-built assertion, however internally
+    consistent, is untrusted unless its assertion_id was
+    preset in the anchor by the trusted channel. Any defect —
+    including a missing assertion or a missing anchor — is
+    untrusted, never an exception, never a downgrade."""
+    assertion = claim.get("formal_association_assertion")
+    if not isinstance(assertion, dict):
+        return False
+    assertion_id = assertion.get("assertion_id")
+    if not (isinstance(assertion_id, str) and assertion_id):
+        return False
+    if assertion.get("source_id") != assoc.get("source_id"):
+        return False
+    if assertion.get("revision") != assoc.get("revision"):
+        return False
+    if assertion.get("locator") != assoc.get("locator"):
+        return False
+    if assertion.get("event_ref") != assoc.get("event_ref"):
+        return False
+    if assertion.get("claim_id") != claim.get("claim_id"):
+        return False
+    if assertion.get("player_uid") != claim.get("player_uid"):
+        return False
+    if assertion.get("snapshot_id") != assoc.get("snapshot_id"):
+        return False
+    digest = assertion.get("assertion_digest")
+    if not (isinstance(digest, str) and len(digest) == 64
+            and _SHA256_RE.match(digest)):
+        return False
+    try:
+        expected = formal_association_assertion_digest(
+            claim, assoc, assertion_id)
+    except (TypeError, ValueError):
+        return False
+    if digest != expected:
+        return False
+    # Trust-anchor repair (Human-authorized, 2026-10-31, Q2
+    # BLOCK-01): internal consistency is not authorization.
+    # The assertion must ALSO be registered in the anchor the
+    # trusted channel preset: a caller who invents an
+    # assertion_id, or replays a registered id onto a different
+    # claim (caught above by field binding), gains nothing.
+    # Without an anchor, no assertion is trusted.
+    if not _trust_anchor_valid(trust_anchor):
+        return False
+    registry = trust_anchor.get("assertion_registry")
+    return registry.get(assertion_id) == digest
+
+
+def _ref_mentioned(ref: str, text: str) -> bool:
+    """Token-boundary mention check for an event ref inside anchor
+    text. A bare substring test lets a longer ref swallow a
+    shorter one (EV-001 inside EV-0012): the ref must appear as
+    a discrete token, delimited on both sides by a non-word
+    character (or a string edge). Hyphens count as delimiters,
+    so EV-001 followed by '-A' still counts as a mention —
+    that is the documented boundary rule, pinned by tests."""
+    try:
+        pattern = (r"(?<![A-Za-z0-9_])" + re.escape(ref)
+                   + r"(?![A-Za-z0-9_])")
+        return re.search(pattern, text) is not None
+    except (TypeError, re.error):
+        return False
 
 
 def validate_canonical_approval(approval: Any, refs: Any) -> bool:
@@ -512,7 +741,8 @@ def _event_association_valid(claim: Dict[str, Any], *,
                              passage_anchors=None,
                              passage_texts=None,
                              canonical_refs=None,
-                             canonical_approval=None) -> bool:
+                             canonical_approval=None,
+                             trust_anchor=None) -> bool:
     assoc = claim.get("event_association")
     if not isinstance(assoc, dict):
         return False
@@ -567,7 +797,11 @@ def _event_association_valid(claim: Dict[str, Any], *,
         # strings, or whose passage never states the event, is
         # untrusted even when its digest recomputes.
         anchor_text = passage_texts.get((source_id, revision, locator))
-        if not isinstance(anchor_text, str) or ref not in anchor_text:
+        # Corrective repair (Human-authorized, 2026-10-31): a
+        # bare substring test lets EV-001 match EV-0012. The ref
+        # must appear as a discrete token in the anchor text.
+        if not isinstance(anchor_text, str) \
+                or not _ref_mentioned(ref, anchor_text):
             return False
         registered_locators = {(s, l) for (s, _r, l) in passage_texts}
         for entry in evidence:
@@ -600,10 +834,37 @@ def _event_association_valid(claim: Dict[str, Any], *,
         # binding exactly those refs. Anything else is untrusted,
         # so the claim falls back to the UNKNOWN paths, never to
         # a CONFLICT or OK on an unapproved basis.
+        # Trust-anchor repair (Human-authorized, 2026-10-31, Q2
+        # BLOCK-01): refs + approval alone are call-supplied
+        # materials. They are trusted ONLY when they match the
+        # session-bound anchor preset by the trusted channel:
+        # the refs digest must equal the anchor's canonical
+        # digest, and the approval's release/source must match
+        # the anchor's when the anchor carries them. Self-built
+        # refs + approval + recomputed digests, without an
+        # anchor, are untrusted — the digests prove the caller
+        # built a consistent bundle, not that any authority
+        # approved it.
         if canonical_refs is None or canonical_approval is None:
             return False
         if not validate_canonical_approval(canonical_approval,
                                             canonical_refs):
+            return False
+        if not _trust_anchor_valid(trust_anchor):
+            return False
+        try:
+            refs_digest = sha256_hex(canonical_json(canonical_refs))
+        except (TypeError, ValueError):
+            return False
+        if trust_anchor.get("canonical_digest") != refs_digest:
+            return False
+        if trust_anchor.get("release_id") is not None \
+                and trust_anchor.get("release_id") \
+                != canonical_approval.get("release_id"):
+            return False
+        if trust_anchor.get("source_sha256") is not None \
+                and trust_anchor.get("source_sha256") \
+                != canonical_approval.get("source_sha256"):
             return False
         entry = canonical_refs.get(ref)
         if not isinstance(entry, dict):
@@ -612,6 +873,23 @@ def _event_association_valid(claim: Dict[str, Any], *,
             return False
         if entry.get("confirmed") is not True:
             return False
+    elif not _formal_association_assertion_valid(claim, assoc,
+                                                 trust_anchor):
+        # Corrective repair (Human-authorized, 2026-10-31, Q2
+        # B-01), strengthened by the trust-anchor ruling
+        # (2026-10-31, Q2 BLOCK-01): the contract allows
+        # exactly two trusted positive bases — an approved
+        # canonical reference (above), or a separate formal
+        # association assertion (this check). A self-consistent
+        # association alone (content support + recomputed
+        # digest, no artifact) is NOT a basis, and neither is
+        # a self-built assertion: the assertion must ALSO be
+        # registered in the session-bound trust anchor. With
+        # neither basis, the association is untrusted, so the
+        # claim falls back to the UNKNOWN paths. The anchor
+        # itself arrives from the trusted preset channel
+        # (session construction), never from call inputs.
+        return False
     return True
 
 
@@ -626,7 +904,30 @@ def resolve_claims_by_event(claims: List[Dict[str, Any]], *,
                             passage_anchors=None,
                             passage_texts=None,
                             canonical_refs=None,
-                            canonical_approval=None) -> Dict[str, Any]:
+                            canonical_approval=None,
+                            trust_anchor=None) -> Dict[str, Any]:
+    """INTERNAL PROJECTION PRIMITIVE — not a trusted consumer verdict.
+
+    This function computes a projection over claims: which claim groups
+    are mutually exclusive under the supplied materials. Its return
+    value is a computation, NOT a trusted consumer verdict, and no
+    product surface may adopt it as one. The only trusted consumer
+    verdicts come from ConsumeSession.consume_answer, which supplies
+    ONLY the session's own provisioned anchor, passage anchors, and
+    passage texts — never per-call material — and wraps the result
+    with an entry verification record.
+
+    Canonical references and formal assertions are trusted ONLY
+    against a session-bound trust anchor supplied separately (see
+    _trust_anchor_valid): call materials that merely recompute their
+    own digests, without an anchor match, are untrusted. A direct
+    caller that supplies its own anchor proves nothing about
+    authorization provenance, because the anchor and the material
+    come from the same call; a matching anchor here demonstrates
+    internal consistency only. The product call graph has exactly
+    one caller (ConsumeSession.consume_answer); any future product
+    caller must be treated as a new trusted-entry decision, not a
+    silent reuse (guarded by test_kc_v211_release_ruling)."""
     def _valid(claim: Dict[str, Any]) -> bool:
         return _event_association_valid(
             claim, authorized_sources=authorized_sources,
@@ -635,7 +936,8 @@ def resolve_claims_by_event(claims: List[Dict[str, Any]], *,
             snapshot_id=snapshot_id,
             passage_anchors=passage_anchors,
             canonical_refs=canonical_refs,
-            canonical_approval=canonical_approval)
+            canonical_approval=canonical_approval,
+            trust_anchor=trust_anchor)
 
     conflicting: set = set()
     unresolved: set = set()
@@ -675,12 +977,27 @@ def resolve_claims_by_event(claims: List[Dict[str, Any]], *,
         by_player.setdefault(claim.get("player_uid"), []).append(claim)
     for members in by_player.values():
         if len(members) < 2:
+            # Corrective repair (Human-authorized, 2026-10-31,
+            # Q2 B-03): a single claim invoking an event
+            # relation without a trusted association is
+            # unproven, not a proven no-conflict OK. A single
+            # claim invoking no relation keeps the legacy OK.
+            if members and any("event_key" in m
+                               or "event_association" in m
+                               for m in members) \
+                    and any(not _valid(m) for m in members):
+                unresolved.add("EVENT_ASSOCIATION_UNPROVEN")
             continue
         values = {_claim_business_value(m) for m in members}
-        if len(values) <= 1:
-            continue
         invoking = [m for m in members
                     if "event_key" in m or "event_association" in m]
+        if len(values) <= 1 and not invoking:
+            # Legacy: identical values with no invoked event
+            # relation keep the legacy OK (no relation claimed,
+            # nothing to prove). Invoked relations fall through
+            # to the checks below even when values agree, so
+            # agreement without proof is UNKNOWN, not OK.
+            continue
         if invoking and any(not _valid(m) for m in invoking):
             unresolved.add("EVENT_ASSOCIATION_UNPROVEN")
         # Q2-227-03: differing business values with ANY claim

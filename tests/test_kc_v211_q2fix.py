@@ -302,10 +302,28 @@ def test_q2fix_identity_arbitrary_digest_unknown(fx):
     assert out["candidates"] == []
 
 
+def _auth(uids):
+    # Corrective migration (Human-authorized, 2026-10-31, Q2
+    # B-02): a formal identity authorization object covering
+    # the supplied players, digest-bound the same way the
+    # shared validator recomputes it.
+    auth = {"index_id": "fixture_index", "index_version": "v1",
+            "authorized_players": sorted(uids),
+            "approved_aliases": None, "index_digest": ""}
+    auth["index_digest"] = sha256_hex(canonical_json({
+        "index_id": "fixture_index", "index_version": "v1",
+        "authorized_players": sorted(uids),
+        "approved_aliases": None}))
+    return auth
+
+
 def test_q2fix_identity_real_digest_resolved_pin(fx):
     # PIN (passes pre- and post-fix): a recomputed digest with full
     # authorized coverage still resolves. Not falsification.
-    session = _session()
+    # Corrective migration (2026-10-31, Q2 B-02): the session
+    # now also carries the formal authorization object that
+    # the consumer entry requires for a trusted RESOLVED.
+    session = _session(identity_authorization=_auth([A, B]))
     out = _identity(session, fx)
     assert out["payload"]["status"] == "RESOLVED"
     assert out["payload"]["candidates"] == [A]

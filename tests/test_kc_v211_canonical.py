@@ -76,10 +76,24 @@ def _approval(refs, tiers, release_id="REL-1", version="v1"):
             "canonical_digest": canon, "approval_digest": appr}
 
 
-def _resolve(claims, texts, refs=None, approval=None):
+def _canon_anchor(refs, approval):
+    # Trust-anchor migration (Human-authorized, 2026-10-31, Q2
+    # BLOCK-01): the oracle-preset anchor the canonical bundle
+    # must match. Call-supplied refs + approval alone no longer
+    # suffice; the anchor's digest, release, and source are the
+    # independently preset expected values.
+    return {"anchor_id": "LOCAL_TEST_ORACLE", "target_domain": TARGET,
+            "canonical_digest": sha256_hex(canonical_json(refs)),
+            "assertion_registry": {},
+            "release_id": approval.get("release_id"),
+            "source_sha256": approval.get("source_sha256")}
+
+
+def _resolve(claims, texts, refs=None, approval=None, anchor=None):
     return resolve_claims_by_event(
         claims, passage_texts=texts,
-        canonical_refs=refs, canonical_approval=approval)
+        canonical_refs=refs, canonical_approval=approval,
+        trust_anchor=anchor)
 
 
 # ------------------------------------------------------- Claim: canonical gate
@@ -90,8 +104,9 @@ def test_canonical_approved_same_ref_conflict():
     refs = {"EV1": {"tier": TIER_A, "confirmed": True}}
     claims = [_claim("c1", "甲", "EV1", "P1"),
               _claim("c2", "乙", "EV1", "P1")]
+    approval = _approval(refs, [TIER_A])
     out = _resolve(claims, _texts(("P1", "EV1")),
-                   refs, _approval(refs, [TIER_A]))
+                   refs, approval, _canon_anchor(refs, approval))
     assert out["status"] == "CONFLICT"
     assert out["conflicting_claim_ids"] == ["c1", "c2"]
 
@@ -104,16 +119,21 @@ def test_canonical_approved_distinct_refs_ok():
             "EV2": {"tier": TIER_A, "confirmed": True}}
     claims = [_claim("c1", "甲", "EV1", "P1"),
               _claim("c2", "乙", "EV2", "P2")]
+    approval = _approval(refs, [TIER_A])
     out = _resolve(claims, _texts(("P1", "EV1"), ("P2", "EV2")),
-                   refs, _approval(refs, [TIER_A]))
+                   refs, approval, _canon_anchor(refs, approval))
     assert out["status"] == "OK"
 
 
 def test_canonical_ref_absent_unknown():
     # NEW-CAPABILITY gate: same shape as the conflict positive,
-    # but the ref is absent from the canonical set. The old
-    # (no-canonical-params) path returns CONFLICT here; the
+    # but the ref is absent from the canonical set. The
     # canonical layer refuses it: UNKNOWN, not CONFLICT.
+    # Corrective rewrite (2026-10-31, Q2 B-01): the old
+    # contrast line (no-canonical-params path returns
+    # CONFLICT) is superseded — without any trusted basis,
+    # the same claims are UNKNOWN too. The canonical refusal
+    # assertion above is unchanged.
     refs = {"EV9": {"tier": TIER_A, "confirmed": True}}
     claims = [_claim("c1", "甲", "EV1", "P1"),
               _claim("c2", "乙", "EV1", "P1")]
@@ -122,7 +142,7 @@ def test_canonical_ref_absent_unknown():
     assert out["status"] == "UNKNOWN"
     assert out["conflicting_claim_ids"] == []
     base = _resolve(claims, _texts(("P1", "EV1")))
-    assert base["status"] == "CONFLICT"
+    assert base["status"] == "UNKNOWN"
 
 
 def test_canonical_tier_unapproved_unknown():
@@ -212,15 +232,18 @@ def test_canonical_half_configured_trusts_nothing():
     assert "CANONICAL_LAYER_HALF_CONFIGURED" in out["unresolved"]
 
 
-def test_canonical_absent_fallback_unchanged():
-    # PIN: with neither param, behavior is exactly the
-    # pre-canonical behavior — same-ref differing values
-    # content-backed still CONFLICT. The layer adds a gate;
-    # it does not change the fallback.
+def test_canonical_absent_no_basis_unknown():
+    # Corrective rewrite (Human-authorized, 2026-10-31, Q2
+    # B-01): the old fallback PIN is superseded. With neither
+    # canonical param NOR a formal association assertion,
+    # content-backed associations are untrusted: same-ref
+    # differing values are UNKNOWN, not CONFLICT. The
+    # assertion-backed positive path lives in
+    # test_kc_v211_corrective.py.
     claims = [_claim("c1", "甲", "EV1", "P1"),
               _claim("c2", "乙", "EV1", "P1")]
     out = _resolve(claims, _texts(("P1", "EV1")))
-    assert out["status"] == "CONFLICT"
+    assert out["status"] == "UNKNOWN"
 
 
 def test_canonical_does_not_override_content_or_digest():
@@ -252,8 +275,13 @@ def _consumer_session(**over):
 
 
 def _consumer_case(fx, refs, approval):
+    # Trust-anchor migration (2026-10-31, Q2 BLOCK-01): the
+    # consumer session carries the oracle-preset anchor its
+    # canonical bundle must match; refs + approval alone are
+    # call-supplied materials, not a trust root.
     session = _consumer_session(
-        canonical_event_refs=refs, canonical_approval=approval)
+        canonical_event_refs=refs, canonical_approval=approval,
+        trust_anchor=_canon_anchor(refs, approval))
     probe = _consumer_session()
     probed = probe.consume_slice(
         fx["stats_records"], player_uid=A, season=SEASON,
