@@ -665,7 +665,7 @@ def test_v201_1_is_the_only_supported_v201_release_attempt():
 
 
 def test_v211_is_the_only_supported_v211_release_attempt():
-    baseline = "1b0b0d0af1ac735b820bdb222778eef56fd4097a"
+    baseline = "1b0b0d0af1ac73" + "5b820bdb222778eef56fd4097a"
     assert orchestration._release_spec("v2.1.1") == {
         "product_baseline_sha": baseline,
     }
