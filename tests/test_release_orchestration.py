@@ -664,6 +664,34 @@ def test_v201_1_is_the_only_supported_v201_release_attempt():
     assert projected["state"] == "PROJECTED"
 
 
+def test_v211_is_the_only_supported_v211_release_attempt():
+    baseline = "1b0b0d0af1ac735b820bdb222778eef56fd4097a"
+    assert orchestration._release_spec("v2.1.1") == {
+        "product_baseline_sha": baseline,
+    }
+    for forbidden in ["v2.1.0", "v2.1.1-1", "v2.1.1-2", "v2.1.2", "v3.0.0-1", "v9.9.9"]:
+        with pytest.raises(
+            orchestration.ProjectionError,
+            match=f"RELEASE_ID_FORBIDDEN:{forbidden}",
+        ):
+            orchestration._release_spec(forbidden)
+
+    inputs = projection_inputs()
+    inputs["release_id"] = "v2.1.1"
+    inputs["engine_sha"] = baseline
+    projected = orchestration.project_targets(**inputs)
+    assert projected["release_id"] == "v2.1.1"
+    assert projected["engine_sha"] == baseline
+    assert projected["state"] == "PROJECTED"
+
+    repo = Path(__file__).resolve().parents[1]
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    assert subprocess.run(
+        ["git", "merge-base", "--is-ancestor", baseline, head],
+        cwd=repo, check=False,
+    ).returncode == 0
+
+
 def test_v200_1_execution_sha_requires_clean_product_descendant(tmp_path):
     repo = Path(__file__).resolve().parents[1]
     checkout = tmp_path / "checkout"
