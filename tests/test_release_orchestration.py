@@ -2553,3 +2553,121 @@ def test_historical_subtree_elsewhere_under_root_not_pulled_into_current_invento
     assert "f-curr-1" in item_ids
     assert "f-ev-1" in item_ids
     assert "f-hist-other" not in item_ids
+
+
+def test_allowed_removed_code_keys_carry_forward():
+    inputs = projection_inputs(
+        tracked=["src/new.py"],
+        hashes={"src/new.py": "new-file-sha"},
+    )
+    inputs["allowed_removed_code_keys"] = ["code/Makefile"]
+    projected = orchestration.project_targets(**inputs)
+    assert "code/Makefile" in projected["carried_forward_code_targets"]
+    assert "code/Makefile" in projected["carried_forward_artifacts"]
+    assert "code/Makefile" in projected["unchanged_targets"]
+    target_by_key = {t["logical_key"]: t for t in projected["existing_targets"]}
+    assert target_by_key["code/Makefile"]["disposition"] == "carried_forward"
+    assert target_by_key["code/Makefile"]["legacy_carried_forward"] is True
+
+
+def test_allowed_removed_code_keys_unauthorized_key_fails():
+    inputs = projection_inputs(
+        tracked=[],
+        hashes={},
+    )
+    inputs["manifest_rows"].append({"drive_file_id": "code-extra", "uid": "code/extra.py"})
+    inputs["previous_status"]["artifacts"].append({"id": "code-extra", "name": "extra.py", "sha256": "extra-sha"})
+    inputs["previous_targets"]["code-extra"] = {
+        "allowed_parents": ["scripts"],
+        "mime": "text/plain",
+        "mode": "binary",
+        "publish_parent": "scripts",
+    }
+    inputs["allowed_removed_code_keys"] = ["code/Makefile"]
+    with pytest.raises(
+        orchestration.ProjectionError,
+        match="REMOVED_TARGET_POLICY_REQUIRED:code/extra.py",
+    ):
+        orchestration.project_targets(**inputs)
+
+
+def test_allowed_removed_code_keys_invalid_format():
+    inputs = projection_inputs()
+    inputs["allowed_removed_code_keys"] = "code/Makefile"
+    with pytest.raises(orchestration.ProjectionError, match="ALLOWED_REMOVED_CODE_KEYS_INVALID"):
+        orchestration.project_targets(**inputs)
+
+    inputs["allowed_removed_code_keys"] = [123]
+    with pytest.raises(orchestration.ProjectionError, match="ALLOWED_REMOVED_CODE_KEYS_INVALID"):
+        orchestration.project_targets(**inputs)
+
+    inputs["allowed_removed_code_keys"] = ["not_code/file"]
+    with pytest.raises(orchestration.ProjectionError, match="ALLOWED_REMOVED_CODE_KEYS_INVALID"):
+        orchestration.project_targets(**inputs)
+
+
+def test_allowed_removed_code_keys_unknown_key():
+    inputs = projection_inputs()
+    inputs["allowed_removed_code_keys"] = ["code/non_existent.py"]
+    with pytest.raises(orchestration.ProjectionError, match="ALLOWED_REMOVED_CODE_KEYS_UNKNOWN"):
+        orchestration.project_targets(**inputs)
+
+
+def test_candidate_inputs_and_entry_code_with_carried_forward_code(monkeypatch, tmp_path):
+    projection_val = {
+        "release_id": "v1.5.2-1",
+        "engine_sha": "a" * 40,
+        "carried_forward_code_targets": ["code/legacy.txt"],
+        "existing_targets": [
+            {
+                "id": "leg-id",
+                "logical_key": "code/legacy.txt",
+                "name": "legacy.txt",
+                "mime": "text/plain",
+                "mode": "binary",
+                "previous_sha256": orchestration.digest(b"legacy-content"),
+                "publish_parent": "scripts",
+                "staging_parent": "staging",
+                "disposition": "carried_forward",
+                "legacy_carried_forward": True,
+            },
+            {
+                "id": "code-entry-id",
+                "logical_key": "entry/code",
+                "name": "code",
+                "mime": "text/plain",
+                "mode": "binary",
+                "publish_parent": "scripts",
+                "staging_parent": "staging",
+                "disposition": "metadata_update",
+            },
+        ],
+        "new_targets": [],
+    }
+    previous = {
+        "leg-id": b"legacy-content",
+        "code-entry-id": b"old-entry-code",
+    }
+    reads = []
+
+    def fake_snapshot(_drive, file_id, _mode="binary"):
+        reads.append(file_id)
+        return previous[file_id], {"id": file_id}
+
+    monkeypatch.setattr(orchestration, "snapshot", fake_snapshot)
+    out = tmp_path / "candidate"
+    entries = orchestration._candidate_inputs(
+        object(), tmp_path, projection_val,
+        {"status_id": "status", "reservations": {}}, out,
+    )
+    by_key = {e["logical_key"]: e for e in entries}
+    assert "code/legacy.txt" in by_key
+    assert by_key["code/legacy.txt"]["change_class"] == "CARRIED_FORWARD_CODE_MIRROR"
+    assert by_key["code/legacy.txt"]["before_hash"] == orchestration.digest(b"legacy-content")
+    assert Path(by_key["code/legacy.txt"]["path"]).read_bytes() == b"legacy-content"
+
+    code_entry_bytes = Path(by_key["entry/code"]["path"]).read_bytes().decode()
+    assert "# 当前代码镜像" in code_entry_bytes
+    assert "# 历史受控结转代码镜像（只读保留，非当前 Git HEAD 文件）" in code_entry_bytes
+    assert "code/legacy.txt" in code_entry_bytes
+
