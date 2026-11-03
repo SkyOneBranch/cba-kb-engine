@@ -781,6 +781,7 @@ def project_targets(
     status_hash=None,
     status_meta=None,
     allocation=None,
+    allowed_removed_code_keys=None,
 ):
     """Project exact target semantics without any remote mutation."""
     _require_release(release_id)
@@ -894,13 +895,27 @@ def project_targets(
             "RETIREMENT_CONTROL_TARGET_FORBIDDEN:"
             + ",".join(retiring_control_keys)
         )
+
+    allowed_set = set()
+    if allowed_removed_code_keys is not None:
+        if not isinstance(allowed_removed_code_keys, (list, tuple, set)):
+            raise ProjectionError("ALLOWED_REMOVED_CODE_KEYS_INVALID")
+        for k in allowed_removed_code_keys:
+            if not isinstance(k, str) or not k.startswith("code/"):
+                raise ProjectionError("ALLOWED_REMOVED_CODE_KEYS_INVALID")
+        allowed_set = set(allowed_removed_code_keys)
+        if allowed_set - existing_code_keys:
+            raise ProjectionError("ALLOWED_REMOVED_CODE_KEYS_UNKNOWN")
+
     removed_code_keys = sorted(
         key for key in existing_code_keys if key not in current_code
     )
-    if removed_code_keys:
+    unauthorized_removed = sorted(set(removed_code_keys) - allowed_set)
+    if unauthorized_removed:
         raise ProjectionError(
-            "REMOVED_TARGET_POLICY_REQUIRED:" + ",".join(removed_code_keys)
+            "REMOVED_TARGET_POLICY_REQUIRED:" + ",".join(unauthorized_removed)
         )
+    carried_removed_keys = sorted(set(removed_code_keys) & allowed_set)
 
     unchanged = []
     modified = []
@@ -912,6 +927,11 @@ def project_targets(
             unchanged.append(logical_key)
         else:
             modified.append(logical_key)
+
+    for logical_key in carried_removed_keys:
+        item = existing[logical_key]
+        reused.append(logical_key)
+        unchanged.append(logical_key)
 
     new_keys = sorted(set(current_code) - existing_code_keys)
     if allocation is not None and set(new_keys) != set(reserved_keys):
@@ -946,12 +966,15 @@ def project_targets(
             item["disposition"] = "metadata_update"
         elif logical_key in retiring_keys:
             item["disposition"] = "RETIRED_FROM_CURRENT"
+        elif logical_key in carried_removed_keys:
+            item["disposition"] = "carried_forward"
+            item["legacy_carried_forward"] = True
         else:
             item["disposition"] = "carried_forward"
         existing_targets.append(item)
 
-    final_keys = sorted((non_code_keys - retiring_keys) | set(current_code))
-    legacy_reservation_keys = sorted(non_code_keys | set(current_code))
+    final_keys = sorted((non_code_keys - retiring_keys) | set(current_code) | set(carried_removed_keys))
+    legacy_reservation_keys = sorted(non_code_keys | set(current_code) | set(carried_removed_keys))
     if len(final_keys) != len(set(final_keys)):
         raise ProjectionError("LOGICAL_KEY_COLLISION")
     retiring_targets = [
@@ -976,7 +999,8 @@ def project_targets(
         "new_target_count": len(new_targets),
         "removed_target_count": len(removed_code_keys),
         "retired_target_count": len(retiring_targets),
-        "carried_forward_count": len(business_keys - retiring_keys),
+        "carried_forward_count": len((business_keys - retiring_keys) | set(carried_removed_keys)),
+        "carried_forward_code_targets": carried_removed_keys,
         "final_artifact_count": len(final_keys),
         "final_current_artifact_count": len(final_keys),
         "final_current_logical_keys": final_keys,
@@ -986,7 +1010,7 @@ def project_targets(
         "removed_targets": removed_code_keys,
         "modified_content_targets": modified,
         "unchanged_targets": unchanged,
-        "carried_forward_artifacts": sorted(business_keys - retiring_keys),
+        "carried_forward_artifacts": sorted((business_keys - retiring_keys) | set(carried_removed_keys)),
         "active_target_ids": sorted(active_ids),
         "active_production_target_count": len(active_ids),
         "reserved_policy_target_ids": sorted(reserved_ids),
@@ -1384,7 +1408,7 @@ def _candidate_inputs(drive, engine_root, projection, allocation, output):
         key: file_id for key, file_id in allocation["reservations"].items()
     })
     code_hashes = {
-        item["logical_key"]: item.get("current_sha256") or item["sha256"]
+        item["logical_key"]: item.get("current_sha256") or item.get("previous_sha256") or item.get("sha256")
         for item in projection["existing_targets"]
         if item["logical_key"].startswith("code/")
     }
@@ -1417,11 +1441,19 @@ def _candidate_inputs(drive, engine_root, projection, allocation, output):
         )
     data_by_key = {}
     previous_by_key = {}
+    carried_code_targets = set(projection.get("carried_forward_code_targets", []))
     for logical_key in ordered:
         if logical_key == "input/manifest.csv":
             continue
         item = item_by_key[logical_key]
-        if logical_key.startswith("code/"):
+        if logical_key in carried_code_targets:
+            previous, _ = snapshot(
+                drive, item["id"], item.get("mode", "binary"),
+            )
+            previous_by_key[logical_key] = previous
+            data = previous
+            generated = False
+        elif logical_key.startswith("code/"):
             relative = logical_key.removeprefix("code/")
             data = (Path(engine_root) / relative).read_bytes()
             generated = True
@@ -1460,6 +1492,8 @@ def _candidate_inputs(drive, engine_root, projection, allocation, output):
             change_class = "NEW_CODE_MIRROR"
         elif logical_key in CONTROL_KEYS:
             change_class = "CONTROL_METADATA_UPDATE"
+        elif logical_key in carried_code_targets:
+            change_class = "CARRIED_FORWARD_CODE_MIRROR"
         elif logical_key.startswith("code/"):
             change_class = "CODE_MIRROR_UPDATE"
         else:
@@ -1567,6 +1601,9 @@ def _control_candidate(logical_key, previous, projection, allocation,
             mapping, allow_unicode=True, sort_keys=False,
         ).encode()
     if logical_key == "entry/code":
+        carried_set = set(projection.get("carried_forward_code_targets", []))
+        current_hashes = {k: v for k, v in code_hashes.items() if k not in carried_set}
+        carried_hashes = {k: v for k, v in code_hashes.items() if k in carried_set}
         lines = [
             "# 当前代码镜像",
             f"GitHub: https://github.com/SkyCjq/cba-kb-engine/tree/{engine_sha}",
@@ -1574,9 +1611,16 @@ def _control_candidate(logical_key, previous, projection, allocation,
             "legacy/ 是历史脚本，禁止用旧 uploader/wechat/sync 向生产写入。",
         ]
         lines.extend(
-            f"- {key} | SHA256 {code_hashes[key]}"
-            for key in sorted(code_hashes)
+            f"- {key} | SHA256 {current_hashes[key]}"
+            for key in sorted(current_hashes)
         )
+        if carried_hashes:
+            lines.append("")
+            lines.append("# 历史受控结转代码镜像（只读保留，非当前 Git HEAD 文件）")
+            lines.extend(
+                f"- {key} | SHA256 {carried_hashes[key]}"
+                for key in sorted(carried_hashes)
+            )
         return ("\n".join(lines) + "\n").encode()
     if logical_key == CONTEXT_CARD_KEY:
         if registry is None or manifest_bytes is None:
@@ -2072,6 +2116,7 @@ def _project_command(args, instance):
         status_hash=digest(status_raw),
         status_meta=fingerprint(status_meta),
         allocation=allocation_data,
+        allowed_removed_code_keys=production.get("allowed_removed_code_keys"),
     )
     save(args.output, projection)
     return projection
