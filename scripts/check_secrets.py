@@ -31,7 +31,7 @@ REFERENCE = re.compile(r'(?:\$\{[A-Z_][A-Z0-9_]*\}|\$[A-Z_][A-Z0-9_]*|<[A-Z_][A-
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 MAX_MEMBERS = 2000
 
-# Drive-ID morphology, REQ-212 preparatory (pattern set v1 semantics, frozen
+# Drive-ID morphology, REQ-212 Stage 2 formal (pattern set v1 semantics, frozen
 # census definition). Findings carry a SHA-256 fingerprint of the matched
 # token only -- never the token itself, never matched content. The URL and
 # field forms follow the census definition exactly; the hex/digit exclusions
