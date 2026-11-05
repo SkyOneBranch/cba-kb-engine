@@ -16,7 +16,7 @@ takes them as explicit caller-supplied values so it stays stdlib-pure and
 independently testable. Wiring the locator supply from a real Snapshot is a
 formal-stage integration step, not something this scaffolding invents.
 
-Scoring rules (version oracle-scoring-v1, frozen at build time):
+Scoring rules (version oracle-scoring-v2, frozen at build time):
 - exact: integer counts exact after versioned normalization (thousand
   separators and surrounding whitespace stripped; anything else unparseable).
 - uid: canonical representation after whitespace strip; aliases match ONLY
@@ -27,6 +27,18 @@ Scoring rules (version oracle-scoring-v1, frozen at build time):
   set; missing, invalid, or out-of-Snapshot locators fail.
 - unknown: a correct UNKNOWN/refusal passes on honesty; asserting a value
   for a known-UNKNOWN is a critical failure.
+- consistency (v2): a dict answer whose verbatim text asserts ANY number
+  that differs from its structured value (beyond the declared tolerance
+  for rate) contradicts itself and fails closed. Numbers are extracted
+  decimal-, comma- and underscore-aware ("13.0" is one number, "1_000"
+  and "1,000" are one number each; locator fragments such as "loc-1" and
+  identifiers such as "Q1" assert no number). Text with no asserted
+  number is skipped, never guessed. Multi-number text is therefore NOT
+  skipped when one of its numbers contradicts the structured value: an
+  ambiguous verbatim answer fails closed instead of passing on the
+  structured value alone. Known limitation: extraneous numbers in
+  verbatim text (e.g. a year) are indistinguishable from the asserted
+  value and fail the check; verbatim answers must not carry them.
 Critical failures (identity error, fabricated known-UNKNOWN, invalid
 mandatory locator, unsupported factual assertion) each block acceptance.
 Repeat protocol: a materially non-deterministic outcome (disagreeing runs)
@@ -38,12 +50,16 @@ Residual risk: manifest digests prove internal consistency, not external
 approval — a fully replaced manifest with a recomputed digest verifies OK
 under verify_manifest alone. Formal scoring and receipt acceptance
 therefore require a ScoringApproval bound to the approved manifest
-digest, the Oracle version, the scoring-code SHA of this module, and the
-applicable Snapshot digest (see score_answer_approved and
+digest, the Oracle version, the scoring-code SHA of this module, the
+applicable Snapshot digest, the authorization domain, and the digest of
+the authorized locator set (see score_answer_approved and
 validate_receipt_approved). The approval record must come from an
 independent trusted record (e.g. the Freeze record's pinned digests),
 never from the input being scored: a caller-supplied digest or flag alone
-is never a trust root.
+is never a trust root. The locator set itself is derived from the real
+authorized Snapshot by the approval issuer (its catalog_references —
+see snapshot_locators); this module verifies the pinned digest of the
+set, it does not re-implement the Snapshot's own covered-bytes scheme.
 """
 
 from __future__ import annotations
@@ -54,7 +70,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-SCORING_SPEC_VERSION = "oracle-scoring-v1"
+SCORING_SPEC_VERSION = "oracle-scoring-v2"
 
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -305,7 +321,7 @@ def _parse_count(value):
     if isinstance(value, int) and not isinstance(value, bool):
         return value
     if isinstance(value, str):
-        cleaned = value.replace(",", "").replace(" ", "").strip()
+        cleaned = value.replace(",", "").replace("_", "").replace(" ", "").strip()
         if re.fullmatch(r"[+-]?\d+", cleaned):
             return int(cleaned)
     return None
@@ -315,7 +331,7 @@ def _parse_number(value):
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
     if isinstance(value, str):
-        cleaned = value.replace(",", "").strip()
+        cleaned = value.replace(",", "").replace("_", "").strip()
         try:
             return float(cleaned)
         except ValueError:
@@ -323,41 +339,34 @@ def _parse_number(value):
     return None
 
 
-_INT_RE = re.compile(r"(?<![A-Za-z0-9_-])[+-]?\d+(?![A-Za-z0-9])")
-_NUMBER_RE = re.compile(r"(?<![A-Za-z0-9_-])[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?![A-Za-z0-9])")
+# One asserted number in verbatim text: decimal-, comma- and
+# underscore-aware, standalone-token only. "13.0" is one number;
+# "1_000" and "1,000" are one number each; "12 and 13" are two.
+# Digits attached to letters or hyphens (a locator fragment such as
+# "loc-1", an identifier such as "Q1") are not asserted numbers.
+# A dotted run such as "v1.2" or "3.14.15" matches nothing: the
+# lookarounds reject a number glued to a dot-digit on either side.
+_NUM_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?<![0-9]\.)[+-]?(?:\d[\d_]*(?:,\d[\d_]{2})*"
+    r"(?:\.\d[\d_]*)?|\.\d[\d_]*)(?![A-Za-z0-9])(?!\.\d)")
 
 
-def _verbatim_integer(text):
-    """The single integer asserted in verbatim text, or None if undetermined.
+def _verbatim_numbers(text):
+    """All numbers asserted in verbatim text, as floats (see _NUM_TOKEN_RE).
 
-    Only standalone numeric tokens count: digits attached to letters or
-    hyphens (a locator fragment such as "loc-1", an identifier such as
-    "Q1") are not asserted numbers and are skipped, never guessed. Text
-    with no standalone integer, or with more than one, cannot be
-    cross-checked and is skipped (never guessed).
+    Text with no asserted number yields []; the caller skips the
+    cross-check there, never guessing. Every returned number counts:
+    any one contradicting the structured value fails the check.
     """
     if not isinstance(text, str):
-        return None
-    found = _INT_RE.findall(text)
-    if len(found) != 1:
-        return None
-    try:
-        return int(found[0])
-    except ValueError:
-        return None
-
-
-def _verbatim_number(text):
-    """The single number asserted in verbatim text, or None if undetermined."""
-    if not isinstance(text, str):
-        return None
-    found = _NUMBER_RE.findall(text)
-    if len(found) != 1:
-        return None
-    try:
-        return float(found[0])
-    except ValueError:
-        return None
+        return []
+    numbers = []
+    for token in _NUM_TOKEN_RE.findall(text):
+        try:
+            numbers.append(float(token.replace(",", "").replace("_", "")))
+        except ValueError:
+            continue
+    return numbers
 
 
 @dataclass(frozen=True)
@@ -373,24 +382,77 @@ class ScoreResult:
 class ScoringApproval:
     """Independent approval record for formal scoring and receipt acceptance.
 
-    All four bindings must match the Oracle, this scoring code, and the
+    All six bindings must match the Oracle, this scoring code, and the
     applicable Snapshot. This record must come from an independent trusted
     record (e.g. the Freeze record's pinned digests), never from the input
     being scored: a caller-supplied digest or flag alone is never a trust
     root. This dataclass is the whole mechanism -- no platform, key system,
     approval center, or extra Gate is built here.
+
+    authorization_domain binds the domain a receipt may claim: a receipt
+    whose domain differs from the approval's cannot be accepted by passing
+    the changed domain as the expected value. locator_set_digest binds
+    the exact authorized locator set: the SHA-256 of the canonical JSON
+    of the sorted set (see locator_set_digest). The set itself is derived
+    from the real authorized Snapshot by the approval issuer (see
+    snapshot_locators); the digest is what this module enforces.
     """
 
     manifest_digest: str
     version: str
     scoring_code_sha: str
     snapshot_digest: str
+    authorization_domain: str
+    locator_set_digest: str
 
     def __post_init__(self):
-        for name in ("manifest_digest", "scoring_code_sha", "snapshot_digest"):
+        for name in ("manifest_digest", "scoring_code_sha", "snapshot_digest",
+                     "locator_set_digest"):
             if not _HEX64.match(getattr(self, name) or ""):
                 raise OracleError(f"{name} must be a 64-hex digest")
         _require_nonempty(self.version, "version")
+        _require_nonempty(self.authorization_domain, "authorization_domain")
+
+
+def locator_set_digest(locators) -> str:
+    """Digest of the sorted authorized locator set (the binding value).
+
+    The approval pins this digest; formal entrypoints recompute it from
+    the caller-supplied set and require equality, so a caller cannot
+    widen the set to smuggle in a foreign locator. The set itself is
+    derived from the real authorized Snapshot by the approval issuer
+    (see snapshot_locators).
+    """
+    if not isinstance(locators, (list, tuple)):
+        raise OracleError("authorized locators must be a list or tuple")
+    items = sorted(set(locators))
+    if not all(isinstance(item, str) for item in items):
+        raise OracleError("authorized locators must be strings")
+    return _sha256_hex(canonical_json(items).encode("utf-8"))
+
+
+def snapshot_locators(snapshot) -> tuple:
+    """Authorized locator set derived from a real kc Snapshot.
+
+    The set is the Snapshot's catalog_references (its entry_ids): the
+    citable identifiers that belong to that Snapshot. Accepts a Snapshot
+    object (duck-typed: catalog_references) or a plain dict with the same
+    field. This only DERIVES the set. The binding to the approval is the
+    locator_set_digest on ScoringApproval, and the Snapshot's own digest
+    binding is the approval's snapshot_digest; the Snapshot digest itself
+    is recomputed by validate_snapshot in kc_snapshot, not re-implemented
+    here (this module must not duplicate that covered-bytes scheme).
+    """
+    if isinstance(snapshot, dict):
+        refs = snapshot.get("catalog_references", ())
+    else:
+        refs = getattr(snapshot, "catalog_references", None)
+        if refs is None:
+            raise OracleError("snapshot has no catalog_references")
+    if not isinstance(refs, (list, tuple)) or not all(
+            isinstance(ref, str) and ref for ref in refs):
+        raise OracleError("snapshot catalog_references must be non-empty strings")
+    return tuple(sorted(set(refs)))
 
 
 def scoring_code_sha() -> str:
@@ -406,8 +468,13 @@ def verify_scoring_approval(approval, *, oracle: Oracle, snapshot_digest: str) -
     """Fail closed unless the approval binds this Oracle, code, and Snapshot.
 
     Raises OracleError naming the mismatched binding only (never the
-    values): approval.manifest_digest must equal the Oracle's artifact
-    digest, approval.version must equal the Oracle version,
+    values). The approval's manifest digest must equal the digest
+    RECOMPUTED from the Oracle's actual content (sources, questions,
+    scoring spec) -- which must also equal the Oracle's self-reported
+    artifact digest -- so a question substituted after build cannot reuse
+    an old approval even when the stored digest is left untouched. The
+    Oracle must be a real Oracle object, not a duck-typed stand-in.
+    approval.version must equal the Oracle version,
     approval.scoring_code_sha must equal this module's runtime source SHA,
     and approval.snapshot_digest must equal the applicable Snapshot digest.
     """
@@ -415,8 +482,16 @@ def verify_scoring_approval(approval, *, oracle: Oracle, snapshot_digest: str) -
         raise OracleError("scoring approval must be a ScoringApproval record")
     if not isinstance(snapshot_digest, str) or not _HEX64.match(snapshot_digest):
         raise OracleError("snapshot_digest must be a 64-hex digest")
-    if approval.manifest_digest != oracle.artifact_digest:
-        raise OracleError("approval manifest_digest does not match Oracle artifact_digest")
+    if not isinstance(oracle, Oracle):
+        raise OracleError("scoring approval requires a real Oracle object")
+    recomputed = _manifest_digest(
+        oracle.version,
+        [s.to_dict() for s in oracle.sources],
+        [q.to_dict() for q in oracle.questions],
+        oracle.scoring_spec_version,
+    )
+    if recomputed != approval.manifest_digest or recomputed != oracle.artifact_digest:
+        raise OracleError("approval manifest_digest does not match recomputed Oracle content digest")
     if approval.version != oracle.version:
         raise OracleError("approval version does not match Oracle version")
     if approval.scoring_code_sha != scoring_code_sha():
@@ -431,12 +506,16 @@ def score_answer_approved(question, answer, *, oracle: Oracle, approval,
 
     The question must be one of the approved Oracle's questions (equality
     by value, so a tampered replacement question is rejected even if its
-    question_id matches). Any approval mismatch raises OracleError and no
-    score is produced.
+    question_id matches). The caller-supplied locator set must digest to
+    the approval's locator_set_digest, so a foreign locator cannot be
+    smuggled in through the allowlist. Any approval mismatch raises
+    OracleError and no score is produced.
     """
     verify_scoring_approval(approval, oracle=oracle, snapshot_digest=snapshot_digest)
     if question not in oracle.questions:
         raise OracleError("question is not part of the approved Oracle")
+    if locator_set_digest(authorized_locators) != approval.locator_set_digest:
+        raise OracleError("authorized locator set does not match the approval's locator-set digest")
     return score_answer(question, answer, authorized_locators=authorized_locators)
 
 
@@ -476,25 +555,25 @@ def score_answer(question: OracleQuestion, answer, *, authorized_locators=()) ->
                            "invalid/missing/out-of-Snapshot locator")
 
     # Consistency cross-check (structured value vs verbatim text): a dict
-    # answer whose verbatim text asserts a single number that differs from
-    # its structured value contradicts itself and fails closed. Text with
-    # no number or more than one number cannot be determined, so the check
-    # is skipped there -- never guessed. Plain-string answers carry no
-    # separate structured value, so there is nothing to cross-check.
+    # answer whose verbatim text asserts ANY number that differs from its
+    # structured value contradicts itself and fails closed. Text with no
+    # asserted number is skipped, never guessed. Multi-number text is NOT
+    # skipped when one of its numbers contradicts the value: an ambiguous
+    # verbatim answer fails closed instead of passing on the structured
+    # value alone. Plain-string answers carry no separate structured
+    # value, so there is nothing to cross-check.
     if isinstance(answer, dict) and question.comparison in ("exact", "rate"):
-        if question.comparison == "exact":
-            text_count = _verbatim_integer(text)
-            parsed_value = _parse_count(value)
-            if text_count is not None and parsed_value is not None and text_count != parsed_value:
-                return ScoreResult(qid, "FAIL", "consistency", True,
-                                   "structured value contradicts verbatim text")
-        else:
-            text_number = _verbatim_number(text)
-            parsed_value = _parse_number(value)
-            if (text_number is not None and parsed_value is not None
-                    and abs(text_number - parsed_value) > question.tolerance):
-                return ScoreResult(qid, "FAIL", "consistency", True,
-                                   "structured value contradicts verbatim text")
+        parsed_value = (_parse_count(value) if question.comparison == "exact"
+                        else _parse_number(value))
+        if parsed_value is not None:
+            for asserted in _verbatim_numbers(text):
+                if question.comparison == "exact":
+                    if asserted != parsed_value:
+                        return ScoreResult(qid, "FAIL", "consistency", True,
+                                           "structured value contradicts verbatim text")
+                elif abs(asserted - parsed_value) > question.tolerance:
+                    return ScoreResult(qid, "FAIL", "consistency", True,
+                                       "structured value contradicts verbatim text")
 
     if question.comparison == "exact":
         parsed = _parse_count(value)
@@ -617,10 +696,23 @@ def validate_receipt_approved(receipt: ClientReceipt, *, oracle: Oracle, approva
 
     All bindings are compared exactly: approval to Oracle / scoring code /
     Snapshot, receipt snapshot digest and authorization domain to the
-    expected values, receipt manifest digest and version to the Oracle. A
-    missing approval or any mismatch yields a non-empty error list.
-    Formal acceptance must use this entrypoint, never the scaffolding-only
-    validate_receipt with its optional expectations.
+    expected values, receipt manifest digest and version to the Oracle.
+    The authorization_domain argument must equal the approval's bound
+    domain (a receipt cannot be accepted by changing its domain and
+    passing the changed domain as the expected value), and the
+    caller-supplied locator set must digest to the approval's
+    locator-set digest. A missing approval or any mismatch yields a
+    non-empty error list. Formal acceptance must use this entrypoint,
+    never the scaffolding-only validate_receipt with its optional
+    expectations.
+
+    Retention note (Human-adjudicated, 2026-11-05): a real-client receipt
+    KEEPS its verbatim answer and necessary locators inside the private
+    evidence boundary so the independent Oracle can verify it; the
+    original evidence must not be deleted to pass a review, and real
+    private content must never be stored in the public repository.
+    Public-facing outputs (PR content, error output, ordinary logs,
+    reports) carry digests/fingerprints only, never raw receipt content.
     """
     if not isinstance(approval, ScoringApproval):
         return ["scoring approval is required for formal receipt acceptance"]
@@ -630,6 +722,13 @@ def validate_receipt_approved(receipt: ClientReceipt, *, oracle: Oracle, approva
         return [str(exc)]
     if not isinstance(authorization_domain, str) or not authorization_domain.strip():
         return ["authorization_domain is required for formal receipt acceptance"]
+    if authorization_domain != approval.authorization_domain:
+        return ["authorization_domain does not match the approval's bound domain"]
+    try:
+        if locator_set_digest(authorized_locators) != approval.locator_set_digest:
+            return ["authorized locator set does not match the approval's locator-set digest"]
+    except OracleError as exc:
+        return [str(exc)]
     return validate_receipt(
         receipt, oracle=oracle, authorized_locators=authorized_locators,
         expected_snapshot_digest=snapshot_digest,
@@ -637,9 +736,16 @@ def validate_receipt_approved(receipt: ClientReceipt, *, oracle: Oracle, approva
 
 
 def repeat_required(results) -> bool:
-    """Trigger: any disagreement across runs is materially non-deterministic."""
-    verdicts = {r.verdict for r in results}
-    return len(verdicts) > 1
+    """Trigger: any disagreement across runs is materially non-deterministic.
+
+    Disagreement is judged on the full (verdict, dimension, critical)
+    triple, exactly as adjudicate_repeat judges it: runs with the same
+    overall verdict but conflicting critical dimensions still trigger a
+    repeat, or the trigger would miss the disagreement the adjudicator
+    then has to resolve.
+    """
+    triples = {(r.verdict, r.dimension, r.critical) for r in results}
+    return len(triples) > 1
 
 
 def adjudicate_repeat(results, *, minimum_runs: int = 3) -> tuple:

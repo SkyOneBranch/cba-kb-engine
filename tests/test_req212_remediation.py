@@ -1,6 +1,9 @@
 """REQ-212 Q2 Round 3 remediation tests (PR #236 follow-up).
 
-Each test FAILS on the Q2-FAIL HEAD and PASSES on the remediated HEAD.
+Round-1 tests FAIL on the Q2-FAIL HEAD 7eb9ff33 and PASS on the remediated
+HEAD 677b5438. Round-2 tests (marked R2) FAIL on HEAD 677b5438 (the Q2
+re-review FAIL HEAD) and PASS on the repaired HEAD. One guard test is
+explicitly labelled as passing on both HEADs by design.
 New entrypoints are imported lazily inside the tests so that each test
 fails individually on the old HEAD (a missing entrypoint counts as FAIL
 there). All Drive-ID-like values are SYNTHETIC, built at runtime by
@@ -12,6 +15,7 @@ claims a real result.
 import hashlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -75,13 +79,15 @@ def _receipt(oracle, **overrides):
     return ClientReceipt(**fields)
 
 
-def _approval(oracle, **overrides):
-    from cba_kb.oracle import ScoringApproval, scoring_code_sha
+def _approval(oracle, locators=("loc-1",), **overrides):
+    from cba_kb.oracle import ScoringApproval, locator_set_digest, scoring_code_sha
     fields = dict(
         manifest_digest=oracle.artifact_digest,
         version=oracle.version,
         scoring_code_sha=scoring_code_sha(),
         snapshot_digest="b" * 64,
+        authorization_domain="synthetic-domain",
+        locator_set_digest=locator_set_digest(locators),
     )
     fields.update(overrides)
     return ScoringApproval(**fields)
@@ -280,14 +286,17 @@ def test_cumulative_fails_closed_on_shallow_and_unresolvable_base():
 # --- B1: approval-bound formal scoring -------------------------------------
 
 def test_formal_scoring_approves_bound_oracle():
-    from cba_kb.oracle import ScoringApproval, score_answer_approved, scoring_code_sha
+    from cba_kb.oracle import (ScoringApproval, locator_set_digest,
+                               score_answer_approved, scoring_code_sha)
     import cba_kb.oracle as oracle_module
     oracle = _oracle_v2()
     assert scoring_code_sha() == hashlib.sha256(
         Path(oracle_module.__file__).read_bytes()).hexdigest()
     approval = ScoringApproval(
         manifest_digest=oracle.artifact_digest, version=oracle.version,
-        scoring_code_sha=scoring_code_sha(), snapshot_digest="b" * 64)
+        scoring_code_sha=scoring_code_sha(), snapshot_digest="b" * 64,
+        authorization_domain="synthetic-domain",
+        locator_set_digest=locator_set_digest(["loc-1"]))
     result = score_answer_approved(
         oracle.question("q-count"), {"text": "12", "value": "12", "cited_locators": ["loc-1"]},
         oracle=oracle, approval=approval, snapshot_digest="b" * 64,
@@ -413,7 +422,12 @@ def test_structured_value_contradicting_verbatim_text_fails():
     two_numbers = score_answer(
         count, {"text": "12 and 13", "value": "12", "cited_locators": ["loc-1"]},
         authorized_locators=["loc-1"])
-    assert two_numbers.verdict == "PASS"
+    # R2 semantics change (Q2 re-review blocker 4): multi-number text
+    # whose numbers disagree with the structured value FAILS closed
+    # instead of being skipped. The old PASS expectation was the defect
+    # the reviewer flagged; it is corrected here, not weakened.
+    assert two_numbers.verdict == "FAIL" and two_numbers.dimension == "consistency"
+    assert two_numbers.critical is True
 
 
 def test_locator_fragment_in_text_is_not_an_asserted_count():
@@ -520,3 +534,312 @@ def test_error_strings_never_echo_raw_input():
     assert result.returncode == 2
     assert "PATH_NOT_IN_TRUSTED_RECORD" in result.stderr
     assert "api" + "_key=" not in result.stderr
+
+
+# --- R2: Q2 re-review Round 1 blockers (FAIL on HEAD 677b5438) -----------
+
+# B1: substituted questions must not reuse an old approval ------------------
+
+def test_r2_formal_scoring_rejects_substituted_question():
+    from cba_kb.oracle import score_answer_approved
+    oracle = _oracle_v2()
+    approval = _approval(oracle)
+    tampered = _oracle_v2()
+    # Replace only the first question's expected value; the stored
+    # artifact_digest is NOT recomputed (frozen field), so the old code
+    # compares the approval against the untouched stored digest and PASSes.
+    object.__setattr__(tampered, "questions",
+                       (OracleQuestion("q-count", "synthetic count?", "exact",
+                                       expected=13, mandatory_locator=True),)
+                       + tampered.questions[1:])
+    assert tampered.artifact_digest == oracle.artifact_digest
+    try:
+        score_answer_approved(
+            tampered.question("q-count"),
+            {"text": "13", "value": "13", "cited_locators": ["loc-1"]},
+            oracle=tampered, approval=approval, snapshot_digest="b" * 64,
+            authorized_locators=["loc-1"])
+    except OracleError:
+        pass
+    else:
+        raise AssertionError("a substituted question must not score under the old approval")
+
+
+def test_r2_formal_scoring_rejects_duck_typed_oracle():
+    from cba_kb.oracle import score_answer_approved
+    from types import SimpleNamespace
+    oracle = _oracle_v2()
+    approval = _approval(oracle)
+    fake = SimpleNamespace(
+        version=oracle.version, sources=oracle.sources,
+        questions=oracle.questions,
+        scoring_spec_version=oracle.scoring_spec_version,
+        artifact_digest=oracle.artifact_digest)
+    try:
+        score_answer_approved(
+            oracle.question("q-count"),
+            {"text": "12", "value": "12", "cited_locators": ["loc-1"]},
+            oracle=fake, approval=approval, snapshot_digest="b" * 64,
+            authorized_locators=["loc-1"])
+    except OracleError:
+        pass
+    else:
+        raise AssertionError("a duck-typed stand-in is not a real Oracle")
+
+
+# B2: lookup identity must equal read identity ------------------------------
+
+def test_r2_bound_digest_alias_and_real_path_agree():
+    tmp = Path(tempfile.mkdtemp())
+    actual_dir = tmp / "actual"
+    actual_dir.mkdir()
+    real = actual_dir / "good"
+    real.write_bytes(b"original")
+    digest = hashlib.sha256(b"original").hexdigest()
+    link = tmp / "good"
+    os.symlink(real, link)
+    manifest = tmp / "expected.json"
+    manifest.write_text(json.dumps({str(link): digest}))
+    records = SCANNER.load_expected_manifest(str(manifest))
+    # The invariant is agreement, not a particular return value: the
+    # alias, the real path, and a ".." alias of the same file must all
+    # receive the same decision. The old code decides differently for
+    # the same inode.
+    via_alias = SCANNER.verify_bound_digest(str(link), records)
+    via_real = SCANNER.verify_bound_digest(str(real), records)
+    via_dotdot = SCANNER.verify_bound_digest(str(tmp / "actual" / ".." / "good"), records)
+    assert via_alias == via_real == via_dotdot
+
+
+def test_r2_manifest_rejects_duplicate_key():
+    tmp = Path(tempfile.mkdtemp())
+    artifact = tmp / "good.bin"
+    artifact.write_bytes(b"original")
+    digest = hashlib.sha256(b"original").hexdigest()
+    other = hashlib.sha256(b"other").hexdigest()
+    manifest = tmp / "expected.json"
+    manifest.write_text(
+        '{"' + str(artifact) + '": "' + digest + '", '
+        '"' + str(artifact) + '": "' + other + '"}')
+    try:
+        SCANNER.load_expected_manifest(str(manifest))
+    except ValueError as exc:
+        assert "MALFORMED_MANIFEST" in str(exc)
+    else:
+        raise AssertionError("a manifest with a duplicate key must fail closed")
+
+
+def test_r2_manifest_rejects_normalized_duplicate_path():
+    tmp = Path(tempfile.mkdtemp())
+    artifact = tmp / "good.bin"
+    artifact.write_bytes(b"original")
+    digest = hashlib.sha256(b"original").hexdigest()
+    manifest = tmp / "expected.json"
+    # NOTE: the "./" alias must be built as a raw string: pathlib
+    # normalizes "." away, so Path(tmp / "." / "good.bin") would collapse
+    # to the same key before the manifest is even written.
+    manifest.write_text(json.dumps(
+        {str(artifact): digest, str(tmp) + "/./good.bin": digest}))
+    try:
+        SCANNER.load_expected_manifest(str(manifest))
+    except ValueError as exc:
+        assert "MALFORMED_MANIFEST" in str(exc)
+    else:
+        raise AssertionError("two keys normalizing to one path must fail closed")
+
+
+# B3: cumulative scan enumerates per-commit file changes ---------------------
+
+def _repo_with_copied_base_blob(base):
+    src = base / "src"
+    _git(base, "init", "-q", "src")
+    (src / "orig.txt").write_text("old notes " + synth_token() + "\n")
+    _git(src, "add", "orig.txt")
+    _commit(src, "base")
+    base_sha = _git(src, "rev-parse", "HEAD").stdout.strip()
+    (src / "new.txt").write_text((src / "orig.txt").read_text())
+    _git(src, "add", "new.txt")
+    _commit(src, "copy to new path")
+    (src / "new.txt").unlink()
+    _git(src, "add", "-A")
+    _commit(src, "remove copy")
+    return src, base_sha
+
+
+def test_r2_cumulative_flags_copied_base_blob_deleted_before_head():
+    base = Path(tempfile.mkdtemp())
+    src, base_sha = _repo_with_copied_base_blob(base)
+    tracked = _run_cli("--tracked", cwd=str(src))
+    assert tracked.returncode == 0  # final HEAD is clean: the escape case
+    cumulative = _run_cli("--cumulative", "--base", base_sha, cwd=str(src))
+    assert cumulative.returncode == 1
+    assert "S_DRIVE_ID_MORPHOLOGY" in cumulative.stderr
+
+
+def test_r2_cumulative_rejects_base_equal_to_head():
+    base = Path(tempfile.mkdtemp())
+    src, base_sha = _repo_with_deleted_secret(base)
+    result = _run_cli("--cumulative", "--base", "HEAD", cwd=str(src))
+    assert result.returncode == 2
+    assert "S_HISTORY_UNAVAILABLE" in result.stderr
+
+
+# B4: decimal / thousands / underscore number parsing ------------------------
+
+def test_r2_decimal_contradiction_fails():
+    oracle = _oracle_v2()
+    count = oracle.question("q-count")
+    contra = score_answer(
+        count, {"text": "13.0", "value": "12", "cited_locators": ["loc-1"]},
+        authorized_locators=["loc-1"])
+    assert contra.verdict == "FAIL" and contra.dimension == "consistency"
+    assert contra.critical is True
+    agreeing = score_answer(
+        count, {"text": "12.0", "value": "12", "cited_locators": ["loc-1"]},
+        authorized_locators=["loc-1"])
+    assert agreeing.verdict == "PASS"
+
+
+def test_r2_underscore_and_comma_thousands_agree():
+    big = build_oracle(
+        version="oracle-v2-synthetic",
+        sources=[OracleSource("src-synth", "synthetic primary source",
+                              "LAWFUL_PUBLIC_SYNTHETIC")],
+        questions=[OracleQuestion("q-big", "synthetic big count?", "exact",
+                                  expected=1000, mandatory_locator=True)],
+    )
+    for text in ("1_000", "1,000"):
+        result = score_answer(
+            big.question("q-big"),
+            {"text": text, "value": "1000", "cited_locators": ["loc-1"]},
+            authorized_locators=["loc-1"])
+        assert result.verdict == "PASS", text
+
+
+def test_r2_multi_number_contradiction_fails_closed():
+    oracle = _oracle_v2()
+    count = oracle.question("q-count")
+    result = score_answer(
+        count, {"text": "12 and 13", "value": "12", "cited_locators": ["loc-1"]},
+        authorized_locators=["loc-1"])
+    assert result.verdict == "FAIL" and result.dimension == "consistency"
+    assert result.critical is True
+
+
+# B5: repeat trigger compares critical dimensions ----------------------------
+
+def test_r2_repeat_required_sees_dimension_disagreement():
+    from cba_kb.oracle import repeat_required
+    assert repeat_required([
+        ScoreResult("q", "FAIL", "value", True, "a"),
+        ScoreResult("q", "FAIL", "locator", True, "b"),
+    ]) is True
+    assert repeat_required([
+        ScoreResult("q", "PASS", "value", False, "a"),
+        ScoreResult("q", "PASS", "value", False, "a"),
+    ]) is False
+
+
+# B6(a): authorization domain is bound by the approval ------------------------
+
+def test_r2_formal_receipt_acceptance_binds_authorization_domain():
+    from cba_kb.oracle import validate_receipt_approved
+    oracle = _oracle_v2()
+    receipt = _receipt(oracle)
+    approval = _approval(oracle)
+    assert validate_receipt_approved(
+        receipt, oracle=oracle, approval=approval,
+        snapshot_digest="b" * 64, authorization_domain="synthetic-domain",
+        authorized_locators=["loc-1"]) == []
+    # Caller changes the receipt domain AND passes the same changed
+    # domain: must still fail, because the approval binds synthetic-domain.
+    changed = _receipt(oracle, authorization_domain="other-domain")
+    assert validate_receipt_approved(
+        changed, oracle=oracle, approval=approval,
+        snapshot_digest="b" * 64, authorization_domain="other-domain",
+        authorized_locators=["loc-1"]) != []
+    # An approval built for another domain must not accept the receipt.
+    other_approval = _approval(oracle, authorization_domain="other-domain")
+    assert validate_receipt_approved(
+        receipt, oracle=oracle, approval=other_approval,
+        snapshot_digest="b" * 64, authorization_domain="synthetic-domain",
+        authorized_locators=["loc-1"]) != []
+
+
+# B6(b): locator allowlist is bound to the approval ---------------------------
+
+def test_r2_formal_scoring_binds_locator_set_to_approval():
+    from cba_kb.oracle import score_answer_approved
+    oracle = _oracle_v2()
+    approval = _approval(oracle)
+    # A foreign locator smuggled in through the caller-supplied allowlist.
+    try:
+        score_answer_approved(
+            oracle.question("q-count"),
+            {"text": "12", "value": "12", "cited_locators": ["loc-attacker"]},
+            oracle=oracle, approval=approval, snapshot_digest="b" * 64,
+            authorized_locators=["loc-attacker"])
+    except OracleError:
+        pass
+    else:
+        raise AssertionError("a locator outside the approved set must not score")
+    # The approved set still scores.
+    result = score_answer_approved(
+        oracle.question("q-count"),
+        {"text": "12", "value": "12", "cited_locators": ["loc-1"]},
+        oracle=oracle, approval=approval, snapshot_digest="b" * 64,
+        authorized_locators=["loc-1"])
+    assert result.verdict == "PASS"
+
+
+def test_r2_locator_set_digest_derives_from_real_snapshot():
+    from cba_kb.kc_snapshot import build_snapshot, validate_snapshot
+    from cba_kb.oracle import (locator_set_digest, score_answer_approved,
+                               snapshot_locators)
+    oracle = _oracle_v2()
+    snapshot = build_snapshot(
+        entries=[{"entry_id": "loc-1", "sha256": "a" * 64,
+                  "authority": "canonical", "rights": "public",
+                  "source_id": "src-synth"}],
+        target_domain="synthetic-domain", capabilities=["stats"],
+        build_provenance="synthetic-build-1",
+        build_time="2026-11-05T00:00:00+00:00",
+        data_release="SIMULATED_DATA_RELEASE_1",
+        engine_candidate="SIMULATED_ENGINE_CANDIDATE_1",
+        build_code="SIMULATED_BUILD_CODE_1")
+    assert validate_snapshot(snapshot)["valid"] is True
+    locators = snapshot_locators(snapshot)
+    assert locators == ("loc-1",)
+    assert locator_set_digest(locators) == locator_set_digest(["loc-1"])
+    approval = _approval(oracle, locators=locators)
+    result = score_answer_approved(
+        oracle.question("q-count"),
+        {"text": "12", "value": "12", "cited_locators": ["loc-1"]},
+        oracle=oracle, approval=approval, snapshot_digest="b" * 64,
+        authorized_locators=["loc-1"])
+    assert result.verdict == "PASS"
+    try:
+        score_answer_approved(
+            oracle.question("q-count"),
+            {"text": "12", "value": "12", "cited_locators": ["loc-attacker"]},
+            oracle=oracle, approval=approval, snapshot_digest="b" * 64,
+            authorized_locators=["loc-attacker"])
+    except OracleError:
+        pass
+    else:
+        raise AssertionError("a locator outside the Snapshot-derived set must not score")
+
+
+# B6(d): loader error text carries no raw OS text ------------------------------
+
+def test_r2_manifest_loader_error_hides_os_text():
+    tmp = Path(tempfile.mkdtemp())
+    directory = tmp / "adir"
+    directory.mkdir()
+    try:
+        SCANNER.load_expected_manifest(str(directory))
+    except ValueError as exc:
+        assert "MANIFEST_UNREADABLE" in str(exc)
+        assert str(directory) not in str(exc)
+    else:
+        raise AssertionError("a directory manifest must fail closed")

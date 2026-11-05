@@ -288,29 +288,50 @@ def verify_digest(path, expected_sha256):
     return (actual == expected_sha256, 'OK' if actual == expected_sha256 else 'DIGEST_MISMATCH')
 
 
+def _no_duplicate_object(pairs):
+    """object_pairs_hook for manifests: duplicate keys fail, never silently
+    take the last value (a manifest with two digests for one path must not
+    load as if it named one)."""
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError("MALFORMED_MANIFEST: duplicate manifest key")
+        obj[key] = value
+    return obj
+
+
 def load_expected_manifest(manifest_path):
     """Load an independently trusted expected record for bound verification.
 
     The manifest is a JSON object mapping an artifact path to its expected
-    64-hex SHA-256 digest. Keys are resolved to absolute paths (relative
-    keys against the manifest file's directory); the returned mapping is
-    {absolute path: digest}. The record must be the independently approved
-    one (version-controlled / pinned at Freeze or release time) and must
-    NEVER be generated from the artifact under check: a caller-supplied
-    digest or flag alone is never a trust root, and this record is credible
-    only because it is independent of the untrusted call input. Any defect
-    raises ValueError (fail closed); callers must not fall back to unbound
-    checks when loading fails.
+    64-hex SHA-256 digest. Keys are resolved to real paths (symlinks
+    resolved, relative keys against the manifest file's directory); the
+    returned mapping is {real path: digest}. Resolving with realpath is
+    what makes the lookup identity equal the read identity in
+    verify_bound_digest: a symlink alias and the path it points at name
+    the same record entry, and two keys that normalize to one path are
+    rejected as duplicates instead of silently colliding. The record must
+    be the independently approved one (version-controlled / pinned at
+    Freeze or release time) and must NEVER be generated from the artifact
+    under check: a caller-supplied digest or flag alone is never a trust
+    root, and this record is credible only because it is independent of
+    the untrusted call input. Any defect raises ValueError (fail closed);
+    callers must not fall back to unbound checks when loading fails.
+    Error text carries a fixed reason code only, never raw OS text.
     """
     try:
         raw = Path(manifest_path).read_bytes()
     except FileNotFoundError:
         raise ValueError('MANIFEST_UNREADABLE: manifest file not found')
-    except OSError as exc:
-        raise ValueError('MANIFEST_UNREADABLE: ' + str(exc))
+    except OSError:
+        raise ValueError('MANIFEST_UNREADABLE')
     try:
-        records = json.loads(raw.decode('utf-8'))
-    except (ValueError, UnicodeDecodeError):
+        records = json.loads(raw.decode('utf-8'), object_pairs_hook=_no_duplicate_object)
+    except ValueError as exc:
+        if str(exc).startswith('MALFORMED_MANIFEST'):
+            raise
+        raise ValueError('MALFORMED_MANIFEST: manifest is not valid JSON')
+    except UnicodeDecodeError:
         raise ValueError('MALFORMED_MANIFEST: manifest is not valid JSON')
     if not isinstance(records, dict) or not records:
         raise ValueError('MALFORMED_MANIFEST: manifest must be a non-empty object of path to digest')
@@ -322,7 +343,10 @@ def load_expected_manifest(manifest_path):
         if not isinstance(digest, str) or not _DIGEST_RE.match(digest):
             raise ValueError('MALFORMED_MANIFEST: manifest digest must be a 64-hex SHA-256')
         key = path if os.path.isabs(path) else os.path.join(manifest_dir, path)
-        normalized[os.path.abspath(key)] = digest
+        real = os.path.realpath(key)
+        if real in normalized:
+            raise ValueError('MALFORMED_MANIFEST: duplicate manifest path after normalization')
+        normalized[real] = digest
     return normalized
 
 
@@ -335,11 +359,13 @@ def verify_bound_digest(path, expected_records):
     trusted record AND the bytes at that path must match the recorded
     digest: a replacement file supplied with its own digest fails here
     because the trusted record still names the original path and digest.
-    Never raises for the checked conditions.
+    The candidate is resolved with realpath before lookup, so the lookup
+    identity is the read identity: a symlink alias and the path it points
+    at name the same record entry. Never raises for the checked conditions.
     """
     if not isinstance(expected_records, dict):
         return (False, 'MALFORMED_MANIFEST')
-    candidate = os.path.abspath(str(path))
+    candidate = os.path.realpath(str(path))
     expected = expected_records.get(candidate)
     if expected is None:
         return (False, 'PATH_NOT_IN_TRUSTED_RECORD')
@@ -445,29 +471,73 @@ def _resolve_cumulative_base(root, base=None):
     raise RuntimeError('HISTORY_UNAVAILABLE: no resolvable base for cumulative scan')
 
 
+def _ls_tree_blobs(root, commit):
+    """{path: blob OID} for one commit (git ls-tree -r -z; blobs only).
+
+    Raises HISTORY_UNAVAILABLE on git failure: a tree that cannot be
+    enumerated cannot prove cumulative coverage.
+    """
+    try:
+        out = subprocess.check_output(
+            ['git', 'ls-tree', '-r', '-z', commit],
+            cwd=root, stderr=subprocess.STDOUT)
+    except (subprocess.CalledProcessError, OSError) as exc:
+        raise RuntimeError('HISTORY_UNAVAILABLE: ' + str(exc))
+    entries = {}
+    for item in out.decode().split('\0'):
+        if not item:
+            continue
+        meta, path = item.split('\t', 1)
+        fields = meta.split()
+        if len(fields) != 3 or fields[1] != 'blob':
+            continue
+        entries[path] = fields[2]
+    return entries
+
+
 def cumulative_pr_blob_ids(root='.', *, base=None):
     """Blob SHA-1s introduced by any commit on base..HEAD.
 
-    Unlike a final-HEAD scan, this includes blobs added by an intermediate
-    commit and deleted before HEAD: `git rev-list --objects` walks every
-    commit tree in the range. Raises HISTORY_UNAVAILABLE on shallow repos,
-    unresolvable bases, or missing/malformed objects (fail closed).
+    Enumerated per commit, not per object: for every commit in the range,
+    every blob on a path that is new or changed relative to the base tree
+    is collected. A blob already reachable from the base still counts
+    when the PR introduces it at a NEW path (copied there and deleted
+    before HEAD): reachability from the base is not introduction by the
+    PR, but a new path in the PR is. Unlike a final-HEAD scan, this
+    includes blobs added by an intermediate commit and deleted before
+    HEAD. A base equal to HEAD, or a base that is not an ancestor of HEAD,
+    defines an empty/meaningless range and raises HISTORY_UNAVAILABLE
+    instead of reporting a vacuous pass. Raises HISTORY_UNAVAILABLE on
+    shallow repos, unresolvable bases, or git failures (fail closed).
     """
     _assert_not_shallow(root)
     resolved = _resolve_cumulative_base(root, base)
     try:
-        listing = subprocess.check_output(
-            ['git', 'rev-list', '--objects', resolved + '..HEAD'],
-            cwd=root, stderr=subprocess.STDOUT)
+        head = subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'], cwd=root,
+            stderr=subprocess.STDOUT).decode().strip()
     except (subprocess.CalledProcessError, OSError) as exc:
         raise RuntimeError('HISTORY_UNAVAILABLE: ' + str(exc))
-    oids = [line.split()[0] for line in listing.decode().splitlines() if line.split()]
-    if not oids:
-        return set()
-    proc = subprocess.run(
-        ['git', 'cat-file', '--batch-check=%(objectname) %(objecttype)'],
-        input='\n'.join(oids), capture_output=True, text=True, cwd=root)
-    return _batch_check_blobs(proc)
+    if resolved == head:
+        raise RuntimeError('HISTORY_UNAVAILABLE: base equals HEAD: empty range proves nothing')
+    ancestor = subprocess.run(
+        ['git', 'merge-base', '--is-ancestor', resolved, 'HEAD'],
+        cwd=root, capture_output=True)
+    if ancestor.returncode != 0:
+        raise RuntimeError('HISTORY_UNAVAILABLE: base is not an ancestor of HEAD')
+    base_entries = _ls_tree_blobs(root, resolved)
+    try:
+        commits = subprocess.check_output(
+            ['git', 'rev-list', resolved + '..HEAD'],
+            cwd=root, stderr=subprocess.STDOUT).decode().split()
+    except (subprocess.CalledProcessError, OSError) as exc:
+        raise RuntimeError('HISTORY_UNAVAILABLE: ' + str(exc))
+    blobs = set()
+    for commit in commits:
+        for path, oid in _ls_tree_blobs(root, commit).items():
+            if base_entries.get(path) != oid:
+                blobs.add(oid)
+    return blobs
 
 
 def cumulative_findings(root='.', *, base=None):
