@@ -1309,3 +1309,48 @@ def test_r6_rate_long_tail_cannot_round_away_contradiction():
         ctx.prec = old_prec
     assert result.verdict == "FAIL" and result.dimension == "consistency"
     assert result.critical is True
+
+# R7: regression GUARDS for the Fraction resource-exhaustion defect ----
+# These are GUARDS, not falsification tests: on the pre-regression HEAD
+# a3aca6ee the same tokens already FAIL closed promptly (the old Decimal
+# subtraction raised Overflow, caught by the handler), so a guard passes
+# there too by design. On the regressed HEAD 4ef799eb the calls below
+# HANG (no verdict within 20 s under a 256 MiB cap) -- that hang is the
+# defect these guards pin down. They must return FAIL promptly on the
+# repaired HEAD.
+
+def test_r7_rate_huge_positive_exponent_fails_closed_promptly():
+    import time
+    oracle = _oracle_v2()
+    rate = oracle.question("q-rate")
+    # Verbatim 1e999999999999999999 vs structured 50.0, tolerance 0.05:
+    # Decimal constructs it finite (adjusted = 999999999999999999), so
+    # the finite check passes it through, and the unbounded Fraction
+    # conversion then tries to build a 10**18-digit integer. The v7
+    # bound rejects the operand before any allocation: FAIL, promptly.
+    start = time.monotonic()
+    result = score_answer(
+        rate, {"text": "1e999999999999999999", "value": 50.0, "unit": "percent",
+               "cited_locators": ["loc-1"]},
+        authorized_locators=["loc-1"])
+    elapsed = time.monotonic() - start
+    assert result.verdict == "FAIL" and result.dimension == "consistency"
+    assert result.critical is True
+    assert elapsed < 10, f"huge-exponent rate check took {elapsed:.1f}s"
+
+
+def test_r7_rate_huge_negative_exponent_fails_closed_promptly():
+    import time
+    oracle = _oracle_v2()
+    rate = oracle.question("q-rate")
+    # Same shape, negative exponent: the denominator would expand to
+    # 10**18 digits. The v7 bound rejects it before conversion.
+    start = time.monotonic()
+    result = score_answer(
+        rate, {"text": "1e-999999999999999999", "value": 50.0, "unit": "percent",
+               "cited_locators": ["loc-1"]},
+        authorized_locators=["loc-1"])
+    elapsed = time.monotonic() - start
+    assert result.verdict == "FAIL" and result.dimension == "consistency"
+    assert result.critical is True
+    assert elapsed < 10, f"huge-negative-exponent rate check took {elapsed:.1f}s"

@@ -16,7 +16,7 @@ takes them as explicit caller-supplied values so it stays stdlib-pure and
 independently testable. Wiring the locator supply from a real Snapshot is a
 formal-stage integration step, not something this scaffolding invents.
 
-Scoring rules (version oracle-scoring-v6, frozen at build time):
+Scoring rules (version oracle-scoring-v7, frozen at build time):
 - exact: integer counts exact after versioned normalization (thousand
   separators and surrounding whitespace stripped; anything else unparseable).
 - uid: canonical representation after whitespace strip; aliases match ONLY
@@ -54,6 +54,16 @@ Scoring rules (version oracle-scoring-v6, frozen at build time):
   comparison is exact for any operand the context can construct, and a
   fixed-precision band-aid is not used. A Fraction conversion that
   cannot be made (NaN/Infinity) fails the check closed the same way.
+- consistency (v7): the exact rational comparison is bounded BEFORE
+  any Fraction conversion: an operand whose adjusted exponent or
+  coefficient digit count exceeds 10000 is unhandleable and fails the
+  check closed ("rate operand exceeds supported range") instead of
+  expanding into an unbounded integer (a short exponent token such as
+  1e999999999999999999 must never hang or exhaust memory). The bound
+  is orders of magnitude above any legitimate input -- structured
+  values and tolerances are floats (at most 17 significant digits,
+  |adjusted| <= 308) and verbatim CBA numbers are a few dozen digits
+  at most -- yet keeps every Fraction integer below ~20,000 digits.
 Critical failures (identity error, fabricated known-UNKNOWN, invalid
 mandatory locator, unsupported factual assertion) each block acceptance.
 Repeat protocol: a materially non-deterministic outcome (disagreeing runs)
@@ -87,7 +97,19 @@ from decimal import Decimal, DecimalException, InvalidOperation
 from fractions import Fraction
 from pathlib import Path
 
-SCORING_SPEC_VERSION = "oracle-scoring-v6"
+SCORING_SPEC_VERSION = "oracle-scoring-v7"
+
+# Largest magnitude (adjusted exponent) and coefficient length a rate
+# operand may have before the exact rational comparison. Structured
+# values and tolerances are floats (at most 17 significant digits,
+# |adjusted| <= 308); verbatim CBA numbers are a few dozen digits at
+# most. The bound is orders of magnitude above any legitimate input,
+# yet keeps every Fraction integer below ~20,000 digits (a few KB),
+# so the comparison can never allocate or compute far beyond the
+# input length. An operand beyond the bound is unhandleable and fails
+# closed (see _rate_operand_in_range).
+_MAX_RATE_OPERAND_ADJUSTED = 10000
+_MAX_RATE_OPERAND_DIGITS = 10000
 
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -419,6 +441,21 @@ def _verbatim_numbers(text):
     return numbers
 
 
+def _rate_operand_in_range(value: Decimal) -> bool:
+    """True when value's exact rational form stays within the supported
+    range for the rate consistency comparison. Both readings are O(1)
+    and bound the size of every integer Fraction(value) would build:
+    with L coefficient digits and exponent E, the numerator has at
+    most L + max(E, 0) digits and the denominator at most max(-E, 0),
+    and |adjusted()| = |L - 1 + E| bounds both. A non-finite operand
+    (NaN/Infinity) passes this bound check -- adjusted() returns 0
+    for it -- and is rejected downstream when Fraction raises
+    ValueError/OverflowError, which the caller fails closed.
+    """
+    return (abs(value.adjusted()) <= _MAX_RATE_OPERAND_ADJUSTED
+            and len(value.as_tuple().digits) <= _MAX_RATE_OPERAND_DIGITS)
+
+
 @dataclass(frozen=True)
 class ScoreResult:
     question_id: str
@@ -651,19 +688,32 @@ def score_answer(question: OracleQuestion, answer, *, authorized_locators=()) ->
                         if asserted != parsed_value:
                             return ScoreResult(qid, "FAIL", "consistency", True,
                                                "structured value contradicts verbatim text")
-                    elif (abs(Fraction(asserted)
-                              - Fraction(Decimal(str(parsed_value))))
-                            > Fraction(Decimal(str(question.tolerance)))):
-                        # Exact rational comparison: Fraction(Decimal) is
-                        # exact, so this difference does not depend on the
-                        # caller's Decimal context (precision, rounding,
-                        # traps) -- a low precision can no longer round a
-                        # real contradiction away, and no fixed precision
-                        # band-aid is used. Decimal(str(...)) on both
-                        # sides: Decimal - float raises TypeError, and
-                        # float tolerance is inexact.
-                        return ScoreResult(qid, "FAIL", "consistency", True,
-                                           "structured value contradicts verbatim text")
+                    else:  # rate
+                        structured = Decimal(str(parsed_value))
+                        tolerance = Decimal(str(question.tolerance))
+                        if (not _rate_operand_in_range(asserted)
+                                or not _rate_operand_in_range(structured)
+                                or not _rate_operand_in_range(tolerance)):
+                            # An operand whose exact rational form would
+                            # expand far beyond the input (e.g. a huge
+                            # exponent) cannot be compared safely: fail
+                            # closed instead of hanging or exhausting
+                            # memory building it.
+                            return ScoreResult(qid, "FAIL", "consistency", True,
+                                               "rate operand exceeds supported range")
+                        if (abs(Fraction(asserted) - Fraction(structured))
+                                > Fraction(tolerance)):
+                            # Exact rational comparison: Fraction(Decimal)
+                            # is exact, so this difference does not depend
+                            # on the caller's Decimal context (precision,
+                            # rounding, traps) -- a low precision can no
+                            # longer round a real contradiction away, and
+                            # no fixed precision band-aid is used.
+                            # Decimal(str(...)) on both sides: Decimal -
+                            # float raises TypeError, and float tolerance
+                            # is inexact.
+                            return ScoreResult(qid, "FAIL", "consistency", True,
+                                               "structured value contradicts verbatim text")
                 except (DecimalException, ValueError, OverflowError):
                     # Any decimal signal the comparison raises (a huge
                     # exponent overflowing the subtraction, an Inexact
@@ -671,8 +721,11 @@ def score_answer(question: OracleQuestion, answer, *, authorized_locators=()) ->
                     # closed with an explicit verdict, never an unhandled
                     # exception with no ScoreResult. Fraction raises
                     # ValueError for a NaN operand and OverflowError for
-                    # an infinite one where Decimal subtraction would
-                    # silently return NaN; both fail closed here too.
+                    # an infinite one; both fail closed here too (the
+                    # Decimal subtraction they replace could silently
+                    # yield NaN only from a NaN operand or infinities of
+                    # opposite sign, never from a finite value against
+                    # one infinity).
                     return ScoreResult(qid, "FAIL", "consistency", True,
                                        "verbatim number cannot be safely compared")
 
