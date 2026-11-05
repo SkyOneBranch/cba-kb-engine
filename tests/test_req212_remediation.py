@@ -1256,3 +1256,56 @@ def test_r5_rate_inexact_trap_returns_a_verdict_not_an_exception():
         ctx.traps[Inexact] = old_trap
     assert result.verdict == "FAIL" and result.dimension == "consistency"
     assert result.critical is True
+
+
+# R6 (new Q2 task, execution 3 repair): rate consistency must be exact,
+# independent of the caller's ambient Decimal precision -----------------
+
+def test_r6_rate_precision_2_cannot_round_away_contradiction():
+    import decimal
+    oracle = _oracle_v2()
+    rate = oracle.question("q-rate")
+    # Verbatim 50.0501 vs structured 50.0, tolerance 0.05: the true
+    # difference is 0.0501 > 0.05, so the check must FAIL. At precision
+    # 2 the old Decimal subtraction rounded 0.0501 to 0.050, the >
+    # comparison was False, and the matching structured value PASSED.
+    # The fix compares exact rationals, so ambient precision cannot
+    # round a real contradiction away.
+    ctx = decimal.getcontext()
+    old_prec = ctx.prec
+    ctx.prec = 2
+    try:
+        result = score_answer(
+            rate, {"text": "50.0501", "value": 50.0, "unit": "percent",
+                   "cited_locators": ["loc-1"]},
+            authorized_locators=["loc-1"])
+    finally:
+        ctx.prec = old_prec
+    assert result.verdict == "FAIL" and result.dimension == "consistency"
+    assert result.critical is True
+
+
+# R6: a fixed-precision band-aid does not close the same hole -----------
+
+def test_r6_rate_long_tail_cannot_round_away_contradiction():
+    import decimal
+    oracle = _oracle_v2()
+    rate = oracle.question("q-rate")
+    # A 60-digit tail ("50.05" + 55 zeros + "1") vs structured 50.0,
+    # tolerance 0.05: the true difference exceeds the tolerance by one
+    # unit in the 60th decimal place, so the check must FAIL. At
+    # precision 50 the old subtraction rounded it to exactly 0.05 and
+    # the answer PASSED -- any fixed precision is beaten by a longer
+    # tail. The fix compares exact rationals, so no tail length matters.
+    ctx = decimal.getcontext()
+    old_prec = ctx.prec
+    ctx.prec = 50
+    try:
+        result = score_answer(
+            rate, {"text": "50.05" + "0" * 55 + "1", "value": 50.0,
+                   "unit": "percent", "cited_locators": ["loc-1"]},
+            authorized_locators=["loc-1"])
+    finally:
+        ctx.prec = old_prec
+    assert result.verdict == "FAIL" and result.dimension == "consistency"
+    assert result.critical is True

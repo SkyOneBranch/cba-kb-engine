@@ -16,7 +16,7 @@ takes them as explicit caller-supplied values so it stays stdlib-pure and
 independently testable. Wiring the locator supply from a real Snapshot is a
 formal-stage integration step, not something this scaffolding invents.
 
-Scoring rules (version oracle-scoring-v5, frozen at build time):
+Scoring rules (version oracle-scoring-v6, frozen at build time):
 - exact: integer counts exact after versioned normalization (thousand
   separators and surrounding whitespace stripped; anything else unparseable).
 - uid: canonical representation after whitespace strip; aliases match ONLY
@@ -47,6 +47,13 @@ Scoring rules (version oracle-scoring-v5, frozen at build time):
   depends on caller trap settings. A rate comparison that raises any
   decimal signal (Overflow, InvalidOperation, Inexact, ...) also fails
   closed with an explicit verdict, never an unhandled exception.
+- consistency (v6): the rate difference is compared EXACTLY, as rational
+  numbers (Fraction(Decimal) is exact), so it is independent of the
+  caller's Decimal context (precision, rounding, traps). A low ambient
+  precision can no longer round a real contradiction away: the
+  comparison is exact for any operand the context can construct, and a
+  fixed-precision band-aid is not used. A Fraction conversion that
+  cannot be made (NaN/Infinity) fails the check closed the same way.
 Critical failures (identity error, fabricated known-UNKNOWN, invalid
 mandatory locator, unsupported factual assertion) each block acceptance.
 Repeat protocol: a materially non-deterministic outcome (disagreeing runs)
@@ -77,9 +84,10 @@ import json
 import re
 from dataclasses import dataclass, field
 from decimal import Decimal, DecimalException, InvalidOperation
+from fractions import Fraction
 from pathlib import Path
 
-SCORING_SPEC_VERSION = "oracle-scoring-v5"
+SCORING_SPEC_VERSION = "oracle-scoring-v6"
 
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -643,17 +651,28 @@ def score_answer(question: OracleQuestion, answer, *, authorized_locators=()) ->
                         if asserted != parsed_value:
                             return ScoreResult(qid, "FAIL", "consistency", True,
                                                "structured value contradicts verbatim text")
-                    elif abs(asserted - Decimal(str(parsed_value))) > Decimal(str(question.tolerance)):
-                        # Decimal(str(...)) on both sides: Decimal - float
-                        # raises TypeError, and float tolerance is inexact.
+                    elif (abs(Fraction(asserted)
+                              - Fraction(Decimal(str(parsed_value))))
+                            > Fraction(Decimal(str(question.tolerance)))):
+                        # Exact rational comparison: Fraction(Decimal) is
+                        # exact, so this difference does not depend on the
+                        # caller's Decimal context (precision, rounding,
+                        # traps) -- a low precision can no longer round a
+                        # real contradiction away, and no fixed precision
+                        # band-aid is used. Decimal(str(...)) on both
+                        # sides: Decimal - float raises TypeError, and
+                        # float tolerance is inexact.
                         return ScoreResult(qid, "FAIL", "consistency", True,
                                            "structured value contradicts verbatim text")
-                except DecimalException:
+                except (DecimalException, ValueError, OverflowError):
                     # Any decimal signal the comparison raises (a huge
                     # exponent overflowing the subtraction, an Inexact
                     # signal when the caller enabled that trap, ...) fails
                     # closed with an explicit verdict, never an unhandled
-                    # exception with no ScoreResult.
+                    # exception with no ScoreResult. Fraction raises
+                    # ValueError for a NaN operand and OverflowError for
+                    # an infinite one where Decimal subtraction would
+                    # silently return NaN; both fail closed here too.
                     return ScoreResult(qid, "FAIL", "consistency", True,
                                        "verbatim number cannot be safely compared")
 
