@@ -1203,3 +1203,56 @@ def test_r4_oversized_digit_string_fails_closed():
         authorized_locators=["loc-1"])
     assert result.verdict == "FAIL" and result.dimension == "value"
     assert result.critical is False
+
+
+# R5 (new Q2 task, execution 2 repair): rate consistency must reject a
+# non-finite verbatim number independently of caller trap settings -----
+
+def test_r5_rate_nan_token_fails_with_invalid_operation_trap_off():
+    import decimal
+    from decimal import InvalidOperation
+    oracle = _oracle_v2()
+    rate = oracle.question("q-rate")
+    # With the InvalidOperation trap disabled, Decimal on the huge
+    # exponent returns NaN instead of raising; the old code compared
+    # abs(NaN - 50.0) > tolerance, which is False, so the contradictory
+    # rate answer PASSED. The fix rejects non-finite tokens in
+    # _verbatim_numbers, so the check fails closed as undecidable.
+    ctx = decimal.getcontext()
+    old_trap = ctx.traps[InvalidOperation]
+    ctx.traps[InvalidOperation] = False
+    try:
+        result = score_answer(
+            rate, {"text": "13e99999999999999999999", "value": 50.0,
+                   "cited_locators": ["loc-1"]},
+            authorized_locators=["loc-1"])
+    finally:
+        ctx.traps[InvalidOperation] = old_trap
+    assert result.verdict == "FAIL" and result.dimension == "consistency"
+    assert result.critical is True
+
+
+# R5: the rate consistency branch must not let a Decimal signal escape --
+
+def test_r5_rate_inexact_trap_returns_a_verdict_not_an_exception():
+    import decimal
+    from decimal import Inexact
+    oracle = _oracle_v2()
+    rate = oracle.question("q-rate")
+    # With the Inexact trap enabled, the rate consistency subtraction
+    # (1e-100 minus 50.0) raises decimal.Inexact; the old handler caught
+    # only (InvalidOperation, Overflow), so the signal escaped
+    # score_answer with no ScoreResult. The fix catches
+    # decimal.DecimalException, so the check fails closed with a verdict.
+    ctx = decimal.getcontext()
+    old_trap = ctx.traps[Inexact]
+    ctx.traps[Inexact] = True
+    try:
+        result = score_answer(
+            rate, {"text": "1e-100", "value": 50.0,
+                   "cited_locators": ["loc-1"]},
+            authorized_locators=["loc-1"])
+    finally:
+        ctx.traps[Inexact] = old_trap
+    assert result.verdict == "FAIL" and result.dimension == "consistency"
+    assert result.critical is True

@@ -16,7 +16,7 @@ takes them as explicit caller-supplied values so it stays stdlib-pure and
 independently testable. Wiring the locator supply from a real Snapshot is a
 formal-stage integration step, not something this scaffolding invents.
 
-Scoring rules (version oracle-scoring-v4, frozen at build time):
+Scoring rules (version oracle-scoring-v5, frozen at build time):
 - exact: integer counts exact after versioned normalization (thousand
   separators and surrounding whitespace stripped; anything else unparseable).
 - uid: canonical representation after whitespace strip; aliases match ONLY
@@ -39,11 +39,14 @@ Scoring rules (version oracle-scoring-v4, frozen at build time):
   structured value alone. Known limitation: extraneous numbers in
   verbatim text (e.g. a year) are indistinguishable from the asserted
   value and fail the check; verbatim answers must not carry them.
-- consistency (v4): a recognized number token that Decimal cannot safely
+- consistency (v5): a recognized number token that Decimal cannot safely
   convert (e.g. an exponent beyond the context range) is never silently
-  dropped -- the check fails closed as undecidable. A rate comparison
-  that overflows the decimal context (Overflow / InvalidOperation) also
-  fails closed with an explicit verdict, never an unhandled exception.
+  dropped -- the check fails closed as undecidable. A token that converts
+  to a non-finite Decimal (NaN/Infinity, e.g. when the caller disabled
+  the InvalidOperation trap) is rejected the same way, so the check never
+  depends on caller trap settings. A rate comparison that raises any
+  decimal signal (Overflow, InvalidOperation, Inexact, ...) also fails
+  closed with an explicit verdict, never an unhandled exception.
 Critical failures (identity error, fabricated known-UNKNOWN, invalid
 mandatory locator, unsupported factual assertion) each block acceptance.
 Repeat protocol: a materially non-deterministic outcome (disagreeing runs)
@@ -73,10 +76,10 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation, Overflow
+from decimal import Decimal, DecimalException, InvalidOperation
 from pathlib import Path
 
-SCORING_SPEC_VERSION = "oracle-scoring-v4"
+SCORING_SPEC_VERSION = "oracle-scoring-v5"
 
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -387,16 +390,24 @@ def _verbatim_numbers(text):
     (e.g. an exponent beyond the context range) raises OracleError
     instead of being silently dropped: the caller must fail the
     consistency check closed, never auto-pass on the remaining numbers.
+    A token that converts to a non-finite Decimal (NaN/Infinity -- e.g.
+    when the caller disabled the InvalidOperation trap, so the
+    construction returns NaN instead of raising) is rejected the same
+    way, so no comparison can silently pass on a NaN.
     """
     if not isinstance(text, str):
         return []
     numbers = []
     for token in _NUM_TOKEN_RE.findall(text):
         try:
-            numbers.append(Decimal(token.replace(",", "").replace("_", "")))
+            number = Decimal(token.replace(",", "").replace("_", ""))
         except InvalidOperation:
             raise OracleError(
                 "verbatim number cannot be safely converted") from None
+        if not number.is_finite():
+            raise OracleError(
+                "verbatim number is not finite") from None
+        numbers.append(number)
     return numbers
 
 
@@ -637,11 +648,12 @@ def score_answer(question: OracleQuestion, answer, *, authorized_locators=()) ->
                         # raises TypeError, and float tolerance is inexact.
                         return ScoreResult(qid, "FAIL", "consistency", True,
                                            "structured value contradicts verbatim text")
-                except (InvalidOperation, Overflow):
-                    # A parsed number the decimal context cannot compare
-                    # (e.g. a huge exponent overflowing the subtraction)
-                    # fails closed with an explicit verdict, never an
-                    # unhandled exception with no ScoreResult.
+                except DecimalException:
+                    # Any decimal signal the comparison raises (a huge
+                    # exponent overflowing the subtraction, an Inexact
+                    # signal when the caller enabled that trap, ...) fails
+                    # closed with an explicit verdict, never an unhandled
+                    # exception with no ScoreResult.
                     return ScoreResult(qid, "FAIL", "consistency", True,
                                        "verbatim number cannot be safely compared")
 
