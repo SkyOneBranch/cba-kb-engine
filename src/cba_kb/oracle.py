@@ -16,7 +16,7 @@ takes them as explicit caller-supplied values so it stays stdlib-pure and
 independently testable. Wiring the locator supply from a real Snapshot is a
 formal-stage integration step, not something this scaffolding invents.
 
-Scoring rules (version oracle-scoring-v3, frozen at build time):
+Scoring rules (version oracle-scoring-v4, frozen at build time):
 - exact: integer counts exact after versioned normalization (thousand
   separators and surrounding whitespace stripped; anything else unparseable).
 - uid: canonical representation after whitespace strip; aliases match ONLY
@@ -39,6 +39,11 @@ Scoring rules (version oracle-scoring-v3, frozen at build time):
   structured value alone. Known limitation: extraneous numbers in
   verbatim text (e.g. a year) are indistinguishable from the asserted
   value and fail the check; verbatim answers must not carry them.
+- consistency (v4): a recognized number token that Decimal cannot safely
+  convert (e.g. an exponent beyond the context range) is never silently
+  dropped -- the check fails closed as undecidable. A rate comparison
+  that overflows the decimal context (Overflow / InvalidOperation) also
+  fails closed with an explicit verdict, never an unhandled exception.
 Critical failures (identity error, fabricated known-UNKNOWN, invalid
 mandatory locator, unsupported factual assertion) each block acceptance.
 Repeat protocol: a materially non-deterministic outcome (disagreeing runs)
@@ -68,10 +73,10 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, Overflow
 from pathlib import Path
 
-SCORING_SPEC_VERSION = "oracle-scoring-v3"
+SCORING_SPEC_VERSION = "oracle-scoring-v4"
 
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -318,13 +323,21 @@ def classify_answer(text) -> str:
 
 
 def _parse_count(value):
-    """Versioned count normalization: strip separators/space, then int."""
+    """Versioned count normalization: strip separators/space, then int.
+
+    A digit string beyond Python's int-conversion limit (4300 digits)
+    is unparseable, not an exception: return None so the caller fails
+    the value check closed with a verdict, never raising.
+    """
     if isinstance(value, int) and not isinstance(value, bool):
         return value
     if isinstance(value, str):
         cleaned = value.replace(",", "").replace("_", "").replace(" ", "").strip()
         if re.fullmatch(r"[+-]?\d+", cleaned):
-            return int(cleaned)
+            try:
+                return int(cleaned)
+            except ValueError:
+                return None
     return None
 
 
@@ -352,7 +365,10 @@ def _parse_number(value):
 # such as "Q1") are not asserted numbers. A dotted run such as "v1.2" or
 # "3.14.15" matches nothing: the lookarounds reject a number glued to a
 # dot-digit on either side. Residual, disclosed: integer+letters is
-# skipped, and structured rate values still parse through float.
+# skipped, and structured rate values still parse through float. A token
+# the regex recognizes but Decimal cannot safely convert (an exponent
+# beyond the context range) is NOT dropped: _verbatim_numbers raises
+# OracleError and the caller fails the consistency check closed.
 _NUM_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_-])(?<![0-9]\.)[+-]?(?:"
     r"\d[\d_]*(?:,\d[\d_]{2})*\.\d[\d_]*(?:[eE][+-]?\d[\d_]*)?(?![0-9])(?!\.\d)"
@@ -367,6 +383,10 @@ def _verbatim_numbers(text):
     Text with no asserted number yields []; the caller skips the
     cross-check there, never guessing. Every returned number counts:
     any one contradicting the structured value fails the check.
+    A token the regex recognizes but Decimal cannot safely convert
+    (e.g. an exponent beyond the context range) raises OracleError
+    instead of being silently dropped: the caller must fail the
+    consistency check closed, never auto-pass on the remaining numbers.
     """
     if not isinstance(text, str):
         return []
@@ -375,7 +395,8 @@ def _verbatim_numbers(text):
         try:
             numbers.append(Decimal(token.replace(",", "").replace("_", "")))
         except InvalidOperation:
-            continue
+            raise OracleError(
+                "verbatim number cannot be safely converted") from None
     return numbers
 
 
@@ -515,23 +536,34 @@ def score_answer_approved(question, answer, *, oracle: Oracle, approval,
     """Formal scoring entrypoint: approval-bound, then the standard scorer.
 
     The question must be the approved Oracle's own question object: the
-    caller-supplied question must be a real OracleQuestion, its
-    question_id must resolve to an approved question via the Oracle's own
-    tuple, and the fields must match -- and the APPROVED object is scored,
-    never the caller's object. Membership is never judged by the caller's
-    __eq__: a duck-typed stand-in or a lying __eq__ cannot smuggle a
-    substituted question past the approval check. The caller-supplied
-    locator set must digest to the approval's locator_set_digest, so a
-    foreign locator cannot be smuggled in through the allowlist. Any
-    approval mismatch raises OracleError and no score is produced.
+    caller-supplied question must be an OracleQuestion of the EXACT type
+    (a subclass is rejected -- isinstance would admit a subclass whose
+    __eq__ lies about field equality), its question_id must resolve to
+    an approved question via the Oracle's own tuple, and the fields must
+    match -- and the APPROVED object is scored, never the caller's
+    object. Field equality is judged on the canonical JSON of both
+    questions' to_dict() values, never by the caller's __eq__: a lying
+    __eq__ (or a lying expected value) cannot report equality it does
+    not have, and a non-serializable expected value fails closed.
+    Membership is never judged by the caller's __eq__: a duck-typed
+    stand-in or a lying __eq__ cannot smuggle a substituted question
+    past the approval check. The caller-supplied locator set must digest
+    to the approval's locator_set_digest, so a foreign locator cannot be
+    smuggled in through the allowlist. Any approval mismatch raises
+    OracleError and no score is produced.
     """
     verify_scoring_approval(approval, oracle=oracle, snapshot_digest=snapshot_digest)
-    if not isinstance(question, OracleQuestion):
-        raise OracleError("question must be an OracleQuestion object")
+    if type(question) is not OracleQuestion:
+        raise OracleError("question must be an OracleQuestion object, not a subclass")
     if not isinstance(getattr(question, "question_id", None), str) or not question.question_id:
         raise OracleError("question must carry a question_id")
     approved = oracle.question(question.question_id)  # raises OracleError if unknown
-    if approved != question:
+    try:
+        fields_match = (canonical_json(approved.to_dict())
+                        == canonical_json(question.to_dict()))
+    except (TypeError, ValueError):
+        raise OracleError("question fields cannot be safely compared") from None
+    if not fields_match:
         raise OracleError("question is not part of the approved Oracle")
     if locator_set_digest(authorized_locators) != approval.locator_set_digest:
         raise OracleError("authorized locator set does not match the approval's locator-set digest")
@@ -585,17 +617,33 @@ def score_answer(question: OracleQuestion, answer, *, authorized_locators=()) ->
         parsed_value = (_parse_count(value) if question.comparison == "exact"
                         else _parse_number(value))
         if parsed_value is not None:
-            for asserted in _verbatim_numbers(text):
-                if question.comparison == "exact":
-                    # Decimal vs int compares exactly (no float rounding).
-                    if asserted != parsed_value:
+            # A recognized verbatim number that Decimal cannot safely
+            # convert fails the check closed as undecidable, never
+            # auto-passes on the remaining numbers.
+            try:
+                asserted_numbers = _verbatim_numbers(text)
+            except OracleError:
+                return ScoreResult(qid, "FAIL", "consistency", True,
+                                   "verbatim number cannot be safely converted")
+            for asserted in asserted_numbers:
+                try:
+                    if question.comparison == "exact":
+                        # Decimal vs int compares exactly (no float rounding).
+                        if asserted != parsed_value:
+                            return ScoreResult(qid, "FAIL", "consistency", True,
+                                               "structured value contradicts verbatim text")
+                    elif abs(asserted - Decimal(str(parsed_value))) > Decimal(str(question.tolerance)):
+                        # Decimal(str(...)) on both sides: Decimal - float
+                        # raises TypeError, and float tolerance is inexact.
                         return ScoreResult(qid, "FAIL", "consistency", True,
                                            "structured value contradicts verbatim text")
-                elif abs(asserted - Decimal(str(parsed_value))) > Decimal(str(question.tolerance)):
-                    # Decimal(str(...)) on both sides: Decimal - float
-                    # raises TypeError, and float tolerance is inexact.
+                except (InvalidOperation, Overflow):
+                    # A parsed number the decimal context cannot compare
+                    # (e.g. a huge exponent overflowing the subtraction)
+                    # fails closed with an explicit verdict, never an
+                    # unhandled exception with no ScoreResult.
                     return ScoreResult(qid, "FAIL", "consistency", True,
-                                       "structured value contradicts verbatim text")
+                                       "verbatim number cannot be safely compared")
 
     if question.comparison == "exact":
         parsed = _parse_count(value)

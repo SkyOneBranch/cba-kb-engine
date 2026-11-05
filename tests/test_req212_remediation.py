@@ -1109,3 +1109,97 @@ def test_r3_approval_pairs_locator_set_with_real_snapshot_digest():
         pass
     else:
         raise AssertionError("a different Snapshot digest must not score under this approval")
+
+
+# --- R4: Q2 re-review Round 3 blockers (FAIL on HEAD 8ad490c0) ---------------
+# Each test below fails on HEAD 8ad490c0 for its intended reason and passes
+# on the repaired HEAD.
+
+# B1: an OracleQuestion SUBCLASS with a lying __eq__ must not pass the
+# formal field-match check ----------------------------------------------------
+
+class _LyingEqSubclass(OracleQuestion):
+    """Real OracleQuestion subclass whose __eq__ always reports True."""
+
+    def __eq__(self, other):
+        return True
+
+    def __hash__(self):
+        return hash("q-count")
+
+
+def test_r4_formal_scoring_rejects_lying_eq_subclass():
+    from cba_kb.oracle import score_answer_approved
+    oracle = _oracle_v2()
+    approval = _approval(oracle)
+    fake = _LyingEqSubclass("q-count", "synthetic count?", "exact",
+                            expected=13, mandatory_locator=True)
+    # isinstance admits the subclass, and the old field check
+    # (approved != question) consults the subclass's lying __eq__ via
+    # the reflected comparison, so the check passes and a score is
+    # produced instead of OracleError. Scoring still uses the approved
+    # object, so the original substituted-expectation exploit stays
+    # closed -- but the promised rejection of a question whose fields
+    # differ is bypassed.
+    assert fake in oracle.questions
+    try:
+        score_answer_approved(
+            fake, {"text": "13", "value": "13", "cited_locators": ["loc-1"]},
+            oracle=oracle, approval=approval, snapshot_digest="b" * 64,
+            authorized_locators=["loc-1"])
+    except OracleError:
+        pass
+    else:
+        raise AssertionError("a subclass with a lying __eq__ must not score")
+
+
+# B2: a recognized exponent token that Decimal cannot convert must fail
+# the consistency check, never be silently dropped ----------------------------
+
+def test_r4_unconvertible_exponent_token_fails_consistency():
+    oracle = _oracle_v2()
+    count = oracle.question("q-count")
+    # "13e99999999999999999999" matches the number regex, but Decimal
+    # raises InvalidOperation on it; the old parser dropped it, so the
+    # check saw no contradiction and the matching structured value 12
+    # passed.
+    contra = score_answer(
+        count, {"text": "13e99999999999999999999", "value": "12",
+                "cited_locators": ["loc-1"]},
+        authorized_locators=["loc-1"])
+    assert contra.verdict == "FAIL" and contra.dimension == "consistency"
+    assert contra.critical is True
+
+
+# B3: a parsed exponent that overflows the rate subtraction must fail
+# closed with a ScoreResult, never raise --------------------------------------
+
+def test_r4_rate_overflow_fails_closed_with_a_verdict():
+    oracle = _oracle_v2()
+    rate = oracle.question("q-rate")
+    # "1e1000000" parses as a Decimal, but the rate consistency
+    # subtraction overflows the default decimal context; the old code
+    # let decimal.Overflow escape score_answer with no ScoreResult.
+    result = score_answer(
+        rate, {"text": "1e1000000", "value": 50.0,
+               "cited_locators": ["loc-1"]},
+        authorized_locators=["loc-1"])
+    assert result.verdict == "FAIL" and result.dimension == "consistency"
+    assert result.critical is True
+
+
+# Author fixup (iron-rule self-check finding, NOT one of the three Q2
+# blockers): a structured count string beyond Python's int-conversion
+# limit (4300 digits) made _parse_count raise ValueError out of
+# score_answer with no ScoreResult. The fix returns None for such a
+# string so the exact branch fails closed with a verdict. On the old
+# HEAD this test fails because the ValueError escapes.
+def test_r4_oversized_digit_string_fails_closed():
+    oracle = _oracle_v2()
+    count = oracle.question("q-count")
+    result = score_answer(
+        count, {"text": "12", "value": "9" * 5000,
+                "cited_locators": ["loc-1"]},
+        authorized_locators=["loc-1"])
+    assert result.verdict == "FAIL" and result.dimension == "value"
+    assert result.critical is False
