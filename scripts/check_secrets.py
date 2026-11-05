@@ -40,7 +40,10 @@ MAX_MEMBERS = 2000
 # values with the same shape match too, which is why the gate is fail-closed
 # and disposition (AC-B3) is a separate, evidence-bound step. The patterns
 # are written with escaped separators so this file's own source text does
-# not itself match them.
+# not itself match them. Residual risks (not closed by this gate): the frozen
+# pattern set v1 itself misses some forms (e.g. /drive/folders/<id> whose id
+# does not start with '1' — a pattern-version question, not a scanner
+# deviation); a digest verifies bytes, not path binding.
 _M_DRIVE_HOST = r'drive\.google\.com'
 M_DRIVE_URL = re.compile(
     rb'https?://' + _M_DRIVE_HOST.encode() +
@@ -62,10 +65,36 @@ def _placeholder(value):
             or value.startswith(('os.environ[', 'os.getenv(', 'environ.get(', 'getenv(')))
 
 
+def _morphology_in_path(path):
+    """True if any '!' component of path itself matches Drive-ID morphology.
+
+    A ZIP member name or caller path that IS an identifier-shaped token must
+    not survive into finding output verbatim.
+    """
+    for component in str(path).split('!'):
+        data = component.encode('utf-8')
+        if M_DRIVE_URL.search(data) or M_DRIVE_FIELD.search(data):
+            return True
+        for match in M_DRIVE_TOKEN.finditer(data):
+            token = match.group(0)
+            if not (M_HEX40.match(token) or M_HEX64.match(token) or M_DIGITS.match(token)):
+                return True
+    return False
+
+
+def _safe_path(path):
+    """Path for finding output: fingerprinted when it itself carries morphology."""
+    text = str(path)
+    if _morphology_in_path(text):
+        return '[path-sha256:' + hashlib.sha256(text.encode()).hexdigest()[:12] + ']'
+    return text
+
+
 def _finding(path, rule, value=b'', line=0):
     if isinstance(value, str):
         value = value.encode('utf-8')
-    if any(pattern.search(str(path)) for pattern in PATTERNS.values()) or ASSIGNMENT.search(str(path)):
+    if (any(pattern.search(str(path)) for pattern in PATTERNS.values())
+            or ASSIGNMENT.search(str(path)) or _morphology_in_path(path)):
         path = '[path-sha256:' + hashlib.sha256(str(path).encode()).hexdigest()[:12] + ']'
     return {'path': str(path), 'rule_id': rule, 'line': line,
             'fingerprint': 'sha256:' + hashlib.sha256(value).hexdigest()[:12]}
@@ -170,6 +199,20 @@ def scan_bytes(data, path='<payload>', *, _depth=0, _budget=None, morphology=Fal
     encoding = 'utf-16' if data.startswith((b'\xff\xfe', b'\xfe\xff')) else 'utf-8-sig'
     text = data.decode(encoding, errors='replace')
     findings.extend(_scan_text(text, path, morphology=morphology))
+    if morphology and encoding == 'utf-16':
+        # The BOM-indicated decoding can mangle the input (e.g. BOM-prefixed
+        # UTF-8 bytes decoded as UTF-16): a morphology token contiguous in
+        # the raw bytes would otherwise escape, while the frozen census
+        # (raw-byte patterns) still catches it. Scan the UTF-8 view as well,
+        # reporting only tokens not already found (fingerprint dedup).
+        # Genuine UTF-16 content cannot false-positive here: its raw bytes
+        # never contain a contiguous ASCII token run.
+        seen = {f['fingerprint'] for f in findings if f['rule_id'] == 'S_DRIVE_ID_MORPHOLOGY'}
+        for token, line in _morphology_tokens(data.decode('utf-8-sig', errors='replace')):
+            finding = _finding(path, 'S_DRIVE_ID_MORPHOLOGY', token, line)
+            if finding['fingerprint'] not in seen:
+                seen.add(finding['fingerprint'])
+                findings.append(finding)
     if name.endswith('.json') or text.lstrip().startswith(('{', '[')):
         try:
             decoded = json.loads(text)
@@ -181,12 +224,21 @@ def scan_bytes(data, path='<payload>', *, _depth=0, _budget=None, morphology=Fal
     return findings
 
 
-def scan_morphology_bytes(data, path='<payload>'):
-    """Return only Drive-ID morphology findings for exact bytes (fingerprint only)."""
+def scan_morphology_bytes(data, path='<payload>', *, include_infrastructure=True):
+    """Return Drive-ID morphology findings for exact bytes (fingerprint only).
+
+    With include_infrastructure (default), archive-unreadable/limit findings
+    are included, not filtered out: an unreadable archive must fail the
+    morphology guard instead of passing silently on "no morphology found".
+    Callers that need the pure morphology predicate (reintroduction check)
+    pass include_infrastructure=False.
+    """
     if not isinstance(data, bytes):
         raise TypeError('Morphology scanner requires bytes')
-    return [f for f in scan_bytes(data, path, morphology=True)
-            if f['rule_id'] == 'S_DRIVE_ID_MORPHOLOGY']
+    wanted = {'S_DRIVE_ID_MORPHOLOGY'}
+    if include_infrastructure:
+        wanted |= {'S_ARCHIVE_UNREADABLE', 'S_ARCHIVE_LIMIT'}
+    return [f for f in scan_bytes(data, path, morphology=True) if f['rule_id'] in wanted]
 
 
 def require_morphology_clean(data, path='<payload>'):
@@ -202,6 +254,11 @@ def verify_digest(path, expected_sha256):
     UNREADABLE_ARTIFACT / MALFORMED_DIGEST / DIGEST_MISMATCH. A substituted
     reference fails here because the bytes at the referenced path no longer
     match the recorded digest. Never raises for the checked conditions.
+
+    Residual risk: this compares the bytes at a path with a digest; it does
+    not authenticate the path binding. A path and digest replaced together
+    still verify. Callers must bind the expected digest to a trusted
+    reference outside this check.
     """
     if not isinstance(expected_sha256, str) or not _DIGEST_RE.match(expected_sha256):
         return (False, 'MALFORMED_DIGEST')
@@ -220,7 +277,20 @@ def _git_blob_id(data):
 
 
 def historical_blob_ids(root='.'):
-    """Set of blob SHA-1s reachable from any ref. Raises on git failure (fail closed)."""
+    """Set of blob SHA-1s reachable from any ref. Raises on git failure (fail closed).
+
+    A shallow repository hides history, so it raises HISTORY_UNAVAILABLE
+    instead of reporting "no re-introduction" against a truncated object set.
+    Unexpected or missing objects in batch-check output raise as well.
+    """
+    try:
+        shallow = subprocess.check_output(
+            ['git', 'rev-parse', '--is-shallow-repository'],
+            cwd=root, stderr=subprocess.STDOUT).decode().strip()
+    except (subprocess.CalledProcessError, OSError) as exc:
+        raise RuntimeError('HISTORY_UNAVAILABLE: ' + str(exc))
+    if shallow == 'true':
+        raise RuntimeError('HISTORY_UNAVAILABLE: shallow repository hides history')
     try:
         listing = subprocess.check_output(
             ['git', 'rev-list', '--objects', '--all'], cwd=root, stderr=subprocess.STDOUT)
@@ -239,7 +309,11 @@ def historical_blob_ids(root='.'):
     blobs = set()
     for line in proc.stdout.splitlines():
         fields = line.split()
-        if len(fields) == 2 and fields[1] == 'blob':
+        if len(fields) != 2:
+            raise RuntimeError('HISTORY_UNAVAILABLE: unexpected batch-check line')
+        if fields[1] == 'missing':
+            raise RuntimeError('HISTORY_UNAVAILABLE: missing object in history')
+        if fields[1] == 'blob':
             blobs.add(fields[0])
     return blobs
 
@@ -267,8 +341,8 @@ def reintroduced_findings(root='.', *, staged=True):
             data = subprocess.check_output(['git', 'show', ref], cwd=root)
         except (subprocess.CalledProcessError, OSError) as exc:
             raise RuntimeError('HISTORY_UNAVAILABLE: ' + str(exc))
-        if _git_blob_id(data) in history and scan_morphology_bytes(data, path):
-            findings.append({'path': str(path), 'rule_id': 'S_REINTRODUCED_HISTORICAL',
+        if _git_blob_id(data) in history and scan_morphology_bytes(data, path, include_infrastructure=False):
+            findings.append({'path': _safe_path(path), 'rule_id': 'S_REINTRODUCED_HISTORICAL',
                              'line': 0,
                              'fingerprint': 'sha256:' + hashlib.sha256(data).hexdigest()[:12]})
     return findings
@@ -308,13 +382,21 @@ def main(argv=None):
                         help='Verify one artifact digest; exit 0 on match, 2 otherwise')
     parser.add_argument('paths', nargs='*', type=Path, help='Explicit candidate/readback files')
     args = parser.parse_args(argv)
+    if args.digest and (args.morphology or args.reintroduction or args.tracked or args.paths):
+        # Digest verification and scanning are separate runs: a --digest
+        # success previously returned before any scan ran, so combined flags
+        # could silently skip scanning. Reject the combination instead.
+        print(json.dumps({'status': 'FAIL', 'reason': 'DIGEST_MODE_EXCLUSIVE',
+                          'detail': '--digest cannot be combined with scanning inputs'},
+                         sort_keys=True), file=sys.stderr)
+        return 2
     if args.digest:
         ok, reason = verify_digest(args.digest[0], args.digest[1])
         if ok:
             print('Digest verified')
             return 0
         print(json.dumps({'status': 'FAIL', 'reason': reason,
-                          'path': args.digest[0]}, sort_keys=True), file=sys.stderr)
+                          'path': _safe_path(args.digest[0])}, sort_keys=True), file=sys.stderr)
         return 2
     findings = []
     infrastructure_failure = False

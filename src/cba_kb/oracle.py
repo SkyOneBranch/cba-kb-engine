@@ -33,6 +33,10 @@ Repeat protocol: a materially non-deterministic outcome (disagreeing runs)
 triggers at least THREE TOTAL runs including the initial; all results are
 retained; conflicts are never averaged into a pass and are reported as
 ADJUDICATION_REQUIRED for independent adjudication.
+
+Residual risk: manifest digests prove internal consistency, not external
+approval — a fully replaced manifest with a recomputed digest verifies OK,
+so approval binding lives in the execution record, not in this module.
 """
 
 from __future__ import annotations
@@ -48,9 +52,9 @@ _HEX40 = re.compile(r"^[0-9a-f]{40}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 # Versioned refusal markers for honesty classification. A text answer is
-# UNKNOWN only when its normalized form is one of these (or starts with the
-# UNKNOWN marker followed by a separator); anything asserting a value is a
-# value answer, even if hedged.
+# UNKNOWN only when its normalized form is one of these, or a marker followed
+# by an empty or marker-only remainder; anything asserting a value is a
+# value answer, even if hedged or UNKNOWN:-prefixed.
 _UNKNOWN_MARKERS = {"UNKNOWN", "NOT KNOWN", "REFUSAL", "REFUSED", "NO ANSWER"}
 
 
@@ -136,6 +140,18 @@ class OracleQuestion:
                 raise OracleError(f"question {self.question_id}: rate needs unit and precision")
             if self.tolerance < 0:
                 raise OracleError("tolerance must be >= 0")
+        # Freeze the alias map: a caller-supplied list must not stay mutable
+        # after build, or post-build mutation would change scoring while the
+        # stored manifest digest stays unchanged. Malformed pairs fail here.
+        try:
+            coerced = []
+            for pair in self.alias_map:
+                if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                    raise ValueError("alias_map pair must be a 2-element list/tuple")
+                coerced.append((pair[0], pair[1]))
+        except (TypeError, ValueError) as exc:
+            raise OracleError(f"question {self.question_id}: malformed alias_map") from exc
+        object.__setattr__(self, "alias_map", tuple(coerced))
         aliases = [a for a, _ in self.alias_map]
         if len(set(aliases)) != len(aliases):
             raise OracleError(f"question {self.question_id}: duplicate alias in alias_map")
@@ -180,6 +196,11 @@ class Oracle:
             raise OracleError("Oracle needs at least one source")
         if not self.questions:
             raise OracleError("Oracle needs at least one question")
+        # Freeze sequence fields the same way as alias_map: caller lists must
+        # not stay mutable after build, or the manifest would drift from its
+        # stored digest.
+        object.__setattr__(self, "sources", tuple(self.sources))
+        object.__setattr__(self, "questions", tuple(self.questions))
         ids = [q.question_id for q in self.questions]
         if len(set(ids)) != len(ids):
             raise OracleError("duplicate question_id in Oracle")
@@ -222,6 +243,12 @@ def verify_manifest(manifest) -> tuple:
 
     Reasons: OK / MALFORMED_MANIFEST / DIGEST_MISMATCH. Any structural gap
     or altered digest fails closed; nothing here repairs a manifest.
+
+    Residual risk: verification proves internal consistency only. A fully
+    replaced manifest whose digest was recomputed over the replaced content
+    verifies OK. Binding a manifest to an independent approval or to a
+    scoring-code SHA is a process-level control outside this module;
+    verify_manifest alone never proves approval.
     """
     try:
         version = manifest["version"]
@@ -255,8 +282,12 @@ def classify_answer(text) -> str:
     normalized = " ".join(text.strip().upper().split())
     if normalized in _UNKNOWN_MARKERS:
         return "UNKNOWN"
-    if normalized.startswith("UNKNOWN:") or normalized.startswith("UNKNOWN -"):
-        return "UNKNOWN"
+    for prefix in ("UNKNOWN:", "UNKNOWN -"):
+        if normalized.startswith(prefix):
+            rest = normalized[len(prefix):].strip()
+            if rest == "" or rest in _UNKNOWN_MARKERS:
+                return "UNKNOWN"
+            return "VALUE"
     return "VALUE"
 
 
@@ -296,8 +327,9 @@ def score_answer(question: OracleQuestion, answer, *, authorized_locators=()) ->
     """Deterministically score one answer. Pure function; no client I/O.
 
     answer is either verbatim text (str) or a dict with keys text / value /
-    unit / cited_locators. Locator checks always run against the caller
-    supplied authorized set: an empty set means no locator can pass.
+    unit / cited_locators. Locator checks run for EVERY question type
+    against the caller supplied authorized set: an empty set means no cited
+    locator can pass, and a mandatory locator must be cited and in-Snapshot.
     """
     qid = question.question_id
     if isinstance(answer, dict):
@@ -313,6 +345,18 @@ def score_answer(question: OracleQuestion, answer, *, authorized_locators=()) ->
             return ScoreResult(qid, "PASS", "honesty", False, "correct UNKNOWN/refusal")
         return ScoreResult(qid, "FAIL", "honesty", True,
                            "fabricated known-UNKNOWN: value asserted where Oracle expects UNKNOWN")
+
+    # Locator discipline for all question types (previously only locator-type
+    # questions checked, so a mandatory-locator count question could PASS
+    # with missing or out-of-Snapshot locators).
+    allowed = set(authorized_locators)
+    cited_list = list(cited) if isinstance(cited, (list, tuple)) else []
+    if question.mandatory_locator and not cited_list:
+        return ScoreResult(qid, "FAIL", "locator", True, "missing cited locator")
+    bad = [loc for loc in cited_list if loc not in allowed]
+    if bad:
+        return ScoreResult(qid, "FAIL", "locator", bool(question.mandatory_locator),
+                           "invalid/missing/out-of-Snapshot locator")
 
     if question.comparison == "exact":
         parsed = _parse_count(value)
@@ -383,10 +427,24 @@ class ClientReceipt:
             _require_nonempty(getattr(self, name), name)
         if not isinstance(self.verbatim_answer, str) or not self.verbatim_answer.strip():
             raise OracleError("verbatim_answer must be non-empty text")
+        # Freeze cited locators: a caller list must not stay mutable, or
+        # post-construction mutation would change later validation.
+        if not isinstance(self.cited_locators, (list, tuple)):
+            raise OracleError("cited_locators must be a list or tuple")
+        object.__setattr__(self, "cited_locators", tuple(self.cited_locators))
 
 
-def validate_receipt(receipt: ClientReceipt, *, oracle: Oracle, authorized_locators=()) -> list:
-    """Validate a receipt against its Oracle. Returns error strings ([] = valid)."""
+def validate_receipt(receipt: ClientReceipt, *, oracle: Oracle, authorized_locators=(),
+                     expected_snapshot_digest=None, expected_authorization_domain=None) -> list:
+    """Validate a receipt against its Oracle. Returns error strings ([] = valid).
+
+    When expected_snapshot_digest / expected_authorization_domain are
+    supplied they are compared exactly; without them the receipt's snapshot
+    and domain are format-checked only and NOT authenticated (residual risk:
+    a receipt alone cannot prove which Snapshot or domain it came from —
+    callers that need that binding must pass the expected values).
+    Rejected locators are reported by fingerprint only, never echoed.
+    """
     errors = []
     try:
         question = oracle.question(receipt.question_id)
@@ -396,14 +454,21 @@ def validate_receipt(receipt: ClientReceipt, *, oracle: Oracle, authorized_locat
         errors.append("question_set_version does not match Oracle version")
     if receipt.manifest_digest != oracle.artifact_digest:
         errors.append("manifest_digest does not match Oracle artifact_digest (altered/substituted manifest)")
+    if expected_snapshot_digest is not None and receipt.snapshot_digest != expected_snapshot_digest:
+        errors.append("snapshot_digest does not match expected Snapshot digest")
+    if expected_authorization_domain is not None and receipt.authorization_domain != expected_authorization_domain:
+        errors.append("authorization_domain does not match expected domain")
     if receipt.verbatim_answer.strip() == "":
         errors.append("verbatim_answer empty")
     allowed = set(authorized_locators)
     for loc in receipt.cited_locators:
         if loc not in allowed:
-            errors.append(f"cited locator outside authorized Snapshot: {loc}")
+            errors.append("cited locator outside authorized Snapshot: sha256:"
+                          + _sha256_hex(str(loc).encode())[:12])
     if question.comparison == "locator" and not receipt.cited_locators:
         errors.append("locator question receipt cites no locator")
+    if question.mandatory_locator and not receipt.cited_locators:
+        errors.append("mandatory-locator question receipt cites no locator")
     return errors
 
 
@@ -418,8 +483,11 @@ def adjudicate_repeat(results, *, minimum_runs: int = 3) -> tuple:
 
     Statuses: AGREED / INSUFFICIENT_RUNS / ADJUDICATION_REQUIRED. Conflicts
     are never averaged into a pass and no reviewer override is encoded here.
+    The floor is three total runs: a caller-supplied minimum below three is
+    raised to three, never honored downward.
     """
-    if len(results) < minimum_runs:
+    effective_minimum = max(minimum_runs, 3)
+    if len(results) < effective_minimum:
         return ("INSUFFICIENT_RUNS", None)
     verdicts = {r.verdict for r in results}
     if len(verdicts) == 1:
