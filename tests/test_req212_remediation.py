@@ -2,8 +2,14 @@
 
 Round-1 tests FAIL on the Q2-FAIL HEAD 7eb9ff33 and PASS on the remediated
 HEAD 677b5438. Round-2 tests (marked R2) FAIL on HEAD 677b5438 (the Q2
-re-review FAIL HEAD) and PASS on the repaired HEAD. One guard test is
-explicitly labelled as passing on both HEADs by design.
+re-review FAIL HEAD) and PASS on the repaired HEAD. Round-3 tests
+(marked R3) FAIL on HEAD 8bcd8875 (the Q2 re-review Round 2 FAIL HEAD)
+and PASS on the repaired HEAD. One guard test is explicitly labelled as
+passing on both HEADs by design, and the Snapshot-pairing test is
+labelled as a capability test passing on the R3 baseline HEAD 8bcd8875
+and the repaired HEAD by design (it fails on the older 677b5438 only
+because the locator-set entrypoints did not exist there yet -- API
+absence, not the attack). It closes an evidence gap, it does not falsify.
 New entrypoints are imported lazily inside the tests so that each test
 fails individually on the old HEAD (a missing entrypoint counts as FAIL
 there). All Drive-ID-like values are SYNTHETIC, built at runtime by
@@ -80,16 +86,28 @@ def _receipt(oracle, **overrides):
 
 
 def _approval(oracle, locators=("loc-1",), **overrides):
-    from cba_kb.oracle import ScoringApproval, locator_set_digest, scoring_code_sha
+    # Version-tolerant construction (R3): pass only the fields the
+    # ScoringApproval on the HEAD under test actually supports, so the
+    # approval-related tests fail on an old HEAD for their intended
+    # reason (the attack succeeding) instead of at fixture construction
+    # with ImportError for a helper the old HEAD never had. The old
+    # HEAD's score_answer_approved / validate_receipt_approved accept
+    # the same kwargs, so the attack logic itself is exercised there.
+    import dataclasses
+    from cba_kb.oracle import ScoringApproval, scoring_code_sha
+    supported = {f.name for f in dataclasses.fields(ScoringApproval)}
     fields = dict(
         manifest_digest=oracle.artifact_digest,
         version=oracle.version,
         scoring_code_sha=scoring_code_sha(),
         snapshot_digest="b" * 64,
-        authorization_domain="synthetic-domain",
-        locator_set_digest=locator_set_digest(locators),
     )
-    fields.update(overrides)
+    if "authorization_domain" in supported:
+        fields["authorization_domain"] = "synthetic-domain"
+    if "locator_set_digest" in supported:
+        from cba_kb.oracle import locator_set_digest
+        fields["locator_set_digest"] = locator_set_digest(locators)
+    fields.update({k: v for k, v in overrides.items() if k in supported})
     return ScoringApproval(**fields)
 
 
@@ -663,6 +681,15 @@ def _repo_with_copied_base_blob(base):
     (src / "new.txt").unlink()
     _git(src, "add", "-A")
     _commit(src, "remove copy")
+    # R3 fixture fix (Human-approved 2026-11-05): the original file is
+    # also removed at the final HEAD, so the final HEAD is genuinely
+    # clean under EVERY scan mode -- the previous fixture left orig.txt
+    # tracked, so "--tracked --morphology" flagged it and the test's
+    # "final HEAD is clean" premise held only for the morphology-off
+    # invocation.
+    (src / "orig.txt").unlink()
+    _git(src, "add", "-A")
+    _commit(src, "remove original")
     return src, base_sha
 
 
@@ -671,6 +698,8 @@ def test_r2_cumulative_flags_copied_base_blob_deleted_before_head():
     src, base_sha = _repo_with_copied_base_blob(base)
     tracked = _run_cli("--tracked", cwd=str(src))
     assert tracked.returncode == 0  # final HEAD is clean: the escape case
+    tracked_morph = _run_cli("--tracked", "--morphology", cwd=str(src))
+    assert tracked_morph.returncode == 0  # clean under morphology too
     cumulative = _run_cli("--cumulative", "--base", base_sha, cwd=str(src))
     assert cumulative.returncode == 1
     assert "S_DRIVE_ID_MORPHOLOGY" in cumulative.stderr
@@ -843,3 +872,240 @@ def test_r2_manifest_loader_error_hides_os_text():
         assert str(directory) not in str(exc)
     else:
         raise AssertionError("a directory manifest must fail closed")
+
+
+# --- R3: Q2 re-review Round 2 blockers (FAIL on HEAD 8bcd8875) ---------------
+# Each test below fails on HEAD 8bcd8875 for its intended reason and passes
+# on the repaired HEAD, except the Snapshot-pairing test, which is labelled
+# in place as a capability test passing on the R3 baseline HEAD and the
+# repaired HEAD by design.
+
+# B1: a question that only CLAIMS equality must not score ---------------------
+
+class _LyingEqQuestion:
+    """Question-shaped object whose __eq__ always reports True."""
+
+    question_id = "q-count"
+    comparison = "exact"
+    expected = 13
+    mandatory_locator = True
+
+    def __eq__(self, other):
+        return True
+
+    def __hash__(self):
+        return hash("q-count")
+
+
+def test_r3_formal_scoring_rejects_lying_eq_question():
+    from cba_kb.oracle import score_answer_approved
+    oracle = _oracle_v2()
+    approval = _approval(oracle)
+    fake = _LyingEqQuestion()
+    # The fake claims equality with the approved question while carrying a
+    # different expected value; the old code judges membership with the
+    # caller's __eq__ and then scores the caller's object.
+    assert fake in oracle.questions
+    try:
+        score_answer_approved(
+            fake, {"text": "13", "value": "13", "cited_locators": ["loc-1"]},
+            oracle=oracle, approval=approval, snapshot_digest="b" * 64,
+            authorized_locators=["loc-1"])
+    except OracleError:
+        pass
+    else:
+        raise AssertionError("a question that only claims equality must not score")
+
+
+# B2: a blob restored at its ORIGINAL path must be caught ---------------------
+
+def _repo_with_restored_base_blob(base):
+    src = base / "src"
+    _git(base, "init", "-q", "src")
+    (src / "orig.txt").write_text("old notes " + synth_token() + "\n")
+    _git(src, "add", "orig.txt")
+    _commit(src, "base")
+    base_sha = _git(src, "rev-parse", "HEAD").stdout.strip()
+    (src / "orig.txt").unlink()
+    _git(src, "add", "-A")
+    _commit(src, "delete orig")
+    (src / "orig.txt").write_text("old notes " + synth_token() + "\n")
+    _git(src, "add", "orig.txt")
+    _commit(src, "restore orig")
+    (src / "orig.txt").unlink()
+    _git(src, "add", "-A")
+    _commit(src, "delete orig again")
+    return src, base_sha
+
+
+def test_r3_cumulative_flags_restored_base_blob_at_original_path():
+    base = Path(tempfile.mkdtemp())
+    src, base_sha = _repo_with_restored_base_blob(base)
+    tracked = _run_cli("--tracked", cwd=str(src))
+    assert tracked.returncode == 0  # final HEAD is clean
+    cumulative = _run_cli("--cumulative", "--base", base_sha, cwd=str(src))
+    assert cumulative.returncode == 1
+    assert "S_DRIVE_ID_MORPHOLOGY" in cumulative.stderr
+
+
+# B3: a valid non-UTF-8 Git filename must not break enumeration --------------
+
+def test_r3_cumulative_survives_non_utf8_filename():
+    base = Path(tempfile.mkdtemp())
+    src = base / "src"
+    _git(base, "init", "-q", "src")
+    (src / "plain.txt").write_text("hello\n")
+    _git(src, "add", "plain.txt")
+    _commit(src, "base")
+    base_sha = _git(src, "rev-parse", "HEAD").stdout.strip()
+    # A tracked filename holding byte 0xff is a valid Git filename; the
+    # old code decoded the whole ls-tree output as strict UTF-8 and
+    # raised UnicodeDecodeError instead of failing closed.
+    bad = b"bad\xffname.txt"
+    with open(os.path.join(os.fsencode(str(src)), bad), "wb") as fh:
+        fh.write(b"notes\n")
+    subprocess.run([b"git", b"add", bad], cwd=str(src), check=True,
+                   capture_output=True)
+    _commit(src, "add non-utf8 name")
+    findings = SCANNER.cumulative_findings(str(src), base=base_sha)
+    assert findings == []  # the file holds no morphology tokens
+
+
+# B4: exact counts keep full precision; exponents and unit suffixes parse ----
+
+def _oracle_big():
+    return build_oracle(
+        version="oracle-v3-synthetic",
+        sources=[OracleSource("src-synth", "synthetic primary source",
+                              "LAWFUL_PUBLIC_SYNTHETIC")],
+        questions=[OracleQuestion("q-big", "synthetic big count?", "exact",
+                                  expected=9007199254740992,
+                                  mandatory_locator=True)],
+    )
+
+
+def test_r3_big_int_contradiction_fails():
+    oracle = _oracle_big()
+    big = oracle.question("q-big")
+    contra = score_answer(
+        big, {"text": "9007199254740993", "value": "9007199254740992",
+              "cited_locators": ["loc-1"]},
+        authorized_locators=["loc-1"])
+    assert contra.verdict == "FAIL" and contra.dimension == "consistency"
+    assert contra.critical is True
+
+
+def test_r3_big_int_agreement_has_no_consistency_false_positive():
+    oracle = _oracle_big()
+    big = oracle.question("q-big")
+    result = score_answer(
+        big, {"text": "9007199254740993", "value": "9007199254740993",
+              "cited_locators": ["loc-1"]},
+        authorized_locators=["loc-1"])
+    # The value itself mismatches the approved expected count, so the
+    # answer must fail -- but on the VALUE dimension, never on
+    # consistency: the verbatim number and the structured value agree.
+    assert result.verdict == "FAIL" and result.dimension == "value"
+
+
+def test_r3_scientific_notation_contradiction_fails():
+    oracle = _oracle_v2()
+    count = oracle.question("q-count")
+    contra = score_answer(
+        count, {"text": "1.3e1", "value": "12", "cited_locators": ["loc-1"]},
+        authorized_locators=["loc-1"])
+    assert contra.verdict == "FAIL" and contra.dimension == "consistency"
+    assert contra.critical is True
+
+
+def test_r3_unit_suffixed_decimal_contradiction_fails():
+    oracle = _oracle_v2()
+    count = oracle.question("q-count")
+    contra = score_answer(
+        count, {"text": "13.0points", "value": "12",
+                "cited_locators": ["loc-1"]},
+        authorized_locators=["loc-1"])
+    assert contra.verdict == "FAIL" and contra.dimension == "consistency"
+    assert contra.critical is True
+
+
+# B5-chain: the loader must not expose the raw path via its traceback --------
+
+def test_r3_manifest_loader_error_suppresses_exception_chain():
+    import traceback
+    tmp = Path(tempfile.mkdtemp())
+    directory = tmp / "adir"
+    directory.mkdir()
+    try:
+        SCANNER.load_expected_manifest(str(directory))
+    except ValueError as exc:
+        assert "MANIFEST_UNREADABLE" in str(exc)
+        assert str(directory) not in str(exc)
+        # The chained OSError carries the raw path; `from None` must
+        # suppress it so no formatted traceback exposes the path. The
+        # correct assertion is __suppress_context__, not
+        # __context__ is None (from None sets the flag, the context
+        # object itself stays attached but unformatted).
+        assert exc.__suppress_context__ is True
+        assert str(directory) not in traceback.format_exc()
+    else:
+        raise AssertionError("a directory manifest must fail closed")
+
+
+# Pairing gap (capability test, NOT a falsification test) ----------------------
+# The round-2 test proved the locator-set digest binding with a "b" * 64
+# placeholder for snapshot_digest and never the Snapshot's real
+# content_sha256. This test closes that evidence gap with a real Snapshot
+# digest. It PASSES ON THE R3 BASELINE HEAD 8bcd8875 AND THE REPAIRED
+# HEAD by design: the approval binding already compared snapshot digests
+# exactly on the old HEAD, so the old HEAD also accepts the real digest
+# and rejects a different one. (It fails on the older 677b5438 only
+# because the locator-set entrypoints did not exist there yet -- API
+# absence, not the attack.) Its value is the positive evidence that the
+# issuer pairing works end to end with a real Snapshot, plus the negative
+# case on the new HEAD.
+
+def test_r3_approval_pairs_locator_set_with_real_snapshot_digest():
+    from cba_kb.kc_snapshot import build_snapshot, validate_snapshot
+    from cba_kb.oracle import (locator_set_digest, score_answer_approved,
+                               snapshot_locators)
+    oracle = _oracle_v2()
+
+    def _snapshot(domain):
+        return build_snapshot(
+            entries=[{"entry_id": "loc-1", "sha256": "a" * 64,
+                      "authority": "canonical", "rights": "public",
+                      "source_id": "src-synth"}],
+            target_domain=domain, capabilities=["stats"],
+            build_provenance="synthetic-build-1",
+            build_time="2026-11-05T00:00:00+00:00",
+            data_release="SIMULATED_DATA_RELEASE_1",
+            engine_candidate="SIMULATED_ENGINE_CANDIDATE_1",
+            build_code="SIMULATED_BUILD_CODE_1")
+
+    snapshot = _snapshot("synthetic-domain")
+    assert validate_snapshot(snapshot)["valid"] is True
+    other = _snapshot("other-domain")
+    assert other.content_sha256 != snapshot.content_sha256
+    locators = snapshot_locators(snapshot)
+    assert locators == ("loc-1",)
+    approval = _approval(oracle, locators=locators,
+                         snapshot_digest=snapshot.content_sha256)
+    result = score_answer_approved(
+        oracle.question("q-count"),
+        {"text": "12", "value": "12", "cited_locators": ["loc-1"]},
+        oracle=oracle, approval=approval,
+        snapshot_digest=snapshot.content_sha256,
+        authorized_locators=["loc-1"])
+    assert result.verdict == "PASS"
+    try:
+        score_answer_approved(
+            oracle.question("q-count"),
+            {"text": "12", "value": "12", "cited_locators": ["loc-1"]},
+            oracle=oracle, approval=approval,
+            snapshot_digest=other.content_sha256,
+            authorized_locators=["loc-1"])
+    except OracleError:
+        pass
+    else:
+        raise AssertionError("a different Snapshot digest must not score under this approval")

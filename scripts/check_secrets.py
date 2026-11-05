@@ -322,9 +322,12 @@ def load_expected_manifest(manifest_path):
     try:
         raw = Path(manifest_path).read_bytes()
     except FileNotFoundError:
-        raise ValueError('MANIFEST_UNREADABLE: manifest file not found')
+        # from None: the chained FileNotFoundError carries the raw path in
+        # its message, and the traceback would expose it. The fixed code
+        # is the whole error; the test asserts __suppress_context__.
+        raise ValueError('MANIFEST_UNREADABLE: manifest file not found') from None
     except OSError:
-        raise ValueError('MANIFEST_UNREADABLE')
+        raise ValueError('MANIFEST_UNREADABLE') from None
     try:
         records = json.loads(raw.decode('utf-8'), object_pairs_hook=_no_duplicate_object)
     except ValueError as exc:
@@ -431,7 +434,7 @@ def historical_blob_ids(root='.'):
             ['git', 'rev-list', '--objects', '--all'], cwd=root, stderr=subprocess.STDOUT)
     except (subprocess.CalledProcessError, OSError) as exc:
         raise RuntimeError('HISTORY_UNAVAILABLE: ' + str(exc))
-    oids = [line.split()[0] for line in listing.decode().splitlines() if line.split()]
+    oids = [line.split()[0] for line in listing.decode(errors="surrogateescape").splitlines() if line.split()]
     if not oids:
         # No reachable history to compare against: fail closed rather than
         # report "no re-introduction" on an unreadable history.
@@ -484,7 +487,7 @@ def _ls_tree_blobs(root, commit):
     except (subprocess.CalledProcessError, OSError) as exc:
         raise RuntimeError('HISTORY_UNAVAILABLE: ' + str(exc))
     entries = {}
-    for item in out.decode().split('\0'):
+    for item in out.decode(errors="surrogateescape").split('\0'):
         if not item:
             continue
         meta, path = item.split('\t', 1)
@@ -499,16 +502,22 @@ def cumulative_pr_blob_ids(root='.', *, base=None):
     """Blob SHA-1s introduced by any commit on base..HEAD.
 
     Enumerated per commit, not per object: for every commit in the range,
-    every blob on a path that is new or changed relative to the base tree
-    is collected. A blob already reachable from the base still counts
-    when the PR introduces it at a NEW path (copied there and deleted
-    before HEAD): reachability from the base is not introduction by the
-    PR, but a new path in the PR is. Unlike a final-HEAD scan, this
-    includes blobs added by an intermediate commit and deleted before
-    HEAD. A base equal to HEAD, or a base that is not an ancestor of HEAD,
-    defines an empty/meaningless range and raises HISTORY_UNAVAILABLE
-    instead of reporting a vacuous pass. Raises HISTORY_UNAVAILABLE on
-    shallow repos, unresolvable bases, or git failures (fail closed).
+    every blob on a path that is new or changed relative to that commit's
+    FIRST-PARENT tree is collected. Comparing against the first parent
+    (not the base tree) is what catches a blob restored at its ORIGINAL
+    path: delete -> restore identical bytes -> delete again is invisible
+    against the base tree (the restored bytes equal the base bytes) but
+    visible against the parent tree (the parent lacks the file). A blob
+    already reachable from the base still counts when the PR introduces
+    it at a NEW path (copied there and deleted before HEAD). Unlike a
+    final-HEAD scan, this includes blobs added by an intermediate commit
+    and deleted before HEAD. Merge commits compare against their first
+    parent only, so merged-branch content may be over-collected -- that
+    is the fail-closed direction. A base equal to HEAD, or a base that is
+    not an ancestor of HEAD, defines an empty/meaningless range and raises
+    HISTORY_UNAVAILABLE instead of reporting a vacuous pass. Raises
+    HISTORY_UNAVAILABLE on shallow repos, unresolvable bases, or git
+    failures (fail closed).
     """
     _assert_not_shallow(root)
     resolved = _resolve_cumulative_base(root, base)
@@ -525,7 +534,6 @@ def cumulative_pr_blob_ids(root='.', *, base=None):
         cwd=root, capture_output=True)
     if ancestor.returncode != 0:
         raise RuntimeError('HISTORY_UNAVAILABLE: base is not an ancestor of HEAD')
-    base_entries = _ls_tree_blobs(root, resolved)
     try:
         commits = subprocess.check_output(
             ['git', 'rev-list', resolved + '..HEAD'],
@@ -534,8 +542,15 @@ def cumulative_pr_blob_ids(root='.', *, base=None):
         raise RuntimeError('HISTORY_UNAVAILABLE: ' + str(exc))
     blobs = set()
     for commit in commits:
+        try:
+            parent = subprocess.check_output(
+                ['git', 'rev-parse', commit + '^1'],
+                cwd=root, stderr=subprocess.STDOUT).decode().strip()
+        except (subprocess.CalledProcessError, OSError) as exc:
+            raise RuntimeError('HISTORY_UNAVAILABLE: ' + str(exc))
+        parent_entries = _ls_tree_blobs(root, parent)
         for path, oid in _ls_tree_blobs(root, commit).items():
-            if base_entries.get(path) != oid:
+            if parent_entries.get(path) != oid:
                 blobs.add(oid)
     return blobs
 
@@ -570,7 +585,11 @@ def reintroduced_findings(root='.', *, staged=True):
     command = (['diff', '--cached', '--name-only', '--diff-filter=ACMR', '-z'] if staged
                else ['ls-tree', '-r', '--name-only', '-z', 'HEAD'])
     try:
-        paths = subprocess.check_output(['git', *command], cwd=root).decode().split('\0')
+        # surrogateescape: a valid Git filename may hold non-UTF-8 bytes;
+        # decoding must round-trip, never raise UnicodeDecodeError (which
+        # would bypass the HISTORY_UNAVAILABLE fail-closed path). replace
+        # would collapse distinct paths and silently drop blobs.
+        paths = subprocess.check_output(['git', *command], cwd=root).decode(errors="surrogateescape").split('\0')
         history = historical_blob_ids(root)
     except (subprocess.CalledProcessError, OSError) as exc:
         raise RuntimeError('HISTORY_UNAVAILABLE: ' + str(exc))
@@ -598,7 +617,9 @@ def scan_git(root='.', *, staged=True, morphology=False):
     """Scan index blobs, not working-tree substitutes; tracked mode scans HEAD."""
     command = (['diff', '--cached', '--name-only', '--diff-filter=ACMR', '-z'] if staged
                else ['ls-tree', '-r', '--name-only', '-z', 'HEAD'])
-    paths = subprocess.check_output(['git', *command], cwd=root).decode().split('\0')
+    # surrogateescape: see reintroduced_findings -- a valid Git filename
+    # may hold non-UTF-8 bytes and must round-trip through decode.
+    paths = subprocess.check_output(['git', *command], cwd=root).decode(errors="surrogateescape").split('\0')
     findings = []
     for path in filter(None, paths):
         ref = ':' + path if staged else 'HEAD:' + path

@@ -16,7 +16,7 @@ takes them as explicit caller-supplied values so it stays stdlib-pure and
 independently testable. Wiring the locator supply from a real Snapshot is a
 formal-stage integration step, not something this scaffolding invents.
 
-Scoring rules (version oracle-scoring-v2, frozen at build time):
+Scoring rules (version oracle-scoring-v3, frozen at build time):
 - exact: integer counts exact after versioned normalization (thousand
   separators and surrounding whitespace stripped; anything else unparseable).
 - uid: canonical representation after whitespace strip; aliases match ONLY
@@ -68,9 +68,10 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-SCORING_SPEC_VERSION = "oracle-scoring-v2"
+SCORING_SPEC_VERSION = "oracle-scoring-v3"
 
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -340,19 +341,28 @@ def _parse_number(value):
 
 
 # One asserted number in verbatim text: decimal-, comma- and
-# underscore-aware, standalone-token only. "13.0" is one number;
-# "1_000" and "1,000" are one number each; "12 and 13" are two.
-# Digits attached to letters or hyphens (a locator fragment such as
-# "loc-1", an identifier such as "Q1") are not asserted numbers.
-# A dotted run such as "v1.2" or "3.14.15" matches nothing: the
-# lookarounds reject a number glued to a dot-digit on either side.
+# underscore-aware, standalone-token only, with exact Decimal values
+# (floats lose precision above 2**53, so verbatim numbers are Decimals,
+# never floats). "13.0" is one number; "1_000" and "1,000" are one number
+# each; "12 and 13" are two. Exponent notation is supported ("1.3e1" is
+# 13); a unit suffix is allowed after a decimal number only ("13.0points"
+# is 13.0, "2.5kg" is 2.5) -- an integer glued to letters ("12abc",
+# "12kg") matches nothing and is skipped, never guessed. Digits attached
+# to letters or hyphens (a locator fragment such as "loc-1", an identifier
+# such as "Q1") are not asserted numbers. A dotted run such as "v1.2" or
+# "3.14.15" matches nothing: the lookarounds reject a number glued to a
+# dot-digit on either side. Residual, disclosed: integer+letters is
+# skipped, and structured rate values still parse through float.
 _NUM_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])(?<![0-9]\.)[+-]?(?:\d[\d_]*(?:,\d[\d_]{2})*"
-    r"(?:\.\d[\d_]*)?|\.\d[\d_]*)(?![A-Za-z0-9])(?!\.\d)")
+    r"(?<![A-Za-z0-9_-])(?<![0-9]\.)[+-]?(?:"
+    r"\d[\d_]*(?:,\d[\d_]{2})*\.\d[\d_]*(?:[eE][+-]?\d[\d_]*)?(?![0-9])(?!\.\d)"
+    r"|\d[\d_]*(?:,\d[\d_]{2})*(?:\.\d[\d_]*)?(?:[eE][+-]?\d[\d_]*)?(?![A-Za-z0-9])(?!\.\d)"
+    r"|\.\d[\d_]*(?:[eE][+-]?\d[\d_]*)?(?![A-Za-z0-9])(?!\.\d)"
+    r")")
 
 
 def _verbatim_numbers(text):
-    """All numbers asserted in verbatim text, as floats (see _NUM_TOKEN_RE).
+    """All numbers asserted in verbatim text, as Decimals (see _NUM_TOKEN_RE).
 
     Text with no asserted number yields []; the caller skips the
     cross-check there, never guessing. Every returned number counts:
@@ -363,8 +373,8 @@ def _verbatim_numbers(text):
     numbers = []
     for token in _NUM_TOKEN_RE.findall(text):
         try:
-            numbers.append(float(token.replace(",", "").replace("_", "")))
-        except ValueError:
+            numbers.append(Decimal(token.replace(",", "").replace("_", "")))
+        except InvalidOperation:
             continue
     return numbers
 
@@ -504,19 +514,28 @@ def score_answer_approved(question, answer, *, oracle: Oracle, approval,
                           snapshot_digest: str, authorized_locators=()) -> ScoreResult:
     """Formal scoring entrypoint: approval-bound, then the standard scorer.
 
-    The question must be one of the approved Oracle's questions (equality
-    by value, so a tampered replacement question is rejected even if its
-    question_id matches). The caller-supplied locator set must digest to
-    the approval's locator_set_digest, so a foreign locator cannot be
-    smuggled in through the allowlist. Any approval mismatch raises
-    OracleError and no score is produced.
+    The question must be the approved Oracle's own question object: the
+    caller-supplied question must be a real OracleQuestion, its
+    question_id must resolve to an approved question via the Oracle's own
+    tuple, and the fields must match -- and the APPROVED object is scored,
+    never the caller's object. Membership is never judged by the caller's
+    __eq__: a duck-typed stand-in or a lying __eq__ cannot smuggle a
+    substituted question past the approval check. The caller-supplied
+    locator set must digest to the approval's locator_set_digest, so a
+    foreign locator cannot be smuggled in through the allowlist. Any
+    approval mismatch raises OracleError and no score is produced.
     """
     verify_scoring_approval(approval, oracle=oracle, snapshot_digest=snapshot_digest)
-    if question not in oracle.questions:
+    if not isinstance(question, OracleQuestion):
+        raise OracleError("question must be an OracleQuestion object")
+    if not isinstance(getattr(question, "question_id", None), str) or not question.question_id:
+        raise OracleError("question must carry a question_id")
+    approved = oracle.question(question.question_id)  # raises OracleError if unknown
+    if approved != question:
         raise OracleError("question is not part of the approved Oracle")
     if locator_set_digest(authorized_locators) != approval.locator_set_digest:
         raise OracleError("authorized locator set does not match the approval's locator-set digest")
-    return score_answer(question, answer, authorized_locators=authorized_locators)
+    return score_answer(approved, answer, authorized_locators=authorized_locators)
 
 
 def score_answer(question: OracleQuestion, answer, *, authorized_locators=()) -> ScoreResult:
@@ -568,10 +587,13 @@ def score_answer(question: OracleQuestion, answer, *, authorized_locators=()) ->
         if parsed_value is not None:
             for asserted in _verbatim_numbers(text):
                 if question.comparison == "exact":
+                    # Decimal vs int compares exactly (no float rounding).
                     if asserted != parsed_value:
                         return ScoreResult(qid, "FAIL", "consistency", True,
                                            "structured value contradicts verbatim text")
-                elif abs(asserted - parsed_value) > question.tolerance:
+                elif abs(asserted - Decimal(str(parsed_value))) > Decimal(str(question.tolerance)):
+                    # Decimal(str(...)) on both sides: Decimal - float
+                    # raises TypeError, and float tolerance is inexact.
                     return ScoreResult(qid, "FAIL", "consistency", True,
                                        "structured value contradicts verbatim text")
 
