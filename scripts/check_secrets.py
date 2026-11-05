@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import io
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
@@ -82,10 +83,24 @@ def _morphology_in_path(path):
     return False
 
 
-def _safe_path(path):
-    """Path for finding output: fingerprinted when it itself carries morphology."""
+def _path_needs_fingerprint(path):
+    """Shared sensitive-path predicate for _safe_path and _finding.
+
+    A path is fingerprinted when it matches any secret pattern, an
+    assignment of a credential-shaped key, or Drive-ID morphology. The two
+    output helpers must never disagree about this: a path the finding
+    helper fingerprints must also be fingerprinted by the digest and
+    reintroduction error paths (Q2 round 3 blocker 6).
+    """
     text = str(path)
-    if _morphology_in_path(text):
+    return (any(pattern.search(text) for pattern in PATTERNS.values())
+            or bool(ASSIGNMENT.search(text)) or _morphology_in_path(text))
+
+
+def _safe_path(path):
+    """Path for finding output: fingerprinted when it carries sensitive content."""
+    text = str(path)
+    if _path_needs_fingerprint(text):
         return '[path-sha256:' + hashlib.sha256(text.encode()).hexdigest()[:12] + ']'
     return text
 
@@ -93,8 +108,7 @@ def _safe_path(path):
 def _finding(path, rule, value=b'', line=0):
     if isinstance(value, str):
         value = value.encode('utf-8')
-    if (any(pattern.search(str(path)) for pattern in PATTERNS.values())
-            or ASSIGNMENT.search(str(path)) or _morphology_in_path(path)):
+    if _path_needs_fingerprint(path):
         path = '[path-sha256:' + hashlib.sha256(str(path).encode()).hexdigest()[:12] + ']'
     return {'path': str(path), 'rule_id': rule, 'line': line,
             'fingerprint': 'sha256:' + hashlib.sha256(value).hexdigest()[:12]}
@@ -258,7 +272,9 @@ def verify_digest(path, expected_sha256):
     Residual risk: this compares the bytes at a path with a digest; it does
     not authenticate the path binding. A path and digest replaced together
     still verify. Callers must bind the expected digest to a trusted
-    reference outside this check.
+    reference outside this check. The formal preflight path is
+    verify_bound_digest / --bound-digest, which binds both path and digest
+    to an independently approved manifest (see below).
     """
     if not isinstance(expected_sha256, str) or not _DIGEST_RE.match(expected_sha256):
         return (False, 'MALFORMED_DIGEST')
@@ -272,8 +288,108 @@ def verify_digest(path, expected_sha256):
     return (actual == expected_sha256, 'OK' if actual == expected_sha256 else 'DIGEST_MISMATCH')
 
 
+def load_expected_manifest(manifest_path):
+    """Load an independently trusted expected record for bound verification.
+
+    The manifest is a JSON object mapping an artifact path to its expected
+    64-hex SHA-256 digest. Keys are resolved to absolute paths (relative
+    keys against the manifest file's directory); the returned mapping is
+    {absolute path: digest}. The record must be the independently approved
+    one (version-controlled / pinned at Freeze or release time) and must
+    NEVER be generated from the artifact under check: a caller-supplied
+    digest or flag alone is never a trust root, and this record is credible
+    only because it is independent of the untrusted call input. Any defect
+    raises ValueError (fail closed); callers must not fall back to unbound
+    checks when loading fails.
+    """
+    try:
+        raw = Path(manifest_path).read_bytes()
+    except FileNotFoundError:
+        raise ValueError('MANIFEST_UNREADABLE: manifest file not found')
+    except OSError as exc:
+        raise ValueError('MANIFEST_UNREADABLE: ' + str(exc))
+    try:
+        records = json.loads(raw.decode('utf-8'))
+    except (ValueError, UnicodeDecodeError):
+        raise ValueError('MALFORMED_MANIFEST: manifest is not valid JSON')
+    if not isinstance(records, dict) or not records:
+        raise ValueError('MALFORMED_MANIFEST: manifest must be a non-empty object of path to digest')
+    manifest_dir = os.path.dirname(os.path.abspath(manifest_path))
+    normalized = {}
+    for path, digest in records.items():
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError('MALFORMED_MANIFEST: manifest path must be a non-empty string')
+        if not isinstance(digest, str) or not _DIGEST_RE.match(digest):
+            raise ValueError('MALFORMED_MANIFEST: manifest digest must be a 64-hex SHA-256')
+        key = path if os.path.isabs(path) else os.path.join(manifest_dir, path)
+        normalized[os.path.abspath(key)] = digest
+    return normalized
+
+
+def verify_bound_digest(path, expected_records):
+    """Fail-closed bound digest check against an independently trusted record.
+
+    Returns (ok, reason) with reason in OK / PATH_NOT_IN_TRUSTED_RECORD /
+    MISSING_ARTIFACT / UNREADABLE_ARTIFACT / DIGEST_MISMATCH /
+    MALFORMED_MANIFEST. The candidate path must equal a path named in the
+    trusted record AND the bytes at that path must match the recorded
+    digest: a replacement file supplied with its own digest fails here
+    because the trusted record still names the original path and digest.
+    Never raises for the checked conditions.
+    """
+    if not isinstance(expected_records, dict):
+        return (False, 'MALFORMED_MANIFEST')
+    candidate = os.path.abspath(str(path))
+    expected = expected_records.get(candidate)
+    if expected is None:
+        return (False, 'PATH_NOT_IN_TRUSTED_RECORD')
+    if not isinstance(expected, str) or not _DIGEST_RE.match(expected):
+        return (False, 'MALFORMED_MANIFEST')
+    try:
+        data = Path(path).read_bytes()
+    except FileNotFoundError:
+        return (False, 'MISSING_ARTIFACT')
+    except OSError:
+        return (False, 'UNREADABLE_ARTIFACT')
+    actual = hashlib.sha256(data).hexdigest()
+    return (actual == expected, 'OK' if actual == expected else 'DIGEST_MISMATCH')
+
+
 def _git_blob_id(data):
     return hashlib.sha1(b'blob %d\0' % len(data) + data).hexdigest()
+
+
+def _assert_not_shallow(root):
+    """Raise HISTORY_UNAVAILABLE on a shallow repository (fail closed)."""
+    try:
+        shallow = subprocess.check_output(
+            ['git', 'rev-parse', '--is-shallow-repository'],
+            cwd=root, stderr=subprocess.STDOUT).decode().strip()
+    except (subprocess.CalledProcessError, OSError) as exc:
+        raise RuntimeError('HISTORY_UNAVAILABLE: ' + str(exc))
+    if shallow == 'true':
+        raise RuntimeError('HISTORY_UNAVAILABLE: shallow repository hides history')
+
+
+def _batch_check_blobs(proc):
+    """Parse `git cat-file --batch-check` output into a blob OID set.
+
+    Raises HISTORY_UNAVAILABLE on a nonzero run, an unexpected line, or a
+    missing object -- a history that cannot be enumerated cannot prove the
+    absence of re-introduced or cumulative material.
+    """
+    if proc.returncode != 0:
+        raise RuntimeError('HISTORY_UNAVAILABLE: ' + proc.stderr.strip())
+    blobs = set()
+    for line in proc.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            raise RuntimeError('HISTORY_UNAVAILABLE: unexpected batch-check line')
+        if fields[1] == 'missing':
+            raise RuntimeError('HISTORY_UNAVAILABLE: missing object in history')
+        if fields[1] == 'blob':
+            blobs.add(fields[0])
+    return blobs
 
 
 def historical_blob_ids(root='.'):
@@ -283,14 +399,7 @@ def historical_blob_ids(root='.'):
     instead of reporting "no re-introduction" against a truncated object set.
     Unexpected or missing objects in batch-check output raise as well.
     """
-    try:
-        shallow = subprocess.check_output(
-            ['git', 'rev-parse', '--is-shallow-repository'],
-            cwd=root, stderr=subprocess.STDOUT).decode().strip()
-    except (subprocess.CalledProcessError, OSError) as exc:
-        raise RuntimeError('HISTORY_UNAVAILABLE: ' + str(exc))
-    if shallow == 'true':
-        raise RuntimeError('HISTORY_UNAVAILABLE: shallow repository hides history')
+    _assert_not_shallow(root)
     try:
         listing = subprocess.check_output(
             ['git', 'rev-list', '--objects', '--all'], cwd=root, stderr=subprocess.STDOUT)
@@ -304,18 +413,79 @@ def historical_blob_ids(root='.'):
     proc = subprocess.run(
         ['git', 'cat-file', '--batch-check=%(objectname) %(objecttype)'],
         input='\n'.join(oids), capture_output=True, text=True, cwd=root)
-    if proc.returncode != 0:
-        raise RuntimeError('HISTORY_UNAVAILABLE: ' + proc.stderr.strip())
-    blobs = set()
-    for line in proc.stdout.splitlines():
-        fields = line.split()
-        if len(fields) != 2:
-            raise RuntimeError('HISTORY_UNAVAILABLE: unexpected batch-check line')
-        if fields[1] == 'missing':
-            raise RuntimeError('HISTORY_UNAVAILABLE: missing object in history')
-        if fields[1] == 'blob':
-            blobs.add(fields[0])
-    return blobs
+    return _batch_check_blobs(proc)
+
+
+def _resolve_cumulative_base(root, base=None):
+    """Resolve the base for a cumulative scan, or raise HISTORY_UNAVAILABLE.
+
+    An explicit --base ref wins. Otherwise the merge-base against
+    origin/main, then main. If no base resolves, fail closed -- a scan with
+    no defined base cannot prove cumulative coverage.
+    """
+    if base:
+        try:
+            out = subprocess.check_output(
+                ['git', 'rev-parse', '--verify', base + '^{commit}'],
+                cwd=root, stderr=subprocess.STDOUT).decode().strip()
+        except (subprocess.CalledProcessError, OSError):
+            raise RuntimeError('HISTORY_UNAVAILABLE: unresolvable base ref')
+        if not out:
+            raise RuntimeError('HISTORY_UNAVAILABLE: unresolvable base ref')
+        return out
+    for candidate in ('origin/main', 'main'):
+        try:
+            out = subprocess.check_output(
+                ['git', 'merge-base', candidate, 'HEAD'],
+                cwd=root, stderr=subprocess.STDOUT).decode().strip()
+        except (subprocess.CalledProcessError, OSError):
+            continue
+        if out:
+            return out
+    raise RuntimeError('HISTORY_UNAVAILABLE: no resolvable base for cumulative scan')
+
+
+def cumulative_pr_blob_ids(root='.', *, base=None):
+    """Blob SHA-1s introduced by any commit on base..HEAD.
+
+    Unlike a final-HEAD scan, this includes blobs added by an intermediate
+    commit and deleted before HEAD: `git rev-list --objects` walks every
+    commit tree in the range. Raises HISTORY_UNAVAILABLE on shallow repos,
+    unresolvable bases, or missing/malformed objects (fail closed).
+    """
+    _assert_not_shallow(root)
+    resolved = _resolve_cumulative_base(root, base)
+    try:
+        listing = subprocess.check_output(
+            ['git', 'rev-list', '--objects', resolved + '..HEAD'],
+            cwd=root, stderr=subprocess.STDOUT)
+    except (subprocess.CalledProcessError, OSError) as exc:
+        raise RuntimeError('HISTORY_UNAVAILABLE: ' + str(exc))
+    oids = [line.split()[0] for line in listing.decode().splitlines() if line.split()]
+    if not oids:
+        return set()
+    proc = subprocess.run(
+        ['git', 'cat-file', '--batch-check=%(objectname) %(objecttype)'],
+        input='\n'.join(oids), capture_output=True, text=True, cwd=root)
+    return _batch_check_blobs(proc)
+
+
+def cumulative_findings(root='.', *, base=None):
+    """Morphology findings for every blob introduced on base..HEAD.
+
+    Catches the cumulative case AC-B2 names: sensitive content added in one
+    PR commit and removed before the final HEAD is invisible to a
+    final-HEAD tracked scan but is still in the PR's cumulative change set.
+    Git failures raise RuntimeError so callers fail closed.
+    """
+    findings = []
+    for oid in sorted(cumulative_pr_blob_ids(root, base=base)):
+        try:
+            data = subprocess.check_output(['git', 'cat-file', 'blob', oid], cwd=root)
+        except (subprocess.CalledProcessError, OSError) as exc:
+            raise RuntimeError('HISTORY_UNAVAILABLE: ' + str(exc))
+        findings.extend(scan_morphology_bytes(data, 'cumulative:' + oid[:12]))
+    return findings
 
 
 def reintroduced_findings(root='.', *, staged=True):
@@ -380,14 +550,49 @@ def main(argv=None):
                              'carrying morphology tokens (fail closed on unreadable history)')
     parser.add_argument('--digest', nargs=2, metavar=('PATH', 'SHA256'),
                         help='Verify one artifact digest; exit 0 on match, 2 otherwise')
+    parser.add_argument('--bound-digest', metavar='PATH',
+                        help='Verify one artifact against an independently approved '
+                             'manifest (--manifest); exit 0 on match, 2 otherwise. '
+                             'The formal preflight path: path AND digest must match '
+                             'the trusted record, so a replacement file supplied '
+                             'with its own digest fails.')
+    parser.add_argument('--manifest', metavar='FILE',
+                        help='Trusted expected record for --bound-digest: JSON object '
+                             'mapping artifact path to expected 64-hex SHA-256. Must '
+                             'be the independently approved record, never generated '
+                             'from the artifact under check.')
+    parser.add_argument('--cumulative', action='store_true',
+                        help='Also scan every blob introduced by any commit on '
+                             'base..HEAD (see --base), including blobs deleted before '
+                             'HEAD. Fails closed on shallow repos / unresolvable base.')
+    parser.add_argument('--base', metavar='REF',
+                        help='Base ref for --cumulative (default: merge-base against '
+                             'origin/main, then main)')
     parser.add_argument('paths', nargs='*', type=Path, help='Explicit candidate/readback files')
     args = parser.parse_args(argv)
-    if args.digest and (args.morphology or args.reintroduction or args.tracked or args.paths):
+    if args.digest and (args.morphology or args.reintroduction or args.tracked or args.paths
+                        or args.cumulative or args.bound_digest or args.manifest):
         # Digest verification and scanning are separate runs: a --digest
         # success previously returned before any scan ran, so combined flags
         # could silently skip scanning. Reject the combination instead.
         print(json.dumps({'status': 'FAIL', 'reason': 'DIGEST_MODE_EXCLUSIVE',
                           'detail': '--digest cannot be combined with scanning inputs'},
+                         sort_keys=True), file=sys.stderr)
+        return 2
+    if args.bound_digest and (args.digest or args.morphology or args.reintroduction
+                              or args.tracked or args.paths or args.cumulative):
+        print(json.dumps({'status': 'FAIL', 'reason': 'BOUND_DIGEST_MODE_EXCLUSIVE',
+                          'detail': '--bound-digest cannot be combined with other inputs'},
+                         sort_keys=True), file=sys.stderr)
+        return 2
+    if args.manifest and not args.bound_digest:
+        print(json.dumps({'status': 'FAIL', 'reason': 'MANIFEST_REQUIRES_BOUND_DIGEST',
+                          'detail': '--manifest requires --bound-digest'},
+                         sort_keys=True), file=sys.stderr)
+        return 2
+    if args.base and not args.cumulative:
+        print(json.dumps({'status': 'FAIL', 'reason': 'BASE_REQUIRES_CUMULATIVE',
+                          'detail': '--base requires --cumulative'},
                          sort_keys=True), file=sys.stderr)
         return 2
     if args.digest:
@@ -397,6 +602,25 @@ def main(argv=None):
             return 0
         print(json.dumps({'status': 'FAIL', 'reason': reason,
                           'path': _safe_path(args.digest[0])}, sort_keys=True), file=sys.stderr)
+        return 2
+    if args.bound_digest:
+        if not args.manifest:
+            print(json.dumps({'status': 'FAIL', 'reason': 'BOUND_MANIFEST_REQUIRED',
+                              'detail': '--bound-digest requires --manifest'},
+                             sort_keys=True), file=sys.stderr)
+            return 2
+        try:
+            records = load_expected_manifest(args.manifest)
+        except ValueError as exc:
+            print(json.dumps({'status': 'FAIL', 'reason': str(exc).split(':')[0],
+                              'path': _safe_path(args.manifest)}, sort_keys=True), file=sys.stderr)
+            return 2
+        ok, reason = verify_bound_digest(args.bound_digest, records)
+        if ok:
+            print('Bound digest verified')
+            return 0
+        print(json.dumps({'status': 'FAIL', 'reason': reason,
+                          'path': _safe_path(args.bound_digest)}, sort_keys=True), file=sys.stderr)
         return 2
     findings = []
     infrastructure_failure = False
@@ -418,6 +642,13 @@ def main(argv=None):
     if args.reintroduction:
         try:
             findings.extend(reintroduced_findings(staged=True))
+        except RuntimeError as exc:
+            findings.append({'path': '<history>', 'rule_id': 'S_HISTORY_UNAVAILABLE',
+                             'line': 0, 'fingerprint': 'sha256:' + hashlib.sha256(str(exc).encode()).hexdigest()[:12]})
+            infrastructure_failure = True
+    if args.cumulative:
+        try:
+            findings.extend(cumulative_findings(root='.', base=args.base))
         except RuntimeError as exc:
             findings.append({'path': '<history>', 'rule_id': 'S_HISTORY_UNAVAILABLE',
                              'line': 0, 'fingerprint': 'sha256:' + hashlib.sha256(str(exc).encode()).hexdigest()[:12]})
