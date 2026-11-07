@@ -78,7 +78,7 @@ legacy_event_mapping:
   required_behavior: preserve_explicit_reconciliation_edges_and_never_reverse_write
   legacy_annotation_policy:
     artifact_key: evidence/bayi_legacy_context.md
-    source_id: 1C8BpmY_MMjFGnSOdllRsnVWlwPdfKViV
+    source_id: redacted
     field: club_announcement_date
     observed_rows: 14
     canonical_date_values: null

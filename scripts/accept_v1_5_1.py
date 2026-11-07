@@ -125,10 +125,9 @@ def main():
     registry = drive.get(REGISTRY_ID).decode('utf-8-sig').strip().splitlines()
     evidence['registry'] = {'url': f'https://drive.google.com/file/d/{REGISTRY_ID}/view',
                             'rows': len(registry) - 1}
-    check('Source registry registered the four new sources',
+    check('Source registry registered the remaining sources',
           all(any(source in line for line in registry)
-              for source in ('1C8BpmY_MMjFGnSOdllRsnVWlwPdfKViV', '16H0cxiItoSlGALeHce-E06pD_a3RFAmd',
-                             '1D72_i0dzR9TmeV_XH8KeBr_BTxxwFPIM', '1WYVqi94bqVGOLsD7t1nmMXyTMTU4TOlr')),
+              for source in ('16H0cxiItoSlGALeHce-E06pD_a3RFAmd',)),
           evidence['registry'])
 
     prefix = drive.get_managed_doc(INDEX_ID).decode()

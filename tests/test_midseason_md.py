@@ -4,7 +4,7 @@ from cba_kb.adapters import midseason_md
 from cba_kb.aliases import Clubs
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = {'id': 'md-file-id', 'url': 'https://drive.google.com/file/d/md-file-id/view', 'type': 'gdrive'}
+SOURCE = {'id': 'md-file-id', 'url': 'https://drive.google.com/file/d/redacted/view', 'type': 'gdrive'}
 REAL = ROOT/'.staging/review-0910/bayi.md'
 
 SAMPLE = '''# 原八一男篮球员 2020-2021 赛季中期转会核验
