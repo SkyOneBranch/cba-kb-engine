@@ -13,8 +13,8 @@ from scripts import propose_source_registry
 
 
 EXCLUDED = (
-    '1D72_i0dzR9TmeV_XH8KeBr_BTxxwFPIM',
-    '1WYVqi94bqVGOLsD7t1nmMXyTMTU4TOlr',
+    'excluded-source-a',
+    'excluded-source-b',
 )
 
 
