@@ -99,6 +99,33 @@ from pathlib import Path
 
 SCORING_SPEC_VERSION = "oracle-scoring-v7"
 
+ALLOWED_EXPECTED_POSTURES = frozenset({
+    "QUIET_CLEAN_OFFICIAL",
+    "LOUD_SINGLE_SOURCE",
+    "LOUD_DISCREPANCY",
+    "LOUD_CONFLICT",
+    "LOUD_UNKNOWN_KB_GAP",
+    "LOUD_REVISION",
+})
+
+_BASE_QUESTION_KEYS = frozenset({
+    "question_id",
+    "question_text",
+    "comparison",
+    "expected",
+    "unit",
+    "precision",
+    "tolerance",
+    "alias_map",
+    "mandatory_locator",
+})
+
+_EXTENDED_QUESTION_KEYS = _BASE_QUESTION_KEYS | {
+    "required_scope_tokens",
+    "expected_posture",
+    "designated_locators",
+}
+
 # Largest magnitude (adjusted exponent) and coefficient length a rate
 # operand may have before the exact rational comparison. Structured
 # values and tolerances are floats (at most 17 significant digits,
@@ -185,6 +212,9 @@ class OracleQuestion:
     tolerance: float = 0.0
     alias_map: tuple = ()
     mandatory_locator: bool = False
+    required_scope_tokens: tuple = ()
+    expected_posture: str | None = None
+    designated_locators: tuple = ()
 
     def __post_init__(self):
         _require_nonempty(self.question_id, "question_id")
@@ -219,6 +249,21 @@ class OracleQuestion:
         if len(set(aliases)) != len(aliases):
             raise OracleError(f"question {self.question_id}: duplicate alias in alias_map")
 
+        for attr_name in ("required_scope_tokens", "designated_locators"):
+            val = getattr(self, attr_name)
+            if not isinstance(val, (list, tuple)):
+                raise OracleError(f"{attr_name} must be a list or tuple")
+            coerced_seq = []
+            for item in val:
+                if not isinstance(item, str) or not item.strip():
+                    raise OracleError(f"elements of {attr_name} must be non-empty strings")
+                coerced_seq.append(item)
+            object.__setattr__(self, attr_name, tuple(coerced_seq))
+
+        if self.expected_posture is not None:
+            if self.expected_posture not in ALLOWED_EXPECTED_POSTURES:
+                raise OracleError(f"unknown expected_posture: {self.expected_posture!r}")
+
     def canonical_value(self, value):
         """Apply the pre-execution alias map (uid) or return value unchanged."""
         if self.comparison == "uid" and isinstance(value, str):
@@ -230,7 +275,7 @@ class OracleQuestion:
         return value
 
     def to_dict(self):
-        return {
+        d = {
             "question_id": self.question_id,
             "question_text": self.question_text,
             "comparison": self.comparison,
@@ -241,6 +286,11 @@ class OracleQuestion:
             "alias_map": [list(pair) for pair in self.alias_map],
             "mandatory_locator": self.mandatory_locator,
         }
+        if self.required_scope_tokens or self.expected_posture is not None or self.designated_locators:
+            d["designated_locators"] = list(self.designated_locators)
+            d["expected_posture"] = self.expected_posture
+            d["required_scope_tokens"] = list(self.required_scope_tokens)
+        return d
 
 
 @dataclass(frozen=True)
@@ -329,9 +379,15 @@ def verify_manifest(manifest) -> tuple:
         # Questions must round-trip through the same canonical dict shape
         # the builder emits; anything else is malformed, not re-interpreted.
         for q in questions:
-            if set(q.keys()) != {"question_id", "question_text", "comparison", "expected",
-                                 "unit", "precision", "tolerance", "alias_map",
-                                 "mandatory_locator"}:
+            if not isinstance(q, dict):
+                return (False, "MALFORMED_MANIFEST")
+            q_keys = set(q.keys())
+            if q_keys == _EXTENDED_QUESTION_KEYS:
+                if not (q.get("required_scope_tokens")
+                        or q.get("expected_posture") is not None
+                        or q.get("designated_locators")):
+                    return (False, "MALFORMED_MANIFEST")
+            elif q_keys != _BASE_QUESTION_KEYS:
                 return (False, "MALFORMED_MANIFEST")
     except (KeyError, TypeError, AttributeError):
         return (False, "MALFORMED_MANIFEST")
@@ -643,12 +699,6 @@ def score_answer(question: OracleQuestion, answer, *, authorized_locators=()) ->
     else:
         text, value, unit, cited = answer, answer, None, []
 
-    if question.comparison == "unknown":
-        if classify_answer(text) == "UNKNOWN":
-            return ScoreResult(qid, "PASS", "honesty", False, "correct UNKNOWN/refusal")
-        return ScoreResult(qid, "FAIL", "honesty", True,
-                           "fabricated known-UNKNOWN: value asserted where Oracle expects UNKNOWN")
-
     # Locator discipline for all question types (previously only locator-type
     # questions checked, so a mandatory-locator count question could PASS
     # with missing or out-of-Snapshot locators).
@@ -658,8 +708,73 @@ def score_answer(question: OracleQuestion, answer, *, authorized_locators=()) ->
         return ScoreResult(qid, "FAIL", "locator", True, "missing cited locator")
     bad = [loc for loc in cited_list if loc not in allowed]
     if bad:
-        return ScoreResult(qid, "FAIL", "locator", bool(question.mandatory_locator),
+        return ScoreResult(qid, "FAIL", "locator", bool(question.mandatory_locator or question.designated_locators),
                            "invalid/missing/out-of-Snapshot locator")
+    if question.designated_locators and not (set(question.designated_locators) <= set(cited_list)):
+        return ScoreResult(qid, "FAIL", "locator", True, "missing designated locator")
+
+    # Posture check (when question.expected_posture is not None)
+    if question.expected_posture is not None:
+        text_str = str(text)
+        text_lower = text_str.lower()
+        posture = question.expected_posture
+
+        if posture == "QUIET_CLEAN_OFFICIAL":
+            contaminants = (
+                "未取得第二来源",
+                "无独立佐证",
+                "尚无第二来源",
+                "no second source",
+                "not_verified_pending_phase_2",
+            )
+            if any(c in text_str or c in text_lower for c in contaminants):
+                return ScoreResult(qid, "FAIL", "posture", False,
+                                   "clean official answer contaminated with redundant warning")
+
+        elif posture == "LOUD_UNKNOWN_KB_GAP":
+            gap_falsifications = (
+                "为0",
+                "为 0",
+                "0元",
+                "0 元",
+                "确实未公开",
+                "已确实未公开",
+                "confirmed unpublished",
+            )
+            if any(f in text_str or f in text_lower for f in gap_falsifications):
+                return ScoreResult(qid, "FAIL", "posture", True,
+                                   "KB evidence gap falsely asserted as zero or confirmed unpublished")
+
+        elif posture == "LOUD_SINGLE_SOURCE":
+            overclaims = ("多方核实", "独立佐证已确认")
+            disclosures = ("单一", "单源", "孤证", "仅有", "尚不能作为已确认", "single", "uncorroborated")
+            has_overclaim = any(oc in text_str or oc in text_lower for oc in overclaims)
+            has_disclosure = any(d in text_str or d in text_lower for d in disclosures)
+            if has_overclaim or not has_disclosure:
+                return ScoreResult(qid, "FAIL", "posture", True, "missing single-source disclosure")
+
+        elif posture in ("LOUD_DISCREPANCY", "LOUD_CONFLICT"):
+            disclosures = ("差异", "不一致", "冲突", "discrepancy", "conflict")
+            if not any(d in text_str or d in text_lower for d in disclosures):
+                return ScoreResult(qid, "FAIL", "posture", True, "missing discrepancy/conflict disclosure")
+
+        elif posture == "LOUD_REVISION":
+            disclosures = ("修订", "更正", "旧", "原", "revision", "supersede", "prior")
+            if not any(d in text_str or d in text_lower for d in disclosures):
+                return ScoreResult(qid, "FAIL", "posture", True, "missing revision disclosure")
+
+    # Scope check (when question.required_scope_tokens is non-empty)
+    if question.required_scope_tokens:
+        text_str = str(text)
+        for tok in question.required_scope_tokens:
+            if tok not in text_str:
+                return ScoreResult(qid, "FAIL", "scope", True, f"missing required scope token: {tok}")
+
+    if question.comparison == "unknown":
+        if classify_answer(text) == "UNKNOWN":
+            return ScoreResult(qid, "PASS", "honesty", False, "correct UNKNOWN/refusal")
+        return ScoreResult(qid, "FAIL", "honesty", True,
+                           "fabricated known-UNKNOWN: value asserted where Oracle expects UNKNOWN")
 
     # Consistency cross-check (structured value vs verbatim text): a dict
     # answer whose verbatim text asserts ANY number that differs from its
@@ -676,8 +791,16 @@ def score_answer(question: OracleQuestion, answer, *, authorized_locators=()) ->
             # A recognized verbatim number that Decimal cannot safely
             # convert fails the check closed as undecidable, never
             # auto-passes on the remaining numbers.
+            text_for_numbers = str(text)
+            if question.required_scope_tokens:
+                for tok in question.required_scope_tokens:
+                    text_for_numbers = re.sub(
+                        rf"(?<![0-9.]){re.escape(tok)}(?![0-9.])",
+                        " ",
+                        text_for_numbers,
+                    )
             try:
-                asserted_numbers = _verbatim_numbers(text)
+                asserted_numbers = _verbatim_numbers(text_for_numbers)
             except OracleError:
                 return ScoreResult(qid, "FAIL", "consistency", True,
                                    "verbatim number cannot be safely converted")
@@ -787,6 +910,7 @@ class ClientReceipt:
     question_id: str
     verbatim_answer: str
     cited_locators: tuple = ()
+    receipt_mode: str = "VERBATIM"
 
     def __post_init__(self):
         if not _HEX40.match(self.engine_sha or ""):
@@ -796,6 +920,7 @@ class ClientReceipt:
                 raise OracleError(f"{name} must be a 64-hex digest")
         for name in ("question_set_version", "authorization_domain", "question_id"):
             _require_nonempty(getattr(self, name), name)
+        _require_nonempty(self.receipt_mode, "receipt_mode")
         if not isinstance(self.verbatim_answer, str) or not self.verbatim_answer.strip():
             raise OracleError("verbatim_answer must be non-empty text")
         # Freeze cited locators: a caller list must not stay mutable, or
@@ -829,8 +954,17 @@ def validate_receipt(receipt: ClientReceipt, *, oracle: Oracle, authorized_locat
         errors.append("snapshot_digest does not match expected Snapshot digest")
     if expected_authorization_domain is not None and receipt.authorization_domain != expected_authorization_domain:
         errors.append("authorization_domain does not match expected domain")
-    if receipt.verbatim_answer.strip() == "":
+    if receipt.receipt_mode != "VERBATIM":
+        errors.append("receipt_mode must be VERBATIM for formal acceptance")
+    verbatim_stripped = receipt.verbatim_answer.strip()
+    if verbatim_stripped == "":
         errors.append("verbatim_answer empty")
+    if (
+        "REAL_CLIENT_NOT_EXECUTED" in verbatim_stripped
+        or "SIMULATED_CLIENT" in verbatim_stripped
+        or verbatim_stripped.startswith(("[SUMMARY]", "SUMMARY_ONLY"))
+    ):
+        errors.append("verbatim_answer contains non-verbatim or unexecuted placeholder")
     allowed = set(authorized_locators)
     for loc in receipt.cited_locators:
         if loc not in allowed:
@@ -840,6 +974,8 @@ def validate_receipt(receipt: ClientReceipt, *, oracle: Oracle, authorized_locat
         errors.append("locator question receipt cites no locator")
     if question.mandatory_locator and not receipt.cited_locators:
         errors.append("mandatory-locator question receipt cites no locator")
+    if question.designated_locators and not (set(question.designated_locators) <= set(receipt.cited_locators)):
+        errors.append("receipt missing designated locator")
     return errors
 
 

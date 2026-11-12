@@ -100,6 +100,7 @@ from .kc_projection import (
     sha256_hex,
     validate_identity_authorization,
 )
+from .kc_render import check_completeness
 from .kc_snapshot import (
     build_fact_guarantee,
     build_snapshot,
@@ -597,6 +598,7 @@ def build_local_projection(*, fixture: Dict[str, Any],
     catalog_md = session.render_verified(catalog, kind="catalog")
     passage_md = session.render_verified(cited, kind="passage")
     answer_json = session.render_verified(answer, kind="answer")
+    research_card_md = session.render_verified(answer, kind="research_card")
     identity_payload = identity.get("payload", identity)
     identity_status = identity_payload.get("status")
     identity_candidates = identity_payload.get("candidates", [])
@@ -612,6 +614,7 @@ def build_local_projection(*, fixture: Dict[str, Any],
         "catalog.md": catalog_md,
         "passages/%s.md" % target_passage["source_id"]: passage_md,
         "answer.json": answer_json,
+        "research_card.md": research_card_md,
         "snapshot.json": json.dumps(_snapshot_dict(snap),
                                     ensure_ascii=False, sort_keys=True,
                                     indent=2),
@@ -719,7 +722,8 @@ def build_local_projection(*, fixture: Dict[str, Any],
 # a manifest that omits a required artifact must fail even when
 # its own digest is self-consistent (Q2 round 1, blocker D-01).
 REQUIRED_LOCAL_ARTIFACTS = ("snapshot.json", "guarantee.json",
-                             "answer.json", "index.md", "catalog.md")
+                             "answer.json", "research_card.md",
+                             "index.md", "catalog.md")
 REQUIRED_LOCAL_CATEGORIES = ("slices/", "passages/")
 
 # Sentinel for "JSON parsing did not produce a value". It must be
@@ -919,6 +923,19 @@ def verify_local_projection(output_dir: str) -> Dict[str, Any]:
                 fail("answer_marker", "ANSWER_END_MARKER_MISSING")
             else:
                 checks["answer_marker"] = True
+        rc_path = os.path.join(output_dir, "research_card.md")
+        if not os.path.isfile(rc_path):
+            fail("research_card_exists", "RESEARCH_CARD_MISSING")
+        else:
+            try:
+                with open(rc_path, encoding="utf-8") as fh:
+                    rc_text = fh.read()
+                if not check_completeness(rc_text, kind="markdown"):
+                    fail("research_card", "RESEARCH_CARD_NOT_COMPLETE")
+                else:
+                    checks["research_card"] = True
+            except OSError:
+                fail("research_card", "RESEARCH_CARD_UNREADABLE")
         index_path = os.path.join(output_dir, "index.md")
         if not os.path.isfile(index_path):
             fail("index_exists", "INDEX_MISSING")

@@ -125,6 +125,11 @@ from .kc_render import (
     render_json_slice,
     render_markdown_table,
     render_passage_doc,
+    render_research_card,
+)
+from .kc_evidence_status import (
+    classify_stats_evidence,
+    classify_claim_independence,
 )
 from .kc_slices import (
     KcSliceError,
@@ -133,6 +138,7 @@ from .kc_slices import (
     query_slice_metric,
 )
 from .kc_snapshot import validate_fact_guarantee, validate_snapshot
+from .stats import StatsValidationError
 from .kc_visibility import (
     NOT_FOUND_DETAIL,
     query_visible,
@@ -193,6 +199,7 @@ _KIND_ENTRIES: Dict[str, set] = {
     "catalog": {"consume_catalog"},
     "passage": {"consume_citation"},
     "answer": {"consume_answer"},
+    "research_card": {"consume_answer"},
 }
 
 
@@ -783,7 +790,10 @@ class ConsumeSession:
                        chain: Dict[str, Any],
                        claims: List[Dict[str, Any]],
                        team_id: Optional[str] = None,
-                       fact_guarantee: Any = None
+                       fact_guarantee: Any = None,
+                       candidate_stats_records: Optional[List[Dict[str, Any]]] = None,
+                       claim_origins: Optional[Dict[str, str]] = None,
+                       unknown_basis: Optional[str] = None
                        ) -> Dict[str, Any]:
         """Integrated cross-source answer through the entry. Stats
         come from consume_slice, Document from consume_citation, Fact
@@ -809,10 +819,21 @@ class ConsumeSession:
         reported only in the claim layer. Instruction-like passage
         text is carried as data (treat_as_data) and never executed."""
         fact_copy = copy.deepcopy(fact)
-        sliced = self.consume_slice(
-            records, player_uid=player_uid, season=season,
-            match_type=match_type, scope=scope, team_id=team_id,
-            provider=provider, competition=competition)
+        if candidate_stats_records is not None:
+            try:
+                sliced = self.consume_slice(
+                    records, player_uid=player_uid, season=season,
+                    match_type=match_type, scope=scope, team_id=team_id,
+                    provider=provider, competition=competition)
+            except (KcError, StatsValidationError) as exc:
+                if "INVALID_SCOPE" in str(exc):
+                    raise
+                sliced = dict(UNIFORM_NOT_FOUND)
+        else:
+            sliced = self.consume_slice(
+                records, player_uid=player_uid, season=season,
+                match_type=match_type, scope=scope, team_id=team_id,
+                provider=provider, competition=competition)
         if "payload" in sliced and sliced["payload"].get("status") == "OK":
             stats_layer = query_slice_metric(sliced["payload"], metric)
         else:
@@ -1113,6 +1134,45 @@ class ConsumeSession:
             claim_layer["unresolved"] = list(resolved["unresolved"])
         handling = treat_as_data(
             passage.get("text", "") if isinstance(passage, dict) else "")
+
+        # Evidence transparency classification (v2.1.3 / REQ-213)
+        # Rule A target-first filtering: unauthorized player records never
+        # enter posture classification, so unauthorized and nonexistent
+        # players produce the identical leak-free UNKNOWN posture.
+        raw_stats_records = (
+            candidate_stats_records if candidate_stats_records is not None else records
+        )
+        authorized_stats_records = [
+            r for r in raw_stats_records
+            if isinstance(r, dict) and r.get("player_uid") in self.authorized_players
+        ]
+        stats_classification = classify_stats_evidence(
+            authorized_stats_records,
+            player_uid=player_uid,
+            season=season,
+            match_type=match_type,
+            scope=scope,
+            team_id=team_id,
+            provider=provider,
+            competition=competition,
+            metric=metric,
+            unknown_basis=unknown_basis if player_uid in self.authorized_players else None,
+        )
+        authorized_claims = [
+            c for c in claims
+            if isinstance(c, dict)
+            and (not c.get("source_id") or c.get("source_id") in self.authorized_sources)
+        ]
+        claim_classification = classify_claim_independence(
+            authorized_claims,
+            claim_origins=claim_origins,
+            unknown_basis=unknown_basis if player_uid in self.authorized_players else None,
+        )
+        evidence_transparency = dict(stats_classification)
+        if evidence_transparency.get("posture") != "UNKNOWN":
+            evidence_transparency["subject_player_uid"] = player_uid
+        evidence_transparency["claim_transparency"] = claim_classification
+
         payload = {
             "grains": {
                 "CANONICAL_FACT": fact_layer,
@@ -1125,6 +1185,8 @@ class ConsumeSession:
                 "reason": "CAUSAL_INFERENCE_NOT_DERIVED_FROM_CORRELATED_SOURCES",
             },
             "instruction_handling": handling,
+            "metric": metric,
+            "evidence_transparency": evidence_transparency,
         }
         return self._wrap("consume_answer", payload)
 
@@ -1227,12 +1289,19 @@ class ConsumeSession:
                         self.authorized_players:
                     raise KcConsumeError(
                         "ARTIFACT_PLAYER_NOT_AUTHORIZED")
-        elif kind == "answer":
+        elif kind in ("answer", "research_card"):
             grains = payload.get("grains", {})
             stats_layer = grains.get("STATS", {})
             if isinstance(stats_layer, dict) \
                     and stats_layer.get("status") == "OK" \
                     and stats_layer.get("subject_player_uid") not in \
+                    self.authorized_players:
+                raise KcConsumeError(
+                    "ARTIFACT_STATS_SUBJECT_NOT_AUTHORIZED")
+            et_layer = payload.get("evidence_transparency", {})
+            if isinstance(et_layer, dict) \
+                    and et_layer.get("posture") not in (None, "UNKNOWN") \
+                    and et_layer.get("subject_player_uid") not in \
                     self.authorized_players:
                 raise KcConsumeError(
                     "ARTIFACT_STATS_SUBJECT_NOT_AUTHORIZED")
@@ -1282,4 +1351,6 @@ class ConsumeSession:
             rendered["end_marker"] = True
             return json.dumps(rendered, ensure_ascii=False, sort_keys=True,
                               indent=2)
+        if kind == "research_card":
+            return render_research_card(payload, evidence_verified=True)
         raise KcConsumeError(f"UNKNOWN_RENDERING_KIND:{kind}")
