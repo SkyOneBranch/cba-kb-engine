@@ -23,6 +23,137 @@ from .kc_projection import KcError
 
 READABILITY_STATUS = "NOT_VERIFIED_PENDING_PHASE_2"
 
+
+def render_research_card(payload: Dict[str, Any], *, evidence_verified: bool = False) -> str:
+    """Render compact exception-aware research card.
+
+    Enforces evidence_verified=True guard. Renders grains and evidence posture.
+    Ends strictly with 'end_marker: true'.
+    """
+    if evidence_verified is not True:
+        raise KcRenderError("RESEARCH_CARD_NOT_VERIFIED")
+
+    lines: List[str] = [
+        "# Research Card (Serving Projection)",
+        "",
+    ]
+
+    grains = payload.get("grains", {})
+    stats_layer = grains.get("STATS", {})
+    fact_layer = grains.get("CANONICAL_FACT", {})
+    doc_layer = grains.get("DOCUMENT", {})
+    claim_layer = payload.get("claim_layer", {})
+    transparency = payload.get("evidence_transparency", {})
+
+    posture = transparency.get("posture") or (
+        stats_layer.get("posture") if isinstance(stats_layer, dict) else None
+    ) or "UNKNOWN"
+
+    # 1. Stats & Scope Section
+    lines.append("## Statistical Evidence")
+    scope_meta = transparency.get("scope_meta") or {}
+    season = scope_meta.get("season") or stats_layer.get("season", "-")
+    match_type = scope_meta.get("match_type") or stats_layer.get("match_type", "-")
+    scope = scope_meta.get("scope") or stats_layer.get("scope", "-")
+    games_played = scope_meta.get("games_played")
+    captured_at = scope_meta.get("captured_at")
+    locator = scope_meta.get("locator") or (
+        doc_layer.get("locator") if isinstance(doc_layer, dict) else "-"
+    )
+    metric = payload.get("metric") or stats_layer.get("metric", "-")
+    val = transparency.get("adopted_value")
+    if val is None and isinstance(stats_layer, dict) and posture in ("CLEAN_OFFICIAL", "IDENTICAL_DUPLICATE"):
+        val = stats_layer.get("value")
+
+    lines.append(f"- Posture: {posture}")
+    lines.append(f"- Season: {season}")
+    lines.append(f"- Match Type: {match_type}")
+    lines.append(f"- Scope: {scope}")
+    if games_played is not None:
+        lines.append(f"- Games Played: {games_played}")
+    if captured_at:
+        lines.append(f"- Cutoff / Captured At: {captured_at}")
+    if locator:
+        lines.append(f"- Locator: {locator}")
+
+    if posture in ("CLEAN_OFFICIAL", "IDENTICAL_DUPLICATE"):
+        lines.append(f"- Metric: {metric} = {val}")
+        lines.append(f"- Authority: {transparency.get('authority_note', 'PRIMARY_OFFICIAL_RECORD')}")
+    elif posture == "SCOPE_OR_CUTOFF_DIFF":
+        if val is not None:
+            lines.append(f"- Metric: {metric} = {val} (latest cutoff)")
+        for cr in transparency.get("cutoff_records", []):
+            lines.append(
+                f"  * Cutoff {cr.get('games_played')} games ({cr.get('captured_at') or '-'}): "
+                f"{cr.get('value')} [Locator: {cr.get('locator')}]"
+            )
+        for sp in transparency.get("scope_splits", []):
+            lines.append(
+                f"  * Team Split {sp.get('team_name') or sp.get('team_id')}: "
+                f"{sp.get('value')} ({sp.get('games_played')} games)"
+            )
+    elif posture == "REVISION_SUPERSEDED":
+        lines.append(f"- Metric: {metric} = {val} (REVISION_SUPERSEDED)")
+        for rev in transparency.get("revision_history", []):
+            prior_val = rev.get("prior_value")
+            new_val = rev.get("new_value")
+            lines.append(
+                f"  * Prior Value: {prior_val} -> New Value: {new_val} "
+                f"(Supersedes: {rev.get('supersedes_record_id')}, Reason: {rev.get('reason')})"
+            )
+    elif posture == "DATA_DISCREPANCY":
+        delta = transparency.get("delta")
+        delta_note = f" (Delta: {delta})" if delta is not None else ""
+        lines.append(f"- Discrepancy Detected for Metric: {metric}{delta_note}")
+        for d in transparency.get("discrepancies", []):
+            lines.append(
+                f"  * Record {d.get('record_id')}: {d.get('value')} "
+                f"(Kind: {d.get('record_kind')}, Games: {d.get('games_played')}, Locator: {d.get('locator')})"
+            )
+    elif posture == "TRUE_CONFLICT":
+        lines.append(f"- Irreconcilable Conflict for Metric: {metric}")
+        for d in transparency.get("discrepancies", []):
+            lines.append(f"  * Record {d.get('record_id')}: {d.get('value')} (Locator: {d.get('locator')})")
+    elif posture == "SINGLE_SOURCE_UNCORROBORATED":
+        lines.append(f"- Metric: {metric} = {val}")
+        lines.append("- Note: Single source uncorroborated")
+    elif posture == "UNKNOWN":
+        subkind = transparency.get("unknown_subkind", "NO_RELIABLE_EVIDENCE_IN_KB")
+        lines.append(f"- Unknown: {subkind}")
+
+    # 2. Claim Layer Section (when claims exist)
+    claim_trans = transparency.get("claim_transparency") or {}
+    claims_list = claim_layer.get("claims") if isinstance(claim_layer, dict) else None
+    if claims_list:
+        c_posture = claim_trans.get("posture", claim_layer.get("status", "UNKNOWN"))
+        lines.extend([
+            "",
+            "## Claim Evidence",
+            f"- Claim Posture: {c_posture}",
+        ])
+        for rev in claim_trans.get("revision_history", []):
+            lines.append(
+                f"  * Claim {rev.get('claim_id')} ({rev.get('status')}): "
+                f"{rev.get('statement')} [prior: {rev.get('prior_claim_id')}]"
+            )
+
+    # 3. Document Passage Section
+    if isinstance(doc_layer, dict) and doc_layer.get("verbatim"):
+        lines.extend([
+            "",
+            "## Document Passage",
+            f"- Source: {doc_layer.get('source_id')}",
+            f"- Locator: {doc_layer.get('locator')}",
+            f"> {doc_layer.get('verbatim')}",
+        ])
+
+    lines.extend([
+        "",
+        "end_marker: true",
+    ])
+    return "\n".join(lines) + "\n"
+
+
 MEASUREMENT_PROTOCOL = (
     {"check": "pagination",
      "what_to_measure": "Whether paged reads return every page and "

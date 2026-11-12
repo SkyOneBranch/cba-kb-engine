@@ -230,17 +230,20 @@ class ResearchView:
             lines.append("_暂无比赛统计数据记录_")
         else:
             lines.append("> 声明：STATS 源于官方技术统计通道，独立于注册事实 (CANONICAL_FACT) 与发言陈述 (STATEMENT)，不作自动因果推导。")
-            lines.append("| 赛季 | 球员 | 范围/球队 | 场次 | 场均得分 | 场均篮板 | 场均助攻 | 投篮命中率 | 身份状态 |")
-            lines.append("|---|---|---|---|---|---|---|---|---|")
+            lines.append("| 赛季 | 阶段 | 球员 | 范围/球队 | 场次 | 场均得分 | 场均篮板 | 场均助攻 | 投篮命中率 | 身份状态 | 采集时间/定位 |")
+            lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
             for st in self.stats:
                 m = st.get("metrics", {})
                 scope_label = st.get("team_name") if st.get("scope") == "TEAM_SPLIT" else "全赛季"
+                match_type = st.get("match_type") or st.get("match_type_label") or "-"
+                prov = st.get("provenance") or {}
+                captured_at = prov.get("captured_at") or prov.get("endpoint") or "-"
                 gp = m.get("games_played", "-")
                 pts = m.get("points_per_game", "-")
                 reb = m.get("rebounds_per_game", "-")
                 ast = m.get("assists_per_game", "-")
                 fg_pct = m.get("field_goals_percentage", "-")
                 id_st = st.get("identity_status", "-")
-                lines.append(f"| {st.get('season', '-')} | {st.get('player_name', '-')} | {scope_label} | {gp} | {pts} | {reb} | {ast} | {fg_pct} | {id_st} |")
+                lines.append(f"| {st.get('season', '-')} | {match_type} | {st.get('player_name', '-')} | {scope_label} | {gp} | {pts} | {reb} | {ast} | {fg_pct} | {id_st} | {captured_at} |")
 
         return "\n".join(lines) + "\n"
