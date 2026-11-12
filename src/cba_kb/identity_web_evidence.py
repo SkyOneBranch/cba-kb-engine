@@ -390,6 +390,7 @@ def fetch_official_resource(
     sleep=time.sleep,
     clock=time.monotonic,
     private_b0_domains=None,
+    rate_limit_state=None,
 ):
     request = validate_fetch_request(url, method=method, headers=headers)
     validate_source_url(
@@ -399,16 +400,18 @@ def fetch_official_resource(
     )
     domain = source_domain(url)
     transport = transport or _urllib_transport
+    domain_state = {} if rate_limit_state is None else rate_limit_state
+
     def throttle(url_value):
         current_domain = source_domain(url_value)
-        last_request = _DOMAIN_LAST_REQUEST.get(current_domain)
+        last_request = domain_state.get(current_domain)
         current = clock()
         if (
             last_request is not None
             and current - last_request < per_domain_interval
         ):
             sleep(per_domain_interval - (current - last_request))
-        _DOMAIN_LAST_REQUEST[current_domain] = clock()
+        domain_state[current_domain] = clock()
 
     last_error = None
     for attempt in range(max_retries + 1):

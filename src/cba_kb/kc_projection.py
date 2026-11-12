@@ -54,18 +54,20 @@ _PERCENTAGE_RE = re.compile(r"^\d+(\.\d+)?%$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
+from .common import canonical_json_bytes, sha256_hex as _common_sha256_hex
+
+
 class KcError(RuntimeError):
     """Fail-closed kc/0.1 contract violation."""
 
 
 def canonical_json(value: Any) -> bytes:
     """Deterministic canonical bytes: sorted keys, compact separators."""
-    return json.dumps(value, sort_keys=True, ensure_ascii=False,
-                      separators=(",", ":")).encode("utf-8")
+    return canonical_json_bytes(value, trailing_newline=False)
 
 
 def sha256_hex(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+    return _common_sha256_hex(data)
 
 
 def _is_number(value: Any) -> bool:

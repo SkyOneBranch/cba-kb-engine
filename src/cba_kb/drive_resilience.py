@@ -58,11 +58,12 @@ def _utcnow() -> str:
 def file_lock(path: Any, timeout_s: float = 10.0) -> Iterator[None]:
     """Exclusive advisory lock on a file (POSIX flock).
 
-    Creates the lock file if missing. Fails closed on timeout.
+    Creates the lock file if missing without truncating existing bytes.
+    Fails closed on timeout.
     """
     lock_path = Path(str(path) + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(lock_path, "w")
+    fh = open(lock_path, "a", encoding="utf-8")
     try:
         # Non-blocking attempt with timeout.
         import time
@@ -90,32 +91,11 @@ def _wal_path(ledger_path: Any) -> Path:
 
 
 def _wal_write(p: Path, entry: Dict[str, Any]) -> None:
-    """Write WAL entry with fsync for crash durability (F2 fix).
+    """Write WAL entry atomically with file + parent-dir fsync durability."""
+    from .common import atomic
 
-    Ensures the WAL state is actually persisted to disk, not just in
-    the OS page cache. This provides the crash-recovery guarantee:
-    if we crash after writing IN_PROGRESS, the WAL will be there on
-    restart; if we crash after writing COMPLETED, the completion will
-    be there.
-    """
-    import os
     data = json.dumps(entry, ensure_ascii=False, indent=2).encode("utf-8")
-    # Write to temp file, fsync, then rename (atomic + durable).
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    with open(tmp, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, p)
-    # Sync the directory to ensure the rename is durable.
-    try:
-        dir_fd = os.open(p.parent, os.O_DIRECTORY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-    except OSError:
-        pass  # Best effort; file fsync is the critical part.
+    atomic(p, data)
 
 
 def wal_begin(ledger_path: Any, plan_id: str,

@@ -43,11 +43,11 @@ DEFAULT_RIGHTS = {
 }
 
 
+from .common import canonical_json_bytes
+
+
 def canonical_bytes(value):
-    return (
-        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        + "\n"
-    ).encode()
+    return canonical_json_bytes(value, trailing_newline=True)
 
 
 def normalize_text(text):

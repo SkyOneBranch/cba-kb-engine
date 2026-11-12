@@ -290,11 +290,13 @@ def search_index(
         ok, _ = _rights_approved_for_search(fid, record, principal=principal)
         if not ok:
             continue
-        doc_terms = {t for t, fids in terms.items() if fid in fids}
+        matched_terms = sorted(
+            qt for qt in query_terms if fid in terms.get(qt, ())
+        )
         results.append({
             "file_id": fid,
             "title": meta.get("title", ""),
-            "matched_terms": sorted(query_terms & doc_terms),
+            "matched_terms": matched_terms,
         })
         if len(results) >= limit:
             break
@@ -328,12 +330,16 @@ def revoke_grant_persistent(index_path: Any, file_id: str,
                             principal: str) -> bool:
     """Atomically revoke a document's visibility in the persisted index.
 
-    Loads, revokes, and saves. There is no window where the on-disk index
-    still shows the revoked document. Same caveat as ``revoke_grant``:
+    Loads, revokes, and saves under advisory file lock. There is no window
+    where concurrent revocations overwrite each other or leave the on-disk
+    index showing the revoked document. Same caveat as ``revoke_grant``:
     this does not touch the authoritative registry.
     """
-    index = load_index(index_path)
-    changed = revoke_grant(index, file_id, principal)
-    if changed:
-        save_index(index_path, index)
-    return changed
+    from .drive_resilience import file_lock
+
+    with file_lock(index_path):
+        index = load_index(index_path)
+        changed = revoke_grant(index, file_id, principal)
+        if changed:
+            save_index(index_path, index)
+        return changed

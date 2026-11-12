@@ -70,6 +70,53 @@ def entity_candidates(players: List[Dict[str, Any]],
     }
 
 
+def _validate_slice_dimensions(*, player_uid: str, scope: str,
+                               team_id: Optional[str],
+                               allowed: set) -> None:
+    if scope not in ("WHOLE_SEASON", "TEAM_SPLIT"):
+        raise KcSliceError(f"INVALID_SCOPE:{scope}")
+    if scope == "TEAM_SPLIT" and not team_id:
+        raise KcSliceError("TEAM_SPLIT_REQUIRES_TEAM_ID")
+    if player_uid not in allowed:
+        raise KcSliceError("PLAYER_NOT_AUTHORIZED")
+
+
+def _slice_base(*, player_uid: str, provider: str, competition: str,
+                season: str, match_type: str, scope: str,
+                team_id: Optional[str]) -> Dict[str, Any]:
+    return {
+        "player_uid": player_uid, "provider": provider,
+        "competition": competition, "season": season,
+        "match_type": match_type, "scope": scope,
+        "team_id": team_id if scope == "TEAM_SPLIT" else None,
+        "metrics": {}, "supported_metrics": [], "row_count": 0,
+        "total_rows": 0,
+    }
+
+
+def _finalize_slice(base: Dict[str, Any],
+                    matches: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not matches:
+        return dict(base, status="EMPTY", complete=True, end_marker=True)
+    if len(matches) > 1:
+        raise KcSliceError("MULTIPLE_RECORDS_FOR_SLICE_KEY")
+    record = matches[0]
+    metrics: Dict[str, Any] = {}
+    for metric, value in record["metrics"].items():
+        if value is None:
+            metrics[metric] = {"value": None, "unit": _unit(metric),
+                               "value_kind": "NULL",
+                               "source_record_id": record["record_id"]}
+        else:
+            typed = validate_metric_value(metric, value, _unit(metric))
+            metrics[metric] = {"value": value, "unit": typed["unit"],
+                               "value_kind": typed["value_kind"],
+                               "source_record_id": record["record_id"]}
+    return dict(base, status="OK", metrics=metrics,
+                supported_metrics=sorted(metrics), row_count=1,
+                total_rows=1, complete=True, end_marker=True)
+
+
 def build_slice(records: List[Dict[str, Any]], *, player_uid: str,
                 season: str, match_type: str, scope: str,
                 provider: str, competition: str,
@@ -94,20 +141,12 @@ def build_slice(records: List[Dict[str, Any]], *, player_uid: str,
     indistinguishable from a valid-but-empty key; no provider vocabulary
     yet distinguishes invalid dimensions from empty results.
     """
-    if scope not in ("WHOLE_SEASON", "TEAM_SPLIT"):
-        raise KcSliceError(f"INVALID_SCOPE:{scope}")
-    if scope == "TEAM_SPLIT" and not team_id:
-        raise KcSliceError("TEAM_SPLIT_REQUIRES_TEAM_ID")
-    if player_uid not in set(authorized_ids):
-        raise KcSliceError("PLAYER_NOT_AUTHORIZED")
-    base = {
-        "player_uid": player_uid, "provider": provider,
-        "competition": competition, "season": season,
-        "match_type": match_type, "scope": scope,
-        "team_id": team_id if scope == "TEAM_SPLIT" else None,
-        "metrics": {}, "supported_metrics": [], "row_count": 0,
-        "total_rows": 0,
-    }
+    allowed = set(authorized_ids)
+    _validate_slice_dimensions(player_uid=player_uid, scope=scope,
+                               team_id=team_id, allowed=allowed)
+    base = _slice_base(player_uid=player_uid, provider=provider,
+                       competition=competition, season=season,
+                       match_type=match_type, scope=scope, team_id=team_id)
     if provider != CANONICAL_PROVIDER or competition != CANONICAL_COMPETITION:
         return dict(base, status="EMPTY", complete=True, end_marker=True)
     matches = []
@@ -130,25 +169,7 @@ def build_slice(records: List[Dict[str, Any]], *, player_uid: str,
         if scope == "TEAM_SPLIT" and validated.get("team_id") != team_id:
             continue
         matches.append(validated)
-    if not matches:
-        return dict(base, status="EMPTY", complete=True, end_marker=True)
-    if len(matches) > 1:
-        raise KcSliceError("MULTIPLE_RECORDS_FOR_SLICE_KEY")
-    record = matches[0]
-    metrics: Dict[str, Any] = {}
-    for metric, value in record["metrics"].items():
-        if value is None:
-            metrics[metric] = {"value": None, "unit": _unit(metric),
-                               "value_kind": "NULL",
-                               "source_record_id": record["record_id"]}
-        else:
-            typed = validate_metric_value(metric, value, _unit(metric))
-            metrics[metric] = {"value": value, "unit": typed["unit"],
-                               "value_kind": typed["value_kind"],
-                               "source_record_id": record["record_id"]}
-    return dict(base, status="OK", metrics=metrics,
-                supported_metrics=sorted(metrics), row_count=1,
-                total_rows=1, complete=True, end_marker=True)
+    return _finalize_slice(base, matches)
 
 
 def build_slice_catalog(records: List[Dict[str, Any]], *, player_uid: str,
@@ -160,15 +181,45 @@ def build_slice_catalog(records: List[Dict[str, Any]], *, player_uid: str,
     record is listed in ``missing`` and makes the catalog PARTIAL with
     end_marker False — never a silent omission. The player_uid
     authorization rule of build_slice applies to every slice."""
+    allowed = set(authorized_ids)
+    indexed: Optional[Dict[Tuple[Any, ...], List[Dict[str, Any]]]] = None
     slices = []
     missing = []
     for key in expected_keys:
         season, match_type, scope = key[0], key[1], key[2]
         team = key[3] if len(key) > 3 else None
-        sl = build_slice(records, player_uid=player_uid, season=season,
-                         match_type=match_type, scope=scope, team_id=team,
-                         provider=provider, competition=competition,
-                         authorized_ids=authorized_ids)
+        _validate_slice_dimensions(player_uid=player_uid, scope=scope,
+                                   team_id=team, allowed=allowed)
+        effective_team = team if scope == "TEAM_SPLIT" else None
+        base = _slice_base(player_uid=player_uid, provider=provider,
+                           competition=competition, season=season,
+                           match_type=match_type, scope=scope, team_id=team)
+        if (provider != CANONICAL_PROVIDER
+                or competition != CANONICAL_COMPETITION):
+            sl = dict(base, status="EMPTY", complete=True, end_marker=True)
+        else:
+            if indexed is None:
+                indexed = {}
+                for record in records:
+                    if not isinstance(record, dict):
+                        continue
+                    if record.get("provider") != provider:
+                        continue
+                    if record.get("competition") != competition:
+                        continue
+                    validated = validate_stats_record(record)
+                    if validated["player_uid"] != player_uid:
+                        continue
+                    v_scope = validated["scope"]
+                    v_team = (validated.get("team_id")
+                              if v_scope == "TEAM_SPLIT" else None)
+                    idx_key = (validated["season"], validated["match_type"],
+                               v_scope, v_team)
+                    indexed.setdefault(idx_key, []).append(validated)
+            matches = indexed.get(
+                (season, match_type, scope, effective_team), []
+            )
+            sl = _finalize_slice(base, matches)
         sl = dict(sl, slice_key=(season, match_type, scope, team))
         slices.append(sl)
         if sl["status"] == "EMPTY":
