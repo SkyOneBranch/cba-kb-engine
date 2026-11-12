@@ -450,8 +450,10 @@ def _parse_number(value):
 # 13); a unit suffix is allowed after a decimal number only ("13.0points"
 # is 13.0, "2.5kg" is 2.5) -- an integer glued to letters ("12abc",
 # "12kg") matches nothing and is skipped, never guessed. Digits attached
-# to letters or hyphens (a locator fragment such as "loc-1", an identifier
-# such as "Q1") are not asserted numbers. A dotted run such as "v1.2" or
+# to letters, underscores, or identifier hyphens (a locator fragment such
+# as "loc-1", a filename prefix such as "03_DATA_..." or "03-DATA-...", an
+# identifier such as "Q1") are not asserted numbers; numeric underscores
+# only group digits ("1_000"). A dotted run such as "v1.2" or
 # "3.14.15" matches nothing: the lookarounds reject a number glued to a
 # dot-digit on either side. Residual, disclosed: integer+letters is
 # skipped, and structured rate values still parse through float. A token
@@ -460,9 +462,9 @@ def _parse_number(value):
 # OracleError and the caller fails the consistency check closed.
 _NUM_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_-])(?<![0-9]\.)[+-]?(?:"
-    r"\d[\d_]*(?:,\d[\d_]{2})*\.\d[\d_]*(?:[eE][+-]?\d[\d_]*)?(?![0-9])(?!\.\d)"
-    r"|\d[\d_]*(?:,\d[\d_]{2})*(?:\.\d[\d_]*)?(?:[eE][+-]?\d[\d_]*)?(?![A-Za-z0-9])(?!\.\d)"
-    r"|\.\d[\d_]*(?:[eE][+-]?\d[\d_]*)?(?![A-Za-z0-9])(?!\.\d)"
+    r"\d(?:_?\d)*(?:,\d(?:_?\d){2})*\.\d(?:_?\d)*(?:[eE][+-]?\d(?:_?\d)*)?(?![0-9_])(?![eE][+-]?\d)(?!\.\d)"
+    r"|\d(?:_?\d)*(?:,\d(?:_?\d){2})*(?:\.\d(?:_?\d)*)?(?:[eE][+-]?\d(?:_?\d)*)?(?![A-Za-z0-9_])(?![-][A-Za-z_])(?!\.\d)"
+    r"|\.\d(?:_?\d)*(?:[eE][+-]?\d(?:_?\d)*)?(?![A-Za-z0-9_])(?![-][A-Za-z_])(?!\.\d)"
     r")")
 
 
