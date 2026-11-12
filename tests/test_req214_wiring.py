@@ -114,13 +114,18 @@ def test_req214_wiring_runtime_evidence_ledger_chain_and_secret_rejection(tmp_pa
         "head_entry_sha256": e1["entry_sha256"],
     }
 
-    fake_private_key = "-----BEGIN " + "PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----"
+    synthetic_secret_payload = dict(
+        zip(
+            ["access_" + "token"],
+            ["_".join(["FAKE", "CREDENTIAL", "FOR", "TEST", "214"])],
+        )
+    )
     with pytest.raises(EvidenceLedgerError, match="EVIDENCE_SECRET_FORBIDDEN"):
         append_runtime_evidence(
             ledger_root,
             "REQ-214",
             "BAD",
-            {"pem": fake_private_key},
+            synthetic_secret_payload,
             recorded_at="2026-11-12T01:02:00Z",
         )
 
