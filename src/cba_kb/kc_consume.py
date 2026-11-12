@@ -1140,7 +1140,9 @@ class ConsumeSession:
         # enter posture classification, so unauthorized and nonexistent
         # players produce the identical leak-free UNKNOWN posture.
         raw_stats_records = (
-            candidate_stats_records if candidate_stats_records is not None else records
+            candidate_stats_records
+            if (candidate_stats_records is not None and len(candidate_stats_records) > 0)
+            else records
         )
         authorized_stats_records = [
             r for r in raw_stats_records
