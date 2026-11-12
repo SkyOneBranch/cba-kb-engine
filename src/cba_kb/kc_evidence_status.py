@@ -149,8 +149,13 @@ def classify_stats_evidence(
 
         rec_scope = rec.get("scope", "WHOLE_SEASON")
         rec_team = rec.get("team_id")
+        team_matches = (
+            True
+            if scope != "TEAM_SPLIT" or team_id is None
+            else (rec_team is not None and str(rec_team) == str(team_id))
+        )
 
-        if rec_scope == scope and (team_id is None or rec_team == team_id):
+        if rec_scope == scope and team_matches:
             matching.append(rec)
         elif rec_scope == "TEAM_SPLIT" and scope == "WHOLE_SEASON":
             m_split = rec.get("metrics") or {}
