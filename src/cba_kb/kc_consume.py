@@ -962,15 +962,15 @@ class ConsumeSession:
                     else:
                         fact_source = fact.get("source_id") \
                             or fact.get("source")
-                        scope = fact_guarantee.get("field_scope")
+                        field_scope = fact_guarantee.get("field_scope")
                         if fact_source is None or \
                                 fact_guarantee.get("source_id") \
                                 != fact_source:
                             guarantee_reason = \
                                 "FACT_GUARANTEE_SOURCE_MISMATCH"
-                        elif not isinstance(scope, list) \
+                        elif not isinstance(field_scope, list) \
                                 or not set(fact.keys()) \
-                                <= set(scope):
+                                <= set(field_scope):
                             guarantee_reason = \
                                 "FACT_GUARANTEE_SCOPE_INCOMPLETE"
                         elif not isinstance(
