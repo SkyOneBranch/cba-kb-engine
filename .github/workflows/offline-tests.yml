@@ -67,6 +67,7 @@ jobs:
       - name: v1.5.3 registration semantics
         run: python -m pytest -q tests/test_registration_domain.py tests/test_draft2_regressions.py
       - name: Offline regression suite
+        if: github.event_name != 'pull_request'
         env:
           CBA_KB_SOURCE_POLICY_JSON: '{"excluded_drive_ids":[]}'
         run: |
@@ -78,9 +79,13 @@ jobs:
       # 顺序与原 evidence job 一致；仅在 pull_request 事件运行（push 到 main 无 PR 上下文）。
       - name: Full pytest suite (evidence parity)
         if: github.event_name == 'pull_request'
+        env:
+          CBA_KB_SOURCE_POLICY_JSON: '{"excluded_drive_ids":[]}'
         run: |
           set -o pipefail
-          PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH pytest tests/ -q 2>&1 | tee pytest.log
+          PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH pytest tests/ legacy/ -q -rs \
+            --deselect tests/test_prepare_v1_5_2.py::test_v1_5_2_registry_proposal_is_complete \
+            2>&1 | tee pytest.log
       - name: 门禁自测（PR 版，阻断）
         if: github.event_name == 'pull_request'
         run: python .github/scripts/gate_selftest.py

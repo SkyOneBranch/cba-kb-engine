@@ -320,10 +320,22 @@ def _apply_purge_tombstones(params: Dict[str, Any],
 
 
 def _apply_revoke_index_grant(params: Dict[str, Any],
-                              ctx: Dict[str, Any]) -> Dict[str, Any]:
-    from .drive_search_index import revoke_grant_persistent
-    changed = revoke_grant_persistent(params["index"], params["file_id"],
-                                      params.get("principal", "operator"))
+                              ctx: Dict[str, Any],
+                              *,
+                              _index_locked: bool = False) -> Dict[str, Any]:
+    from .drive_search_index import (
+        _revoke_grant_unlocked,
+        revoke_grant_persistent,
+    )
+    principal = params.get("principal", "operator")
+    if _index_locked:
+        changed = _revoke_grant_unlocked(
+            params["index"], params["file_id"], principal
+        )
+    else:
+        changed = revoke_grant_persistent(
+            params["index"], params["file_id"], principal
+        )
     return {"revoked": changed}
 
 
@@ -624,11 +636,24 @@ def _apply_plan_resilient(plan_path: Any, ledger_path: Any,
                 for key in ("registry", "index"):
                     if params.get(key):
                         lock_targets.append(params[key])
+                index_locked = (
+                    bool(params.get("index"))
+                    and handler is _apply_revoke_index_grant
+                )
                 with ExitStack() as stack:
                     for target in sorted(set(lock_targets)):
                         stack.enter_context(file_lock(target))
-                    result = run_with_timeout(
-                        lambda p=params: handler(p, ctx), timeout_s)
+                    if index_locked:
+                        result = run_with_timeout(
+                            lambda p=params: _apply_revoke_index_grant(
+                                p, ctx, _index_locked=True
+                            ),
+                            timeout_s,
+                        )
+                    else:
+                        result = run_with_timeout(
+                            lambda p=params: handler(p, ctx), timeout_s
+                        )
                 wal_mark_complete(ledger_path, i)
                 completed.append({"op": op_name, "index": i,
                                   "result": result})

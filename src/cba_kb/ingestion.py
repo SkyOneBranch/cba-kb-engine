@@ -11,12 +11,14 @@ import json
 from pathlib import Path
 
 
+from .common import canonical_json_bytes
+
+
 CHANGE_TYPES = ("add", "delete", "modify", "schema_drift")
 
 
 def canonical_bytes(value):
-    return (json.dumps(value, ensure_ascii=False, sort_keys=True,
-                       separators=(",", ":")) + "\n").encode()
+    return canonical_json_bytes(value, trailing_newline=True)
 
 
 def content_sha256(data):

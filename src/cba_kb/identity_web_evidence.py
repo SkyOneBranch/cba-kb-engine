@@ -101,9 +101,6 @@ EXTERNAL_ID_NAMESPACE = re.compile(r"[A-Z][A-Z0-9_]*\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
 _SUSPICIOUS_TEXT = re.compile(r"[�]|Ã|Â|锟|拷|娌|鎹")
-_DOMAIN_LAST_REQUEST = {}
-
-
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -390,6 +387,7 @@ def fetch_official_resource(
     sleep=time.sleep,
     clock=time.monotonic,
     private_b0_domains=None,
+    rate_limit_state=None,
 ):
     request = validate_fetch_request(url, method=method, headers=headers)
     validate_source_url(
@@ -399,16 +397,18 @@ def fetch_official_resource(
     )
     domain = source_domain(url)
     transport = transport or _urllib_transport
+    domain_state = {} if rate_limit_state is None else rate_limit_state
+
     def throttle(url_value):
         current_domain = source_domain(url_value)
-        last_request = _DOMAIN_LAST_REQUEST.get(current_domain)
+        last_request = domain_state.get(current_domain)
         current = clock()
         if (
             last_request is not None
             and current - last_request < per_domain_interval
         ):
             sleep(per_domain_interval - (current - last_request))
-        _DOMAIN_LAST_REQUEST[current_domain] = clock()
+        domain_state[current_domain] = clock()
 
     last_error = None
     for attempt in range(max_retries + 1):

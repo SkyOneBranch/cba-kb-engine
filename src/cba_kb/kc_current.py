@@ -96,7 +96,7 @@ class SimulatedCurrentStore:
         # validation, a registry entry replaced after validation, a
         # wrong target, or a missing entry can no longer commit.
         self._validated_id: Optional[str] = None
-        self._validated_copy: Any = None
+        self._validated_canonical_bytes: Optional[bytes] = None
         self._validated_registry: Optional[Dict[str, Any]] = None
         self._validated_digest: Optional[str] = None
         # Directed repair (round-3 FAIL response): whether validation
@@ -108,7 +108,7 @@ class SimulatedCurrentStore:
 
     def _clear_validation(self) -> None:
         self._validated_id = None
-        self._validated_copy = None
+        self._validated_canonical_bytes = None
         self._validated_registry = None
         self._validated_digest = None
         self._validated_from_own = None
@@ -168,11 +168,11 @@ class SimulatedCurrentStore:
             self.state = "FAILED"
             self._clear_validation()
             raise KcCurrentError("STAGED_SNAPSHOT_TARGET_MISMATCH")
-        # Bind validation to this exact content and registry mapping.
+        # Bind validation to this exact canonical content and registry mapping.
         self._validated_id = staged
         self._validated_registry = registry
         self._validated_from_own = snapshots is None
-        self._validated_copy = copy.deepcopy(snap)
+        self._validated_canonical_bytes = _canonical_state(snap)
         self._validated_digest = digest
         self.state = "VALIDATED"
         return {"valid": True, "snapshot_id": staged}
@@ -203,8 +203,8 @@ class SimulatedCurrentStore:
             self.state = "FAILED"
             self._clear_validation()
             raise KcCurrentError("COMMIT_VALIDATION_MISSING")
-        if _canonical_state(current) != _canonical_state(
-                self._validated_copy):
+        if (self._validated_canonical_bytes is None
+                or _canonical_state(current) != self._validated_canonical_bytes):
             self.state = "FAILED"
             self._clear_validation()
             raise KcCurrentError("COMMIT_VALIDATION_STALE")

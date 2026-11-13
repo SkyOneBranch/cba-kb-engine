@@ -16,7 +16,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import yaml
 
-from .common import atomic
+from .common import atomic, canonical_json_bytes
 from .document_sources import (
     PARSER_VERSION,
     ReviewRequired,
@@ -44,10 +44,7 @@ DEFAULT_RIGHTS = {
 
 
 def canonical_bytes(value):
-    return (
-        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        + "\n"
-    ).encode()
+    return canonical_json_bytes(value, trailing_newline=True)
 
 
 def normalize_text(text):

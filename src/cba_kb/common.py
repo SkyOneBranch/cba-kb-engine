@@ -11,6 +11,39 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+sha256_hex = digest
+
+
+def canonical_json_str(value) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(',', ':'),
+    )
+
+
+def canonical_json_bytes(value, *, trailing_newline: bool = False) -> bytes:
+    rendered = canonical_json_str(value)
+    if trailing_newline:
+        rendered += '\n'
+    return rendered.encode('utf-8')
+
+
+def _fsync_parent_dir(parent: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
+    try:
+        dir_fd = os.open(parent, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
 def atomic(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -21,6 +54,7 @@ def atomic(path, data):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        _fsync_parent_dir(path.parent)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)

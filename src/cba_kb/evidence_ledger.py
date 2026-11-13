@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import re
 
-from .common import digest, lock
+from .common import _fsync_parent_dir, canonical_json_bytes, digest, lock
 
 
 SCHEMA_VERSION = 1
@@ -19,12 +19,7 @@ class EvidenceLedgerError(RuntimeError):
 
 
 def canonical_bytes(value):
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    return canonical_json_bytes(value, trailing_newline=False)
 
 
 def _clean(data, label):
@@ -62,12 +57,13 @@ class RuntimeEvidenceLedger:
             if path.is_file() and re.fullmatch(r"\d{8}-[0-9a-f]{64}\.json", path.name)
         )
 
-    def entries(self):
+    def entries(self, *, scan_secrets: bool = True):
         entries = []
         for index, path in enumerate(self._paths()):
             try:
-                entry = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as exc:
+                raw = path.read_bytes()
+                entry = json.loads(raw.decode("utf-8"))
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
                 raise EvidenceLedgerError("EVIDENCE_LEDGER_INVALID") from exc
             if not isinstance(entry, dict):
                 raise EvidenceLedgerError("EVIDENCE_LEDGER_INVALID")
@@ -80,21 +76,25 @@ class RuntimeEvidenceLedger:
                 or not re.fullmatch(r"[0-9a-f]{64}", entry.get("entry_sha256", ""))
             ):
                 raise EvidenceLedgerError("EVIDENCE_LEDGER_CHAIN_MISMATCH")
-            core = {
-                key: entry[key]
-                for key in (
-                    "schema_version",
-                    "requirement_id",
-                    "event_type",
-                    "recorded_at",
-                    "payload",
-                )
-            }
+            try:
+                core = {
+                    key: entry[key]
+                    for key in (
+                        "schema_version",
+                        "requirement_id",
+                        "event_type",
+                        "recorded_at",
+                        "payload",
+                    )
+                }
+            except KeyError as exc:
+                raise EvidenceLedgerError("EVIDENCE_LEDGER_INVALID") from exc
             if digest(canonical_bytes(core)) != entry["entry_sha256"]:
                 raise EvidenceLedgerError("EVIDENCE_LEDGER_HASH_MISMATCH")
             if path.stem.split("-", 1)[1] != entry["entry_sha256"]:
                 raise EvidenceLedgerError("EVIDENCE_LEDGER_HASH_MISMATCH")
-            _clean(path.read_bytes(), "runtime-ledger-entry.json")
+            if scan_secrets:
+                _clean(raw, "runtime-ledger-entry.json")
             entries.append(entry)
         return entries
 
@@ -117,7 +117,7 @@ class RuntimeEvidenceLedger:
         entry_sha256 = digest(encoded_core)
         self.root.mkdir(parents=True, exist_ok=True)
         with lock(self.root / ".ledger.lock"):
-            entries = self.entries()
+            entries = self.entries(scan_secrets=False)
             sequence = len(entries)
             entry = {
                 **core,
@@ -143,6 +143,7 @@ class RuntimeEvidenceLedger:
                     stream.write(data)
                     stream.flush()
                     os.fsync(stream.fileno())
+                _fsync_parent_dir(self.root)
             except FileExistsError:
                 if path.read_bytes() != data:
                     raise EvidenceLedgerError(
