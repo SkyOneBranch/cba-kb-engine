@@ -16,7 +16,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import yaml
 
-from .common import atomic
+from .common import atomic, canonical_json_bytes
 from .document_sources import (
     PARSER_VERSION,
     ReviewRequired,
@@ -41,9 +41,6 @@ DEFAULT_RIGHTS = {
     "local_file": "private",
     "google_drive_doc": "private",
 }
-
-
-from .common import canonical_json_bytes
 
 
 def canonical_bytes(value):

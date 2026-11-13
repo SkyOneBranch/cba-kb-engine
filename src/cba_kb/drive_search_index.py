@@ -326,6 +326,16 @@ def revoke_grant(index: Dict[str, Any], file_id: str,
     return False
 
 
+def _revoke_grant_unlocked(index_path: Any, file_id: str,
+                           principal: str) -> bool:
+    """Load, revoke, and save assuming caller already holds file_lock(index_path)."""
+    index = load_index(index_path)
+    changed = revoke_grant(index, file_id, principal)
+    if changed:
+        save_index(index_path, index)
+    return changed
+
+
 def revoke_grant_persistent(index_path: Any, file_id: str,
                             principal: str) -> bool:
     """Atomically revoke a document's visibility in the persisted index.
@@ -338,8 +348,4 @@ def revoke_grant_persistent(index_path: Any, file_id: str,
     from .drive_resilience import file_lock
 
     with file_lock(index_path):
-        index = load_index(index_path)
-        changed = revoke_grant(index, file_id, principal)
-        if changed:
-            save_index(index_path, index)
-        return changed
+        return _revoke_grant_unlocked(index_path, file_id, principal)

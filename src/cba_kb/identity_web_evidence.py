@@ -101,9 +101,6 @@ EXTERNAL_ID_NAMESPACE = re.compile(r"[A-Z][A-Z0-9_]*\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
 _SUSPICIOUS_TEXT = re.compile(r"[�]|Ã|Â|锟|拷|娌|鎹")
-_DOMAIN_LAST_REQUEST = {}
-
-
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None

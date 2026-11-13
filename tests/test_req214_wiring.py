@@ -2,8 +2,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
+import threading
+import time
 import pytest
 
+from cba_kb import drive_plan as dp
 from cba_kb import drive_resilience as dr
 from cba_kb import drive_search_index as si
 from cba_kb.evidence_ledger import (
@@ -172,3 +176,151 @@ def test_req214_wiring_fetch_official_resource_within_call_redirect_throttling()
     assert out["redirect_chain"] == ["https://www.cbaleague.com/hop2"]
     assert len(slept) == 1
     assert slept[0] == pytest.approx(1.75)
+
+
+def test_req214_wiring_resilient_apply_revoke_index_grant_and_verify(tmp_path):
+    grant_f1 = {
+        "approved": True,
+        "approver": "auditor",
+        "file_id": "f1",
+        "scope": "drive:read",
+        "granted_at": "2026-11-12T00:00:00Z",
+        "note": "",
+        "allowed_principals": ["alice"],
+    }
+    grant_f2 = dict(grant_f1, file_id="f2")
+    reg = {
+        "f1": {"name": "Alpha", "rights_status": "approved", "rights_grant": grant_f1},
+        "f2": {"name": "Beta", "rights_status": "approved", "rights_grant": grant_f2},
+    }
+    reg_path = tmp_path / "reg.json"
+    idx_path = tmp_path / "idx.json"
+    ledger_path = tmp_path / "ledger.jsonl"
+    plan_path = tmp_path / "plan.json"
+    reg_path.write_text(json.dumps(reg), encoding="utf-8")
+
+    plan = dp.create_plan(
+        [
+            {
+                "op": "rebuild_index",
+                "params": {"registry": str(reg_path), "index": str(idx_path)},
+            },
+            {
+                "op": "revoke_index_grant",
+                "params": {
+                    "index": str(idx_path),
+                    "file_id": "f1",
+                    "principal": "alice",
+                },
+            },
+        ]
+    )
+    dp.save_plan(plan_path, plan)
+    dp.approve_plan(plan_path, "auditor", ledger_path)
+
+    out = dp.apply_plan(
+        plan_path,
+        ledger_path,
+        {"registry": reg},
+        resilient=True,
+        timeout_s=1.0,
+    )
+    assert out["failed"] is None
+    assert [entry["op"] for entry in out["completed"]] == [
+        "rebuild_index",
+        "revoke_index_grant",
+    ]
+    assert out["completed"][1]["result"] == {"revoked": True}
+    assert dr.wal_check_incomplete(ledger_path) is None
+
+    ok, errors = dp.verify_plan(plan_path, {"registry": reg})
+    assert ok is True and errors == []
+
+    persisted = si.load_index(idx_path)
+    assert persisted["docs"]["f1"]["visible"] is False
+    assert persisted["docs"]["f2"]["visible"] is True
+    search_out = si.search_index(persisted, "alpha beta", principal="alice", registry=reg)
+    assert [r["file_id"] for r in search_out["results"]] == ["f2"]
+
+
+def test_req214_wiring_resilient_revoke_serializes_with_concurrent_writer(
+    tmp_path, monkeypatch
+):
+    grant_f1 = {
+        "approved": True,
+        "approver": "auditor",
+        "file_id": "f1",
+        "scope": "drive:read",
+        "granted_at": "2026-11-12T00:00:00Z",
+        "note": "",
+        "allowed_principals": ["alice"],
+    }
+    grant_f2 = dict(grant_f1, file_id="f2")
+    reg = {
+        "f1": {"name": "Alpha", "rights_status": "approved", "rights_grant": grant_f1},
+        "f2": {"name": "Beta", "rights_status": "approved", "rights_grant": grant_f2},
+    }
+    reg_path = tmp_path / "reg.json"
+    idx_path = tmp_path / "idx.json"
+    ledger_path = tmp_path / "ledger.jsonl"
+    plan_path = tmp_path / "plan.json"
+    reg_path.write_text(json.dumps(reg), encoding="utf-8")
+    si.save_index(idx_path, si.build_index(reg, {"f1": "season alpha", "f2": "season beta"}))
+
+    plan = dp.create_plan(
+        [
+            {
+                "op": "revoke_index_grant",
+                "params": {
+                    "index": str(idx_path),
+                    "file_id": "f1",
+                    "principal": "alice",
+                },
+            }
+        ]
+    )
+    dp.save_plan(plan_path, plan)
+    dp.approve_plan(plan_path, "auditor", ledger_path)
+
+    worker_holding_lock = threading.Event()
+    real_load_index = si.load_index
+
+    def delayed_worker_load_index(path):
+        loaded = real_load_index(path)
+        if threading.current_thread() is not threading.main_thread():
+            worker_holding_lock.set()
+            time.sleep(0.1)
+        return loaded
+
+    monkeypatch.setattr(si, "load_index", delayed_worker_load_index)
+    worker_errors: list[BaseException] = []
+
+    def bg_revoke() -> None:
+        try:
+            assert si.revoke_grant_persistent(idx_path, "f2", "alice") is True
+        except BaseException as exc:
+            worker_errors.append(exc)
+
+    worker = threading.Thread(target=bg_revoke)
+    worker.start()
+    assert worker_holding_lock.wait(timeout=2.0) is True
+
+    out = dp.apply_plan(
+        plan_path,
+        ledger_path,
+        {"registry": reg},
+        resilient=True,
+        timeout_s=5.0,
+    )
+    worker.join(timeout=5.0)
+
+    assert not worker_errors
+    assert out["failed"] is None
+    assert out["completed"] == [
+        {"op": "revoke_index_grant", "index": 0, "result": {"revoked": True}}
+    ]
+    assert dp.verify_plan(plan_path, {"registry": reg}) == (True, [])
+
+    persisted = real_load_index(idx_path)
+    assert persisted["docs"]["f1"]["visible"] is False
+    assert persisted["docs"]["f2"]["visible"] is False
