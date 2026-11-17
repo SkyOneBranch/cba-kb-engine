@@ -1,21 +1,21 @@
 {
   "lock_format_version": "1",
-  "lacd_cli_version": "1.0.2",
+  "lacd_cli_version": "1.0.4",
   "source": {
     "type": "git-tag",
-    "repo": "SkyCjq/LACD",
-    "ref": "v1.0.2",
-    "commit": null
+    "repo": "SkyOneBranch/LACD",
+    "ref": "v1.0.4",
+    "commit": "5aaf063c451b17ca01657d06c8c2eddf8cf68ff7"
   },
   "schema_version": "1",
   "policy_version": "1",
-  "template_version": "1.0.2",
+  "template_version": "1.0.4",
   "managed_files": [
     {
       "path": ".github/workflows/lacd-verify.yml",
-      "sha256": "433c558294bec495606bd01e8bda9477c950d8eca234d5791dcc235e2ec51d27",
+      "sha256": "7eea80607c0a91eff1416253127db0801e1cbf5e944f6090f00e44896cab3c2b",
       "template": "workflows/lacd-verify.yml",
-      "template_version": "1.0.2",
+      "template_version": "1.0.4",
       "merge": "replace"
     }
   ],
@@ -23,12 +23,12 @@
     {
       "path": "AGENTS.md",
       "section": "lacd-agent-protocol",
-      "sha256": "410ab32c0da6767fbf5ab118918367723e17c9867add7f7be9ea2ebbf2ce1172",
+      "sha256": "f02da4680881afc425e5c67f33ae7bf085e38a3b66b174f3f3bb09b6cb3ea0e0",
       "template": "managed/agents-md.section.md",
-      "template_version": "1.0.2",
+      "template_version": "1.0.4",
       "merge": "marked-section"
     }
   ],
-  "generated_at": "2026-10-13T14:11:42.319952+00:00",
-  "generated_by": "lacd 1.0.2"
+  "generated_at": "2026-11-17T10:18:34.107683+00:00",
+  "generated_by": "lacd 1.0.4"
 }
