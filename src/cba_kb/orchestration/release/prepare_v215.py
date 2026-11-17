@@ -629,26 +629,36 @@ def _candidate_inputs(
     previous_by_key = {}
     carried_code_targets = set(projection.get("carried_forward_code_targets", []))
 
-    # Preload MASTER row count before rendering control documents regardless of key sort order.
-    master_row_count = None
+    # Preload MASTER row count fail-closed before rendering control documents regardless of key sort order.
+    csv_count = None
+    xlsx_count = None
     if "derived/MASTER.csv" in item_by_key and "derived/MASTER.csv" not in carried_code_targets and "derived/MASTER.csv" not in new_by_key:
         m_item = item_by_key["derived/MASTER.csv"]
         prev_master, _ = snapshot(drive, m_item["id"], m_item.get("mode", "binary"))
         previous_by_key["derived/MASTER.csv"] = prev_master
         data_by_key["derived/MASTER.csv"] = prev_master
         try:
-            master_row_count = compute_master_row_count(prev_master, is_xlsx=False)
-        except Exception:
-            master_row_count = None
-    elif "input/MASTER.xlsx" in item_by_key and "input/MASTER.xlsx" not in carried_code_targets and "input/MASTER.xlsx" not in new_by_key:
+            csv_count = compute_master_row_count(prev_master, is_xlsx=False)
+        except Exception as exc:
+            raise ProjectionError(f"MASTER_ROW_COUNT_INVALID:{exc}") from exc
+    if "input/MASTER.xlsx" in item_by_key and "input/MASTER.xlsx" not in carried_code_targets and "input/MASTER.xlsx" not in new_by_key:
         m_item = item_by_key["input/MASTER.xlsx"]
         prev_master, _ = snapshot(drive, m_item["id"], m_item.get("mode", "binary"))
         previous_by_key["input/MASTER.xlsx"] = prev_master
         data_by_key["input/MASTER.xlsx"] = prev_master
         try:
-            master_row_count = compute_master_row_count(prev_master, is_xlsx=True)
-        except Exception:
-            master_row_count = None
+            xlsx_count = compute_master_row_count(prev_master, is_xlsx=True)
+        except Exception as exc:
+            raise ProjectionError(f"MASTER_ROW_COUNT_INVALID:{exc}") from exc
+    if csv_count is not None and xlsx_count is not None and csv_count != xlsx_count:
+        raise ProjectionError(f"MASTER_ROW_COUNT_MISMATCH:{csv_count}!={xlsx_count}")
+    master_row_count = csv_count if csv_count is not None else xlsx_count
+    requires_master_count = (
+        bool(set(ordered) & {"entry/README", "entry/context", "CURRENT_VERSION_DOC", "derived/INDEX.md"})
+        or _uses_closure(projection["release_id"])
+    )
+    if requires_master_count and master_row_count is None:
+        raise ProjectionError("MASTER_INPUT_MISSING")
 
     for logical_key in ordered:
         if logical_key == "input/manifest.csv" or logical_key in data_by_key:
@@ -885,6 +895,25 @@ def _readable_target_label(logical_key, item_by_key):
     return logical_key.rsplit("/", 1)[-1]
 
 
+def _harvest_known_drive_ids(id_by_key, item_by_key, *, release_id, engine_sha):
+    safe_names = {release_id, engine_sha}
+    if isinstance(item_by_key, dict):
+        for spec in item_by_key.values():
+            if isinstance(spec, dict) and isinstance(spec.get("name"), str):
+                safe_names.add(spec["name"].strip())
+    ids = []
+    if isinstance(id_by_key, dict):
+        for fid in id_by_key.values():
+            if (
+                isinstance(fid, str)
+                and len(fid.strip()) >= 12
+                and " " not in fid
+                and fid.strip() not in safe_names
+            ):
+                ids.append(fid.strip())
+    return tuple(ids)
+
+
 def _content_preserving_candidate(
     logical_key,
     previous,
@@ -897,8 +926,17 @@ def _content_preserving_candidate(
     item_by_key=None,
     master_row_count=None,
 ):
+    if (
+        isinstance(master_row_count, bool)
+        or not isinstance(master_row_count, int)
+        or master_row_count <= 0
+    ):
+        raise ProjectionError("MASTER_ROW_COUNT_REQUIRED")
     release_id = projection["release_id"]
     engine_sha = projection["engine_sha"]
+    known_drive_ids = _harvest_known_drive_ids(
+        id_by_key, item_by_key, release_id=release_id, engine_sha=engine_sha
+    )
     metadata = (
         target_metadata(release_id, engine_sha, registry)
         if registry is not None else None
@@ -939,7 +977,9 @@ def _content_preserving_candidate(
             from cba_kb.current_state import render_current_state
             body_text = render_current_state(metadata) + body_text
         return body_text.encode()
-    preserved = scrub_raw_drive_ids_for_consumer(_managed_body(previous))
+    preserved = scrub_raw_drive_ids_for_consumer(
+        _managed_body(previous), known_drive_ids=known_drive_ids
+    )
     if metadata is not None:
         preserved = replace_current_block(preserved, metadata)
     historical_releases = {
@@ -1199,6 +1239,7 @@ def _build_instance_consumer_targets(
                 scope=item.get("scope", "WHOLE_SEASON"),
                 passage_label=item.get("passage_label", "主要场均数据表"),
                 target_domain=item.get("target_domain", "production"),
+                additional_match_types=item.get("additional_match_types", ()),
             )
             for k, v in built.items():
                 v["publish_parent"] = data_parent

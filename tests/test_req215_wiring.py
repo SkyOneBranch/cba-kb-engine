@@ -30,13 +30,21 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_wiring_all_20_clubs_resolve_and_unknown_team_id_falls_back_honestly():
-    clubs = aliases.Clubs(ROOT).clubs
+    club_resolver = aliases.Clubs(ROOT)
+    clubs = club_resolver.clubs
+    active_club_ids = {
+        cid for cid, spec in clubs.items() if spec.get("status") == "active"
+    }
+    assert len(active_club_ids) == 20
     assert len(aliases.CBA_TEAM_ID_TO_ZH) == 20
     assert len(aliases.CBA_TEAM_ID_TO_CANONICAL_ID) == 20
+    assert set(aliases.CBA_TEAM_ID_TO_CANONICAL_ID.values()) == active_club_ids
     for tid, zh_name in aliases.CBA_TEAM_ID_TO_ZH.items():
+        canon_id = aliases.CBA_TEAM_ID_TO_CANONICAL_ID[tid]
         assert aliases.resolve_team_id_zh(tid) == zh_name
         assert aliases.resolve_team_id_zh(int(tid)) == zh_name
-        assert aliases.CBA_TEAM_ID_TO_CANONICAL_ID[tid] in clubs
+        assert canon_id in clubs
+        assert club_resolver.resolve(zh_name, season="2024-2025") == canon_id
         disp = aliases.format_club_team_display(tid)
         assert zh_name in disp and tid in disp
 
@@ -49,15 +57,33 @@ def test_wiring_all_20_clubs_resolve_and_unknown_team_id_falls_back_honestly():
 
 def test_wiring_research_card_unknown_club_fallback_and_rule_a_zero_leak():
     fx = copy.deepcopy(kc_cleanroom.build_cleanroom_fixture())
-    fx["stats_records"][0] = kc_cleanroom._stats_record(
+    fx["stats_records"] = [
+        r for r in fx["stats_records"]
+        if not (
+            r.get("player_uid") == kc_cleanroom.A
+            and r.get("match_type") in ("REGULAR", "PLAYOFF")
+            and r.get("scope") == "WHOLE_SEASON"
+        )
+    ]
+    fx["stats_records"].insert(0, kc_cleanroom._stats_record(
         player_uid=kc_cleanroom.A,
         provider_player_id="synth_01",
         match_type="REGULAR",
         scope="WHOLE_SEASON",
         team_id="999999",
         team_name=None,
-        metrics=fx["stats_records"][0]["metrics"],
+        metrics=copy.deepcopy(kc_cleanroom.build_cleanroom_fixture()["stats_records"][0]["metrics"]),
+    ))
+    playoff_rec = kc_cleanroom._stats_record(
+        player_uid=kc_cleanroom.A,
+        provider_player_id="synth_01",
+        match_type="PLAYOFF",
+        scope="WHOLE_SEASON",
+        team_id="29131",
+        team_name=None,
+        metrics=dict(fx["stats_records"][0]["metrics"], points_per_game=17.0, games_played=6),
     )
+    fx["stats_records"].append(playoff_rec)
 
     promoted = consumer_surface.build_promoted_research_slice_artifacts(
         fx,
@@ -65,13 +91,19 @@ def test_wiring_research_card_unknown_club_fallback_and_rule_a_zero_leak():
         player_name="林测试",
         player_id="synth_01",
         season="2025-2026",
+        additional_match_types=("PLAYOFF",),
     )
     card_md = promoted["research/card_synth_01_2025_2026"]["content"].decode("utf-8")
     assert "999999 (unresolved_team_id)" in card_md
     assert card_md.splitlines()[0].startswith("# 人物研究卡｜林测试（synth_01）｜2025-2026｜CURRENT")
     assert card_md.strip().endswith("end_marker: true")
+    assert "research/slice_synth_01_2025_2026_regular" in promoted
+    assert "research/slice_synth_01_2025_2026_playoff" in promoted
+    playoff_md = promoted["research/slice_synth_01_2025_2026_playoff"]["content"].decode("utf-8")
+    assert "17.0" in playoff_md
 
-    # Rule A non-leak: unauthorized vs nonexistent players remain identical UNKNOWN
+    # Rule A non-leak: unauthorized vs nonexistent players remain identical in payload JSON,
+    # content_digest, and complete rendered output bytes.
     snap = build_snapshot(
         entries=[{
             "entry_id": "passage:fixture_doc_D1",
@@ -135,8 +167,14 @@ def test_wiring_research_card_unknown_club_fallback_and_rule_a_zero_leak():
         chain=chain,
         claims=[],
     )
-    assert out_unauth["payload"]["evidence_transparency"] == out_nonex["payload"]["evidence_transparency"]
+    assert oracle.canonical_json(out_unauth["payload"]) == oracle.canonical_json(out_nonex["payload"])
+    assert out_unauth["verification"]["content_digest"] == out_nonex["verification"]["content_digest"]
     unauth_card = sess.render_verified(out_unauth, kind="research_card")
+    nonex_card = sess.render_verified(out_nonex, kind="research_card")
+    assert unauth_card.encode("utf-8") == nonex_card.encode("utf-8")
+    assert sess.render_verified(out_unauth, kind="answer").encode("utf-8") == sess.render_verified(
+        out_nonex, kind="answer"
+    ).encode("utf-8")
     assert unauth_card.splitlines()[0] == "# Research Card (Serving Projection)"
     assert "林测试" not in unauth_card and "深圳马可波罗" not in unauth_card
 
@@ -385,6 +423,122 @@ def test_wiring_prepare_v215_dynamic_master_count_redaction_and_consumer_targets
             consumer_target_contents=tampered,
         )
 
+    # BLOCKER 2 fail-closed checks: corrupt/empty/missing MASTER or CSV!=XLSX mismatch MUST abort
+    for bad_row_count in (None, 0, -5, True, False):
+        with pytest.raises(ValueError, match="MASTER_ROW_COUNT_REQUIRED"):
+            consumer_surface.render_consumer_surface_guide_section(
+                release_id="v2.1.5-1", master_row_count=bad_row_count  # type: ignore[arg-type]
+            )
+        with pytest.raises(ValueError, match="MASTER_ROW_COUNT_REQUIRED"):
+            consumer_surface.render_consumer_field_dictionary_md(
+                release_id="v2.1.5-1", engine_sha="a" * 40, master_row_count=bad_row_count  # type: ignore[arg-type]
+            )
+        with pytest.raises(orch.ProjectionError, match="MASTER_ROW_COUNT_REQUIRED"):
+            orch._content_preserving_candidate(
+                "entry/README",
+                b"legacy\n",
+                {"release_id": "v2.1.5-1", "engine_sha": "a" * 40, "active_release_id": "v2.1.4"},
+                {"status_id": "status"},
+                {"entry/README": "id-readme"},
+                tmp_path,
+                master_row_count=bad_row_count,
+            )
+
+    corrupt_bytes_by_id = dict(bytes_by_id)
+    corrupt_bytes_by_id["master-csv-id"] = b"col1,col2\n\n"
+    monkeypatch.setattr(orch, "snapshot", lambda _d, fid, _m="binary": (corrupt_bytes_by_id[fid], {"id": fid}))
+    with pytest.raises(orch.ProjectionError, match="MASTER_ROW_COUNT_INVALID"):
+        orch._candidate_inputs(
+            object(), tmp_path, proj, allocation, tmp_path / "cand_corrupt",
+            consumer_target_contents=consumer_contents,
+        )
+
+    # Mismatch between MASTER.csv (3465) and MASTER.xlsx (12) aborts closed
+    proj_with_xlsx = copy.deepcopy(proj)
+    proj_with_xlsx["existing_targets"].append({
+        "logical_key": "input/MASTER.xlsx",
+        "id": "master-xlsx-id",
+        "name": "MASTER.xlsx",
+        "previous_sha256": orch.digest(b"old"),
+        "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "mode": "binary",
+        "allowed_parents": ["data", "staging"],
+        "publish_parent": "data",
+        "disposition": "carried_forward",
+    })
+    mismatch_bytes = dict(bytes_by_id)
+    mismatch_bytes["master-xlsx-id"] = _make_sample_master_xlsx(12)
+    monkeypatch.setattr(orch, "snapshot", lambda _d, fid, _m="binary": (mismatch_bytes[fid], {"id": fid}))
+    with pytest.raises(orch.ProjectionError, match="MASTER_ROW_COUNT_MISMATCH"):
+        orch._candidate_inputs(
+            object(), tmp_path, proj_with_xlsx, allocation, tmp_path / "cand_mismatch",
+            consumer_target_contents=consumer_contents,
+        )
+
+    # Missing MASTER input when rendering control docs aborts closed
+    proj_no_master = copy.deepcopy(proj)
+    proj_no_master["existing_targets"] = [
+        item for item in proj["existing_targets"] if item["logical_key"] != "derived/MASTER.csv"
+    ]
+    monkeypatch.setattr(orch, "snapshot", fake_snapshot)
+    with pytest.raises(orch.ProjectionError, match="MASTER_INPUT_MISSING"):
+        orch._candidate_inputs(
+            object(), tmp_path, proj_no_master, allocation, tmp_path / "cand_no_master",
+            consumer_target_contents=consumer_contents,
+        )
+
+
+def test_wiring_redaction_provenance_and_alternate_id_shapes(tmp_path):
+    shared_0a = "0A" + "PxYzAbCdEfGhIjKlMnOp"
+    legacy_0b = "0B" + "9LegacySharedFolderId123"
+    opaque_2m = "2M" + "ixedCaseTokenAlphaBeta9901"
+    short_prov = "drv_short_99"
+    git_sha = "c8743b34e185be5b83b50d2815c82c7e957a31fd"
+    digest_hex = "b" * 64
+
+    sr_csv = (
+        "source_id,drive_file_id,current_parent_id,source_title,notes,sha256\n"
+        f"drive:{short_prov},{short_prov},{legacy_0b},2025-2026名单,ref {opaque_2m} commit {git_sha},{digest_hex}\n"
+        f"{shared_0a},{shared_0a},{legacy_0b},共享盘档案,same parent {legacy_0b},{digest_hex}\n"
+    ).encode("utf-8-sig")
+    red_sr = consumer_surface.export_consumer_source_registry_csv(sr_csv).decode("utf-8")
+    for raw in (short_prov, legacy_0b, opaque_2m, shared_0a):
+        assert raw not in red_sr
+    assert git_sha in red_sr and digest_hex in red_sr
+
+    master_csv = (
+        "record_key,season,source_file_id,remarks\n"
+        f"rk1,2025-2026,{short_prov},via {shared_0a} commit {git_sha}\n"
+    ).encode("utf-8-sig")
+    red_master = consumer_surface.export_consumer_master_csv(master_csv).decode("utf-8-sig")
+    assert short_prov not in red_master and shared_0a not in red_master
+    assert "src:" in red_master and git_sha in red_master
+
+    doc_idx = json.dumps({
+        "folder_id": legacy_0b,
+        "documents": [{
+            "doc_id": "doc_snake_case_01",
+            "source_file_id": short_prov,
+            "title": "研究卡_林测试_907766_2025-2026_CURRENT.md",
+            "note": f"from {short_prov} / {shared_0a} / {opaque_2m} commit {git_sha}",
+        }],
+    }, ensure_ascii=False).encode("utf-8")
+    red_idx = consumer_surface.export_consumer_document_index(doc_idx).decode("utf-8")
+    for raw in (short_prov, legacy_0b, shared_0a, opaque_2m):
+        assert raw not in red_idx
+    assert "doc_snake_case_01" in red_idx
+    assert "研究卡_林测试_907766_2025-2026_CURRENT.md" in red_idx
+    assert git_sha in red_idx
+
+    scrubbed = consumer_surface.scrub_raw_drive_ids_for_consumer(
+        f"commit={git_sha} file=研究卡_林测试_907766_2025-2026_CURRENT.md snake=my_long_python_variable_name id1={shared_0a} id2={opaque_2m} id3=drive:{short_prov}",
+        known_drive_ids=(short_prov,),
+    )
+    assert git_sha in scrubbed
+    assert "研究卡_林测试_907766_2025-2026_CURRENT.md" in scrubbed
+    assert "my_long_python_variable_name" in scrubbed
+    assert shared_0a not in scrubbed and opaque_2m not in scrubbed and short_prov not in scrubbed
+
 
 # ---------------------------------------------------------------------------
 # 3. Oracle v8 end-to-end formal approved chain + negative spoofing tests
@@ -397,6 +551,11 @@ def test_wiring_oracle_v8_approved_chain_inline_citations_and_spoofing_rejection
         "00_README_先读这个",
         "03_DATA_SYNTH_2025-2026.json",
     )
+    locator_url_ids = {
+        "研究卡_林测试_907766_2025-2026_CURRENT.md": "synth-card-1",
+        "00_README_先读这个": "synth-readme-1",
+        "03_DATA_SYNTH_2025-2026.json": "synth-03",
+    }
     o = oracle.build_oracle(
         version="v2.1.5-b2-synth",
         sources=[oracle.OracleSource("src-1", "Synth official slice", "LAWFUL_PUBLIC_SYNTHETIC")],
@@ -425,6 +584,7 @@ def test_wiring_oracle_v8_approved_chain_inline_citations_and_spoofing_rejection
         snapshot_digest=snap_digest,
         authorization_domain="synth-v215-b2",
         locator_set_digest=oracle.locator_set_digest(locators),
+        locator_url_map_digest=oracle.locator_url_map_digest(locator_url_ids),
     )
 
     drive_prefix = "https://" + "drive.google.com/file/d/"
@@ -442,6 +602,7 @@ def test_wiring_oracle_v8_approved_chain_inline_citations_and_spoofing_rejection
         question_id="B2-Q10",
         verbatim_answer=verbatim_pass,
         authorized_locators=locators,
+        authorized_locator_url_ids=locator_url_ids,
     )
     assert receipt.citation_protocol == "INLINE_LINK_CHIP_V0123"
     assert oracle.validate_receipt_approved(
@@ -451,6 +612,7 @@ def test_wiring_oracle_v8_approved_chain_inline_citations_and_spoofing_rejection
         snapshot_digest=snap_digest,
         authorization_domain="synth-v215-b2",
         authorized_locators=locators,
+        authorized_locator_url_ids=locator_url_ids,
     ) == []
 
     verdict = oracle.score_answer_approved(
@@ -479,6 +641,7 @@ def test_wiring_oracle_v8_approved_chain_inline_citations_and_spoofing_rejection
         question_id="B2-Q10",
         verbatim_answer=prose_only,
         authorized_locators=locators,
+        authorized_locator_url_ids=locator_url_ids,
     )
     assert prose_receipt.cited_locators == ()
     assert oracle.validate_receipt_approved(
@@ -488,6 +651,7 @@ def test_wiring_oracle_v8_approved_chain_inline_citations_and_spoofing_rejection
         snapshot_digest=snap_digest,
         authorization_domain="synth-v215-b2",
         authorized_locators=locators,
+        authorized_locator_url_ids=locator_url_ids,
     ) != []
     prose_verdict = oracle.score_answer_approved(
         o.question("B2-Q10"),
@@ -519,10 +683,101 @@ def test_wiring_oracle_v8_approved_chain_inline_citations_and_spoofing_rejection
         snapshot_digest=snap_digest,
         authorization_domain="synth-v215-b2",
         authorized_locators=locators,
+        authorized_locator_url_ids=locator_url_ids,
     )
-    assert errs and "inline link/chip" in errs[0]
+    assert errs and "verified v0.1.23 inline Drive/Docs link evidence" in errs[0]
 
-    # Negative 3: Unsupported citation protocol raises OracleError
+    # Negative 3: Unauthenticated literal chip ⟦cite:...⟧ NEVER extracts as citation
+    chip_only = "场均得分 20.1（⟦cite:研究卡_林测试_907766_2025-2026_CURRENT.md⟧）。"
+    assert oracle.extract_v0123_inline_locators(
+        chip_only, authorized_locators=locators, authorized_locator_url_ids=locator_url_ids
+    ) == ()
+
+    # Negative 4: Authorized label linked to an unauthorized/archived Drive file_id MUST BE REJECTED
+    archived_url_ans = (
+        f"2025-2026 赛季常规赛（41场）效力深圳马可波罗，场均得分 20.1"
+        f"（[研究卡_林测试_907766_2025-2026_CURRENT.md]({drive_prefix}rogue-archived-id-999/view)）。"
+    )
+    assert oracle.extract_v0123_inline_locators(
+        archived_url_ans, authorized_locators=locators, authorized_locator_url_ids=locator_url_ids
+    ) == ()
+    forged_receipt = oracle.ClientReceipt(
+        engine_sha="f" * 40,
+        snapshot_digest=snap_digest,
+        manifest_digest=o.artifact_digest,
+        question_set_version=o.version,
+        authorization_domain="synth-v215-b2",
+        question_id="B2-Q10",
+        verbatim_answer=archived_url_ans,
+        cited_locators=("研究卡_林测试_907766_2025-2026_CURRENT.md",),
+        receipt_mode="VERBATIM",
+        citation_protocol="INLINE_LINK_CHIP_V0123",
+    )
+    forged_errs = oracle.validate_receipt_approved(
+        forged_receipt,
+        oracle=o,
+        approval=approval,
+        snapshot_digest=snap_digest,
+        authorization_domain="synth-v215-b2",
+        authorized_locators=locators,
+        authorized_locator_url_ids=locator_url_ids,
+    )
+    assert any("forged or mismatched inline Drive/Docs citation URL" in e for e in forged_errs)
+
+    # Negative 5: Cross-locator swapped URL ([CardLabel](url_of_README)) MUST BE REJECTED
+    swapped_ans = (
+        f"2025-2026 赛季常规赛（41场）效力深圳马可波罗，场均得分 20.1"
+        f"（[研究卡_林测试_907766_2025-2026_CURRENT.md]({drive_prefix}synth-readme-1/view)）。"
+    )
+    assert oracle.extract_v0123_inline_locators(
+        swapped_ans, authorized_locators=locators, authorized_locator_url_ids=locator_url_ids
+    ) == ()
+
+    # Negative 6: Non-object Drive URL (/drive/my-drive) MUST NOT extract as citation
+    non_obj = "https://" + "drive.google.com/drive/my-drive"
+    assert oracle.extract_drive_url_file_id(non_obj) is None
+    assert oracle.extract_v0123_inline_locators(
+        f"[研究卡_林测试_907766_2025-2026_CURRENT.md]({non_obj})",
+        authorized_locators=locators,
+    ) == ()
+
+    # Negative 7: Same file_id claiming two distinct locators in scaffolding mode is rejected
+    dup_id_ans = (
+        f"[研究卡_林测试_907766_2025-2026_CURRENT.md]({drive_prefix}one-shared-id/view) "
+        f"[00_README_先读这个]({drive_prefix}one-shared-id/view)"
+    )
+    assert oracle.extract_v0123_inline_locators(dup_id_ans, authorized_locators=locators) == ()
+
+    # Negative 8: Missing/tampered locator_url_map_digest or authorized_locator_url_ids fails closed
+    no_url_map_approval = oracle.ScoringApproval(
+        manifest_digest=o.artifact_digest,
+        version=o.version,
+        scoring_code_sha=oracle.scoring_code_sha(),
+        snapshot_digest=snap_digest,
+        authorization_domain="synth-v215-b2",
+        locator_set_digest=oracle.locator_set_digest(locators),
+    )
+    assert oracle.validate_receipt_approved(
+        receipt,
+        oracle=o,
+        approval=no_url_map_approval,
+        snapshot_digest=snap_digest,
+        authorization_domain="synth-v215-b2",
+        authorized_locators=locators,
+        authorized_locator_url_ids=locator_url_ids,
+    ) == ["INLINE_LINK_CHIP_V0123 formal acceptance requires approval.locator_url_map_digest"]
+    tampered_url_map_errs = oracle.validate_receipt_approved(
+        receipt,
+        oracle=o,
+        approval=approval,
+        snapshot_digest=snap_digest,
+        authorization_domain="synth-v215-b2",
+        authorized_locators=locators,
+        authorized_locator_url_ids={**locator_url_ids, "00_README_先读这个": "tampered-id"},
+    )
+    assert tampered_url_map_errs == ["authorized_locator_url_ids does not match approval.locator_url_map_digest"]
+
+    # Negative 9: Unsupported citation protocol raises OracleError
     with pytest.raises(oracle.OracleError, match="unsupported citation_protocol"):
         oracle.ClientReceipt(
             engine_sha="f" * 40,

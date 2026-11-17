@@ -96,6 +96,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, DecimalException, InvalidOperation
 from fractions import Fraction
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 SCORING_SPEC_VERSION = "oracle-scoring-v8"
 
@@ -113,7 +114,11 @@ _INLINE_DRIVE_LINK_RE = re.compile(
     + re.escape(_DOCS_HOST)
     + r")/[^\s)\r\n]+)\)"
 )
-_CHIP_CITE_RE = re.compile(r"⟦cite:([^⟧\r\n]+)⟧")
+_DRIVE_OBJECT_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_DRIVE_FILE_PATH_RE = re.compile(r"^(?:/u/\d+)?/file/d/([A-Za-z0-9_-]+)(?:/[A-Za-z0-9_.-]*)?$")
+_DOCS_OBJECT_PATH_RE = re.compile(
+    r"^(?:/u/\d+)?/(?:document|spreadsheets|presentation)/d/([A-Za-z0-9_-]+)(?:/[A-Za-z0-9_.-]*)?$"
+)
 _MD_HTTP_LINK_RE = re.compile(r"\]\(https?://[^)\r\n]+\)")
 _HTTP_URL_RE = re.compile(r"https?://[^\s()\[\]<>\"'\r\n]+")
 _NUMBERED_DOC_PREFIX_RE = re.compile(
@@ -493,33 +498,123 @@ _NUM_TOKEN_RE = re.compile(
     r")")
 
 
-def extract_v0123_inline_locators(verbatim_answer: str, *, authorized_locators=()) -> tuple:
-    """Extract cited locators ONLY from structured Connector v0.1.23 inline Drive/Docs links or chips.
+def extract_drive_url_file_id(url: str) -> str | None:
+    """Parse canonical Google Drive / Docs object file_id; return None for non-object or malformed URLs."""
+    if not isinstance(url, str) or not url or any(ch.isspace() for ch in url):
+        return None
+    parsed = urlparse(url)
+    if (
+        parsed.scheme not in ("http", "https")
+        or parsed.port is not None
+        or parsed.username is not None
+        or parsed.password is not None
+        or ".." in parsed.path
+        or ".." in parsed.query
+        or ".." in parsed.fragment
+    ):
+        return None
+    host = (parsed.hostname or "").lower()
+    if host == _DRIVE_HOST:
+        m = _DRIVE_FILE_PATH_RE.match(parsed.path)
+        if m:
+            return m.group(1)
+        if parsed.path in ("/open", "/open/"):
+            qs = parse_qs(parsed.query, strict_parsing=False)
+            ids = qs.get("id")
+            if isinstance(ids, list) and len(ids) == 1 and _DRIVE_OBJECT_ID_RE.match(ids[0]):
+                return ids[0]
+        return None
+    if host == _DOCS_HOST:
+        m = _DOCS_OBJECT_PATH_RE.match(parsed.path)
+        if m:
+            return m.group(1)
+    return None
 
-    Plain unlinked prose mentions (e.g. "来源文件：...") NEVER extract as citations.
+
+def _resolve_authorized_label(label: str, allowed: tuple, allowed_set: set) -> str | None:
+    if not label:
+        return None
+    if label in allowed_set:
+        return label
+    if allowed_set:
+        matches = [a for a in allowed if a.rsplit("/", 1)[-1] == label]
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+
+def _validate_locator_url_id_map(locator_url_ids, *, authorized_locators=None) -> dict[str, list[str]]:
+    if not isinstance(locator_url_ids, dict) or not locator_url_ids:
+        raise OracleError("authorized_locator_url_ids must be a non-empty dict")
+    allowed_set = set(authorized_locators) if authorized_locators else None
+    id_to_locs: dict[str, list[str]] = {}
+    for loc, fid in locator_url_ids.items():
+        if not isinstance(loc, str) or not loc.strip():
+            raise OracleError("locator key in authorized_locator_url_ids must be non-empty string")
+        if not isinstance(fid, str) or not _DRIVE_OBJECT_ID_RE.match(fid):
+            raise OracleError("file_id in authorized_locator_url_ids must match [A-Za-z0-9_-]+")
+        if allowed_set is not None and loc not in allowed_set:
+            raise OracleError("authorized_locator_url_ids contains locator outside authorized_locators")
+        id_to_locs.setdefault(fid, []).append(loc)
+    return id_to_locs
+
+
+def extract_v0123_inline_locators(
+    verbatim_answer: str,
+    *,
+    authorized_locators=(),
+    authorized_locator_url_ids=None,
+) -> tuple:
+    """Extract cited locators ONLY from authenticated Connector v0.1.23 inline Drive/Docs URLs.
+
+    Plain unlinked prose mentions and unauthenticated literal ``⟦cite:...⟧`` text NEVER
+    extract as citations. When ``authorized_locator_url_ids`` is supplied, the URL's object
+    file_id must belong to that exact authorized locator (and match the label if the label
+    names a known locator).
     """
     if not isinstance(verbatim_answer, str) or not verbatim_answer:
         return ()
     allowed = tuple(authorized_locators or ())
+    if authorized_locator_url_ids is not None:
+        id_to_locs = _validate_locator_url_id_map(
+            authorized_locator_url_ids,
+            authorized_locators=allowed if allowed else None,
+        )
+        if not allowed:
+            allowed = tuple(authorized_locator_url_ids.keys())
+        allowed_set = set(allowed)
+        extracted = []
+        for match in _INLINE_DRIVE_LINK_RE.finditer(verbatim_answer):
+            label = match.group(1).strip()
+            url = match.group(2).strip()
+            fid = extract_drive_url_file_id(url)
+            if fid is None or fid not in id_to_locs:
+                continue
+            candidate_locs = id_to_locs[fid]
+            label_loc = _resolve_authorized_label(label, allowed, allowed_set)
+            if label_loc is not None:
+                if label_loc in candidate_locs:
+                    extracted.append(label_loc)
+                # Label-to-URL mismatch: reject instead of accepting forged link
+                continue
+            if len(candidate_locs) == 1:
+                extracted.append(candidate_locs[0])
+        return tuple(dict.fromkeys(tok for tok in extracted if tok))
+
     allowed_set = set(allowed)
-    extracted = []
+    fid_targets: dict[str, set[str]] = {}
     hits = []
     for match in _INLINE_DRIVE_LINK_RE.finditer(verbatim_answer):
-        hits.append((match.start(), match.group(1).strip(), match.group(2).strip()))
-    for match in _CHIP_CITE_RE.finditer(verbatim_answer):
-        hits.append((match.start(), match.group(1).strip(), ""))
-    hits.sort(key=lambda item: item[0])
-    for _pos, label, url in hits:
-        resolved = None
-        if url and url in allowed_set:
-            resolved = url
-        elif label and label in allowed_set:
-            resolved = label
-        elif allowed_set and label:
-            matches = [a for a in allowed if a.rsplit("/", 1)[-1] == label]
-            if len(matches) == 1:
-                resolved = matches[0]
-        extracted.append(resolved or label or url)
+        label = match.group(1).strip()
+        url = match.group(2).strip()
+        fid = extract_drive_url_file_id(url)
+        if fid is None:
+            continue
+        resolved = _resolve_authorized_label(label, allowed, allowed_set)
+        target = resolved or label or url
+        fid_targets.setdefault(fid, set()).add(target)
+        hits.append((fid, target))
+    extracted = [target for fid, target in hits if len(fid_targets.get(fid, ())) == 1]
     return tuple(dict.fromkeys(tok for tok in extracted if tok))
 
 
@@ -601,14 +696,24 @@ class ScoringApproval:
     snapshot_digest: str
     authorization_domain: str
     locator_set_digest: str
+    locator_url_map_digest: str | None = None
 
     def __post_init__(self):
         for name in ("manifest_digest", "scoring_code_sha", "snapshot_digest",
                      "locator_set_digest"):
             if not _HEX64.match(getattr(self, name) or ""):
                 raise OracleError(f"{name} must be a 64-hex digest")
+        if self.locator_url_map_digest is not None and not _HEX64.match(self.locator_url_map_digest or ""):
+            raise OracleError("locator_url_map_digest must be a 64-hex digest")
         _require_nonempty(self.version, "version")
         _require_nonempty(self.authorization_domain, "authorization_domain")
+
+
+def locator_url_map_digest(locator_url_ids) -> str:
+    """Digest of canonical {locator: drive_object_file_id} binding map."""
+    _validate_locator_url_id_map(locator_url_ids)
+    normalized = {loc: fid for loc, fid in sorted(locator_url_ids.items())}
+    return _sha256_hex(canonical_json(normalized).encode("utf-8"))
 
 
 def locator_set_digest(locators) -> str:
@@ -997,12 +1102,15 @@ def build_v0123_client_receipt(
     question_id: str,
     verbatim_answer: str,
     authorized_locators=(),
+    authorized_locator_url_ids=None,
     extra_cited_locators=(),
     receipt_mode: str = "VERBATIM",
 ) -> ClientReceipt:
-    """Build a ClientReceipt under Connector v0.1.23 inline link/chip citations."""
+    """Build a ClientReceipt under Connector v0.1.23 inline Drive/Docs URL citations."""
     inline = extract_v0123_inline_locators(
-        verbatim_answer, authorized_locators=authorized_locators
+        verbatim_answer,
+        authorized_locators=authorized_locators,
+        authorized_locator_url_ids=authorized_locator_url_ids,
     )
     cited = tuple(dict.fromkeys([*inline, *(extra_cited_locators or ())]))
     return ClientReceipt(
@@ -1020,7 +1128,8 @@ def build_v0123_client_receipt(
 
 
 def validate_receipt(receipt: ClientReceipt, *, oracle: Oracle, authorized_locators=(),
-                     expected_snapshot_digest=None, expected_authorization_domain=None) -> list:
+                     expected_snapshot_digest=None, expected_authorization_domain=None,
+                     authorized_locator_url_ids=None) -> list:
     """Validate a receipt against its Oracle. Returns error strings ([] = valid).
 
     When expected_snapshot_digest / expected_authorization_domain are
@@ -1054,19 +1163,43 @@ def validate_receipt(receipt: ClientReceipt, *, oracle: Oracle, authorized_locat
         or verbatim_stripped.startswith(("[SUMMARY]", "SUMMARY_ONLY"))
     ):
         errors.append("verbatim_answer contains non-verbatim or unexecuted placeholder")
-    allowed = set(authorized_locators)
+    allowed_tuple = tuple(authorized_locators or ())
+    allowed = set(allowed_tuple)
     for loc in receipt.cited_locators:
         if loc not in allowed:
             errors.append("cited locator outside authorized Snapshot: sha256:"
                           + _sha256_hex(str(loc).encode())[:12])
-    if receipt.citation_protocol == "INLINE_LINK_CHIP_V0123" and receipt.cited_locators:
-        inline_found = set(
-            extract_v0123_inline_locators(
-                receipt.verbatim_answer, authorized_locators=authorized_locators
+    if receipt.citation_protocol == "INLINE_LINK_CHIP_V0123":
+        id_to_locs = None
+        if authorized_locator_url_ids is not None:
+            try:
+                id_to_locs = _validate_locator_url_id_map(
+                    authorized_locator_url_ids,
+                    authorized_locators=allowed_tuple if allowed_tuple else None,
+                )
+            except OracleError as exc:
+                errors.append(str(exc))
+                id_to_locs = {}
+            for match in _INLINE_DRIVE_LINK_RE.finditer(receipt.verbatim_answer):
+                label = match.group(1).strip()
+                url = match.group(2).strip()
+                fid = extract_drive_url_file_id(url)
+                if fid is None or fid not in id_to_locs:
+                    errors.append("forged or mismatched inline Drive/Docs citation URL")
+                    continue
+                label_loc = _resolve_authorized_label(label, allowed_tuple, allowed)
+                if label_loc is not None and label_loc not in id_to_locs[fid]:
+                    errors.append("forged or mismatched inline Drive/Docs citation URL")
+        if receipt.cited_locators:
+            inline_found = set(
+                extract_v0123_inline_locators(
+                    receipt.verbatim_answer,
+                    authorized_locators=allowed_tuple,
+                    authorized_locator_url_ids=authorized_locator_url_ids,
+                )
             )
-        )
-        if not set(receipt.cited_locators) <= inline_found:
-            errors.append("cited locator missing structured v0.1.23 inline link/chip evidence")
+            if not set(receipt.cited_locators) <= inline_found:
+                errors.append("cited locator missing verified v0.1.23 inline Drive/Docs link evidence")
     if question.comparison == "locator" and not receipt.cited_locators:
         errors.append("locator question receipt cites no locator")
     if question.mandatory_locator and not receipt.cited_locators:
@@ -1078,7 +1211,8 @@ def validate_receipt(receipt: ClientReceipt, *, oracle: Oracle, authorized_locat
 
 def validate_receipt_approved(receipt: ClientReceipt, *, oracle: Oracle, approval,
                               snapshot_digest: str, authorization_domain: str,
-                              authorized_locators=()) -> list:
+                              authorized_locators=(),
+                              authorized_locator_url_ids=None) -> list:
     """Formal receipt acceptance: the approval record is REQUIRED.
 
     All bindings are compared exactly: approval to Oracle / scoring code /
@@ -1116,10 +1250,25 @@ def validate_receipt_approved(receipt: ClientReceipt, *, oracle: Oracle, approva
             return ["authorized locator set does not match the approval's locator-set digest"]
     except OracleError as exc:
         return [str(exc)]
+    if receipt.citation_protocol == "INLINE_LINK_CHIP_V0123" or approval.locator_url_map_digest is not None:
+        if approval.locator_url_map_digest is None:
+            return ["INLINE_LINK_CHIP_V0123 formal acceptance requires approval.locator_url_map_digest"]
+        if authorized_locator_url_ids is None:
+            return ["authorized_locator_url_ids map is required for formal INLINE_LINK_CHIP_V0123 acceptance"]
+        try:
+            _validate_locator_url_id_map(
+                authorized_locator_url_ids,
+                authorized_locators=authorized_locators,
+            )
+            if locator_url_map_digest(authorized_locator_url_ids) != approval.locator_url_map_digest:
+                return ["authorized_locator_url_ids does not match approval.locator_url_map_digest"]
+        except OracleError as exc:
+            return [str(exc)]
     return validate_receipt(
         receipt, oracle=oracle, authorized_locators=authorized_locators,
         expected_snapshot_digest=snapshot_digest,
-        expected_authorization_domain=authorization_domain)
+        expected_authorization_domain=authorization_domain,
+        authorized_locator_url_ids=authorized_locator_url_ids)
 
 
 def repeat_required(results) -> bool:
