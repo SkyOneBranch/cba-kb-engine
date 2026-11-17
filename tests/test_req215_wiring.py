@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import csv
+import hashlib
 import importlib.util
 import io
 import json
@@ -790,6 +791,181 @@ def test_wiring_oracle_v8_approved_chain_inline_citations_and_spoofing_rejection
             cited_locators=("研究卡_林测试_907766_2025-2026_CURRENT.md",),
             citation_protocol="UNKNOWN_PROTO",
         )
+
+    # Negative 10 (Formal Path): Duplicate file_id across two distinct authorized locators MUST fail closed
+    dup_map = {
+        "研究卡_林测试_907766_2025-2026_CURRENT.md": "shared-dup-id",
+        "00_README_先读这个": "shared-dup-id",
+        "03_DATA_SYNTH_2025-2026.json": "synth-03",
+    }
+    with pytest.raises(oracle.OracleError, match="duplicate file_id"):
+        oracle._validate_locator_url_id_map(dup_map, authorized_locators=locators)
+    with pytest.raises(oracle.OracleError, match="duplicate file_id"):
+        oracle.locator_url_map_digest(dup_map)
+
+    dup_claim_ans = (
+        f"2025-2026 赛季常规赛（41场）效力深圳马可波罗，场均得分 20.1"
+        f"（[研究卡_林测试_907766_2025-2026_CURRENT.md]({drive_prefix}shared-dup-id/view)）。"
+    )
+    with pytest.raises(oracle.OracleError, match="duplicate file_id"):
+        oracle.extract_v0123_inline_locators(
+            dup_claim_ans,
+            authorized_locators=locators,
+            authorized_locator_url_ids=dup_map,
+        )
+    with pytest.raises(oracle.OracleError, match="duplicate file_id"):
+        oracle.build_v0123_client_receipt(
+            engine_sha="f" * 40,
+            snapshot_digest=snap_digest,
+            manifest_digest=o.artifact_digest,
+            question_set_version=o.version,
+            authorization_domain="synth-v215-b2",
+            question_id="B2-Q10",
+            verbatim_answer=dup_claim_ans,
+            authorized_locators=locators,
+            authorized_locator_url_ids=dup_map,
+        )
+
+    # Hand-recomputed digest attack on formal validate_receipt_approved & validate_receipt MUST fail closed
+    forged_dup_digest = hashlib.sha256(
+        oracle.canonical_json(dict(sorted(dup_map.items()))).encode("utf-8")
+    ).hexdigest()
+    dup_approval = oracle.ScoringApproval(
+        manifest_digest=o.artifact_digest,
+        version=o.version,
+        scoring_code_sha=oracle.scoring_code_sha(),
+        snapshot_digest=snap_digest,
+        authorization_domain="synth-v215-b2",
+        locator_set_digest=oracle.locator_set_digest(locators),
+        locator_url_map_digest=forged_dup_digest,
+    )
+    dup_receipt = oracle.ClientReceipt(
+        engine_sha="f" * 40,
+        snapshot_digest=snap_digest,
+        manifest_digest=o.artifact_digest,
+        question_set_version=o.version,
+        authorization_domain="synth-v215-b2",
+        question_id="B2-Q10",
+        verbatim_answer=dup_claim_ans,
+        cited_locators=("研究卡_林测试_907766_2025-2026_CURRENT.md",),
+        receipt_mode="VERBATIM",
+        citation_protocol="INLINE_LINK_CHIP_V0123",
+    )
+    dup_approved_errs = oracle.validate_receipt_approved(
+        dup_receipt,
+        oracle=o,
+        approval=dup_approval,
+        snapshot_digest=snap_digest,
+        authorization_domain="synth-v215-b2",
+        authorized_locators=locators,
+        authorized_locator_url_ids=dup_map,
+    )
+    assert dup_approved_errs and any("duplicate file_id" in e for e in dup_approved_errs)
+    dup_scaff_errs = oracle.validate_receipt(
+        dup_receipt,
+        oracle=o,
+        authorized_locators=locators,
+        authorized_locator_url_ids=dup_map,
+    )
+    assert dup_scaff_errs and any("duplicate file_id" in e for e in dup_scaff_errs)
+
+    # Negative 11: Unauthorized/polluted display label pointing to authorized file_id & piggybacked link rejection
+    polluted_label_ans = (
+        f"2025-2026 赛季常规赛（41场）效力深圳马可波罗，场均得分 20.1"
+        f"（[90_archive_污染旧表.xlsx]({drive_prefix}synth-card-1/view)）。"
+    )
+    assert oracle.extract_v0123_inline_locators(
+        polluted_label_ans,
+        authorized_locators=locators,
+        authorized_locator_url_ids=locator_url_ids,
+    ) == ()
+    polluted_receipt = oracle.ClientReceipt(
+        engine_sha="f" * 40,
+        snapshot_digest=snap_digest,
+        manifest_digest=o.artifact_digest,
+        question_set_version=o.version,
+        authorization_domain="synth-v215-b2",
+        question_id="B2-Q10",
+        verbatim_answer=polluted_label_ans,
+        cited_locators=("研究卡_林测试_907766_2025-2026_CURRENT.md",),
+        receipt_mode="VERBATIM",
+        citation_protocol="INLINE_LINK_CHIP_V0123",
+    )
+    polluted_errs = oracle.validate_receipt_approved(
+        polluted_receipt,
+        oracle=o,
+        approval=approval,
+        snapshot_digest=snap_digest,
+        authorization_domain="synth-v215-b2",
+        authorized_locators=locators,
+        authorized_locator_url_ids=locator_url_ids,
+    )
+    assert any("forged or mismatched inline Drive/Docs citation URL" in e for e in polluted_errs)
+
+    piggyback_ans = f"{verbatim_pass} 附带 [90_archive_污染旧表.xlsx]({drive_prefix}synth-card-1/view)"
+    piggyback_receipt = oracle.ClientReceipt(
+        engine_sha="f" * 40,
+        snapshot_digest=snap_digest,
+        manifest_digest=o.artifact_digest,
+        question_set_version=o.version,
+        authorization_domain="synth-v215-b2",
+        question_id="B2-Q10",
+        verbatim_answer=piggyback_ans,
+        cited_locators=("研究卡_林测试_907766_2025-2026_CURRENT.md",),
+        receipt_mode="VERBATIM",
+        citation_protocol="INLINE_LINK_CHIP_V0123",
+    )
+    piggyback_errs = oracle.validate_receipt_approved(
+        piggyback_receipt,
+        oracle=o,
+        approval=approval,
+        snapshot_digest=snap_digest,
+        authorization_domain="synth-v215-b2",
+        authorized_locators=locators,
+        authorized_locator_url_ids=locator_url_ids,
+    )
+    assert any("forged or mismatched inline Drive/Docs citation URL" in e for e in piggyback_errs)
+
+    upper_drive = "https://" + "DRIVE.GOOGLE.COM/file/d/"
+    upper_forged_receipt = oracle.ClientReceipt(
+        engine_sha="f" * 40,
+        snapshot_digest=snap_digest,
+        manifest_digest=o.artifact_digest,
+        question_set_version=o.version,
+        authorization_domain="synth-v215-b2",
+        question_id="B2-Q10",
+        verbatim_answer=f"[研究卡_林测试_907766_2025-2026_CURRENT.md]({upper_drive}rogue-upper/view)",
+        cited_locators=("研究卡_林测试_907766_2025-2026_CURRENT.md",),
+        receipt_mode="VERBATIM",
+        citation_protocol="INLINE_LINK_CHIP_V0123",
+    )
+    assert any(
+        "forged or mismatched inline Drive/Docs citation URL" in e
+        for e in oracle.validate_receipt_approved(
+            upper_forged_receipt,
+            oracle=o,
+            approval=approval,
+            snapshot_digest=snap_digest,
+            authorization_domain="synth-v215-b2",
+            authorized_locators=locators,
+            authorized_locator_url_ids=locator_url_ids,
+        )
+    )
+
+    # Negative 12: Empty authorized_locators=() with non-empty authorized_locator_url_ids must fail closed
+    with pytest.raises(oracle.OracleError, match="outside authorized_locators"):
+        oracle.extract_v0123_inline_locators(
+            verbatim_pass,
+            authorized_locators=(),
+            authorized_locator_url_ids=locator_url_ids,
+        )
+
+    # Negative 13: Scaffolding reverse ambiguity (one locator claiming two distinct file_ids)
+    reverse_ambig_ans = (
+        f"[研究卡_林测试_907766_2025-2026_CURRENT.md]({drive_prefix}id-1/view) "
+        f"[研究卡_林测试_907766_2025-2026_CURRENT.md]({drive_prefix}id-2/view)"
+    )
+    assert oracle.extract_v0123_inline_locators(reverse_ambig_ans, authorized_locators=locators) == ()
 
 
 # ---------------------------------------------------------------------------

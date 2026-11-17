@@ -112,7 +112,8 @@ _INLINE_DRIVE_LINK_RE = re.compile(
     + re.escape(_DRIVE_HOST)
     + r"|"
     + re.escape(_DOCS_HOST)
-    + r")/[^\s)\r\n]+)\)"
+    + r")/[^\s)\r\n]+)\)",
+    re.IGNORECASE,
 )
 _DRIVE_OBJECT_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _DRIVE_FILE_PATH_RE = re.compile(r"^(?:/u/\d+)?/file/d/([A-Za-z0-9_-]+)(?:/[A-Za-z0-9_.-]*)?$")
@@ -543,66 +544,75 @@ def _resolve_authorized_label(label: str, allowed: tuple, allowed_set: set) -> s
     return None
 
 
-def _validate_locator_url_id_map(locator_url_ids, *, authorized_locators=None) -> dict[str, list[str]]:
-    if not isinstance(locator_url_ids, dict) or not locator_url_ids:
+def _validate_locator_url_id_map(locator_url_ids, *, authorized_locators=None) -> dict[str, str]:
+    """Validate strict 1-to-1 bijection between authorized locators and Drive/Docs file_ids."""
+    if type(locator_url_ids) is not dict or not locator_url_ids:
         raise OracleError("authorized_locator_url_ids must be a non-empty dict")
-    allowed_set = set(authorized_locators) if authorized_locators else None
-    id_to_locs: dict[str, list[str]] = {}
+    if authorized_locators is not None:
+        if not isinstance(authorized_locators, (list, tuple, set, frozenset)):
+            raise OracleError("authorized_locators must be a collection of strings")
+        allowed_set = set(authorized_locators)
+    else:
+        allowed_set = None
+    id_to_loc: dict[str, str] = {}
     for loc, fid in locator_url_ids.items():
-        if not isinstance(loc, str) or not loc.strip():
+        if type(loc) is not str or not loc or loc != loc.strip():
             raise OracleError("locator key in authorized_locator_url_ids must be non-empty string")
-        if not isinstance(fid, str) or not _DRIVE_OBJECT_ID_RE.match(fid):
+        if type(fid) is not str or not _DRIVE_OBJECT_ID_RE.match(fid):
             raise OracleError("file_id in authorized_locator_url_ids must match [A-Za-z0-9_-]+")
         if allowed_set is not None and loc not in allowed_set:
             raise OracleError("authorized_locator_url_ids contains locator outside authorized_locators")
-        id_to_locs.setdefault(fid, []).append(loc)
-    return id_to_locs
+        if fid in id_to_loc:
+            raise OracleError(
+                "duplicate file_id in authorized_locator_url_ids: one-to-one locator binding required"
+            )
+        id_to_loc[fid] = loc
+    return id_to_loc
 
 
 def extract_v0123_inline_locators(
     verbatim_answer: str,
     *,
-    authorized_locators=(),
+    authorized_locators=None,
     authorized_locator_url_ids=None,
 ) -> tuple:
     """Extract cited locators ONLY from authenticated Connector v0.1.23 inline Drive/Docs URLs.
 
     Plain unlinked prose mentions and unauthenticated literal ``⟦cite:...⟧`` text NEVER
-    extract as citations. When ``authorized_locator_url_ids`` is supplied, the URL's object
-    file_id must belong to that exact authorized locator (and match the label if the label
-    names a known locator).
+    extract as citations. When ``authorized_locator_url_ids`` is supplied, it must be a
+    strict 1-to-1 map and BOTH the URL's object file_id AND the Markdown link display label
+    must resolve to that same unique authorized locator.
     """
     if not isinstance(verbatim_answer, str) or not verbatim_answer:
         return ()
-    allowed = tuple(authorized_locators or ())
     if authorized_locator_url_ids is not None:
-        id_to_locs = _validate_locator_url_id_map(
+        id_to_loc = _validate_locator_url_id_map(
             authorized_locator_url_ids,
-            authorized_locators=allowed if allowed else None,
+            authorized_locators=authorized_locators,
         )
-        if not allowed:
-            allowed = tuple(authorized_locator_url_ids.keys())
+        allowed = (
+            tuple(authorized_locators)
+            if authorized_locators is not None
+            else tuple(authorized_locator_url_ids.keys())
+        )
         allowed_set = set(allowed)
         extracted = []
         for match in _INLINE_DRIVE_LINK_RE.finditer(verbatim_answer):
             label = match.group(1).strip()
             url = match.group(2).strip()
             fid = extract_drive_url_file_id(url)
-            if fid is None or fid not in id_to_locs:
+            if fid is None or fid not in id_to_loc:
                 continue
-            candidate_locs = id_to_locs[fid]
+            bound_loc = id_to_loc[fid]
             label_loc = _resolve_authorized_label(label, allowed, allowed_set)
-            if label_loc is not None:
-                if label_loc in candidate_locs:
-                    extracted.append(label_loc)
-                # Label-to-URL mismatch: reject instead of accepting forged link
-                continue
-            if len(candidate_locs) == 1:
-                extracted.append(candidate_locs[0])
+            if label_loc == bound_loc:
+                extracted.append(bound_loc)
         return tuple(dict.fromkeys(tok for tok in extracted if tok))
 
+    allowed = tuple(authorized_locators or ())
     allowed_set = set(allowed)
     fid_targets: dict[str, set[str]] = {}
+    target_fids: dict[str, set[str]] = {}
     hits = []
     for match in _INLINE_DRIVE_LINK_RE.finditer(verbatim_answer):
         label = match.group(1).strip()
@@ -610,11 +620,21 @@ def extract_v0123_inline_locators(
         fid = extract_drive_url_file_id(url)
         if fid is None:
             continue
-        resolved = _resolve_authorized_label(label, allowed, allowed_set)
-        target = resolved or label or url
+        if allowed_set:
+            resolved = _resolve_authorized_label(label, allowed, allowed_set)
+            if resolved is None:
+                continue
+            target = resolved
+        else:
+            target = label or url
         fid_targets.setdefault(fid, set()).add(target)
+        target_fids.setdefault(target, set()).add(fid)
         hits.append((fid, target))
-    extracted = [target for fid, target in hits if len(fid_targets.get(fid, ())) == 1]
+    extracted = [
+        target
+        for fid, target in hits
+        if len(fid_targets.get(fid, ())) == 1 and len(target_fids.get(target, ())) == 1
+    ]
     return tuple(dict.fromkeys(tok for tok in extracted if tok))
 
 
@@ -1101,7 +1121,7 @@ def build_v0123_client_receipt(
     authorization_domain: str,
     question_id: str,
     verbatim_answer: str,
-    authorized_locators=(),
+    authorized_locators=None,
     authorized_locator_url_ids=None,
     extra_cited_locators=(),
     receipt_mode: str = "VERBATIM",
@@ -1170,27 +1190,29 @@ def validate_receipt(receipt: ClientReceipt, *, oracle: Oracle, authorized_locat
             errors.append("cited locator outside authorized Snapshot: sha256:"
                           + _sha256_hex(str(loc).encode())[:12])
     if receipt.citation_protocol == "INLINE_LINK_CHIP_V0123":
-        id_to_locs = None
+        id_to_loc = None
+        map_valid = True
         if authorized_locator_url_ids is not None:
             try:
-                id_to_locs = _validate_locator_url_id_map(
+                id_to_loc = _validate_locator_url_id_map(
                     authorized_locator_url_ids,
-                    authorized_locators=allowed_tuple if allowed_tuple else None,
+                    authorized_locators=allowed_tuple,
                 )
             except OracleError as exc:
                 errors.append(str(exc))
-                id_to_locs = {}
-            for match in _INLINE_DRIVE_LINK_RE.finditer(receipt.verbatim_answer):
-                label = match.group(1).strip()
-                url = match.group(2).strip()
-                fid = extract_drive_url_file_id(url)
-                if fid is None or fid not in id_to_locs:
-                    errors.append("forged or mismatched inline Drive/Docs citation URL")
-                    continue
-                label_loc = _resolve_authorized_label(label, allowed_tuple, allowed)
-                if label_loc is not None and label_loc not in id_to_locs[fid]:
-                    errors.append("forged or mismatched inline Drive/Docs citation URL")
-        if receipt.cited_locators:
+                map_valid = False
+            if map_valid and id_to_loc is not None:
+                for match in _INLINE_DRIVE_LINK_RE.finditer(receipt.verbatim_answer):
+                    label = match.group(1).strip()
+                    url = match.group(2).strip()
+                    fid = extract_drive_url_file_id(url)
+                    if fid is None or fid not in id_to_loc:
+                        errors.append("forged or mismatched inline Drive/Docs citation URL")
+                        continue
+                    label_loc = _resolve_authorized_label(label, allowed_tuple, allowed)
+                    if label_loc != id_to_loc[fid]:
+                        errors.append("forged or mismatched inline Drive/Docs citation URL")
+        if receipt.cited_locators and map_valid:
             inline_found = set(
                 extract_v0123_inline_locators(
                     receipt.verbatim_answer,
