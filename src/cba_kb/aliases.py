@@ -1,9 +1,86 @@
 """Season-aware club name resolution. Unknown names fail closed."""
-import unicodedata
 from pathlib import Path
+from types import MappingProxyType
+from typing import Optional
+import unicodedata
 import yaml
 
 CONFIG = 'config/club_aliases.yaml'
+
+# Authoritative CBA league official team_id -> Chinese club standard name (teams_2024 baseline).
+CBA_TEAM_ID_TO_ZH: MappingProxyType[str, str] = MappingProxyType({
+    '29115': '北京北汽',
+    '29117': '新疆伊力特',
+    '29118': '江苏肯帝亚',
+    '29124': '广东东阳光',
+    '29125': '上海久事',
+    '29127': '四川丰谷酒业',
+    '29128': '浙江方兴渡',
+    '29129': '辽宁本钢',
+    '29130': '山东高速',
+    '29131': '深圳马可波罗',
+    '29132': '山西汾酒',
+    '29133': '南京头排苏酒',
+    '29134': '福建晋江文旅',
+    '29135': '青岛国信制药',
+    '29136': '北京控股',
+    '29137': '九台农商银行',
+    '29138': '天津先行者',
+    '29139': '广州朗肽海本',
+    '29140': '浙江稠州金租',
+    '100074683': '宁波町渥',
+})
+
+# Authoritative mapping from league team_id -> config/club_aliases.yaml canonical club_id.
+CBA_TEAM_ID_TO_CANONICAL_ID: MappingProxyType[str, str] = MappingProxyType({
+    '29115': 'beijing_shougang',
+    '29117': 'xinjiang_guanghui',
+    '29118': 'jiangsu_kendiya',
+    '29124': 'guangdong_hongyuan',
+    '29125': 'shanghai_jiushi',
+    '29127': 'sichuan_jincheng',
+    '29128': 'zhejiang_guangsha',
+    '29129': 'liaoning_shenyang_sansheng',
+    '29130': 'shandong_gaosu',
+    '29131': 'shenzhen_xinshiji',
+    '29132': 'shanxi_fenjiu',
+    '29133': 'nanjing_tongxi',
+    '29134': 'fujian_xunxing',
+    '29135': 'qingdao_guoxin_haitian',
+    '29136': 'beijing_konggu',
+    '29137': 'jilin_jiutai',
+    '29138': 'tianjin_ronggang',
+    '29139': 'guangzhou_longshi',
+    '29140': 'zhejiang_chouzhou',
+    '100074683': 'ningbo_fubang',
+})
+
+
+def resolve_team_id_zh(team_id: object) -> Optional[str]:
+    """Resolve an official CBA league team_id to its Chinese club standard name.
+
+    Unknown, boolean, or empty team IDs return None (honest fallback; never guess).
+    """
+    if team_id is None or isinstance(team_id, bool):
+        return None
+    key = str(team_id).strip()
+    if not key:
+        return None
+    return CBA_TEAM_ID_TO_ZH.get(key)
+
+
+def format_club_team_display(team_id: object, team_name: object = None) -> Optional[str]:
+    """Format a human-readable club display string with honest unknown fallback."""
+    id_str = '' if (team_id is None or isinstance(team_id, bool)) else str(team_id).strip()
+    name_str = '' if team_name is None else str(team_name).strip()
+    resolved_zh = resolve_team_id_zh(id_str)
+    if resolved_zh:
+        return f'{resolved_zh} (team_id={id_str})'
+    if name_str and name_str != id_str:
+        return f'{name_str} (team_id={id_str})' if id_str else name_str
+    if id_str:
+        return f'{id_str} (unresolved_team_id)'
+    return None
 
 
 class UnresolvedClub(ValueError):

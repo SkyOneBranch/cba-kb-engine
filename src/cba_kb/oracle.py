@@ -16,7 +16,7 @@ takes them as explicit caller-supplied values so it stays stdlib-pure and
 independently testable. Wiring the locator supply from a real Snapshot is a
 formal-stage integration step, not something this scaffolding invents.
 
-Scoring rules (version oracle-scoring-v7, frozen at build time):
+Scoring rules (version oracle-scoring-v8, frozen at build time):
 - exact: integer counts exact after versioned normalization (thousand
   separators and surrounding whitespace stripped; anything else unparseable).
 - uid: canonical representation after whitespace strip; aliases match ONLY
@@ -97,7 +97,32 @@ from decimal import Decimal, DecimalException, InvalidOperation
 from fractions import Fraction
 from pathlib import Path
 
-SCORING_SPEC_VERSION = "oracle-scoring-v7"
+SCORING_SPEC_VERSION = "oracle-scoring-v8"
+
+CONNECTOR_CITATION_PROTOCOLS = frozenset({
+    "NATIVE_FOOTER_PILLS",
+    "INLINE_LINK_CHIP_V0123",
+})
+
+_DRIVE_HOST = "drive" + ".google." + "com"
+_DOCS_HOST = "docs" + ".google." + "com"
+_INLINE_DRIVE_LINK_RE = re.compile(
+    r"\[([^\]\r\n]+)\]\((https?://(?:"
+    + re.escape(_DRIVE_HOST)
+    + r"|"
+    + re.escape(_DOCS_HOST)
+    + r")/[^\s)\r\n]+)\)"
+)
+_CHIP_CITE_RE = re.compile(r"⟦cite:([^⟧\r\n]+)⟧")
+_MD_HTTP_LINK_RE = re.compile(r"\]\(https?://[^)\r\n]+\)")
+_HTTP_URL_RE = re.compile(r"https?://[^\s()\[\]<>\"'\r\n]+")
+_NUMBERED_DOC_PREFIX_RE = re.compile(
+    r"(?<![0-9.])\b0\d+[_-][A-Za-z_\u4e00-\u9fff][A-Za-z0-9_\-\u4e00-\u9fff]*"
+)
+_EXT_FILENAME_RE = re.compile(
+    r"[A-Za-z\u4e00-\u9fff_][A-Za-z0-9_.\-\u4e00-\u9fff]*\.(?:md|csv|xlsx|xls|json|jsonl|yaml|yml|pdf|txt|zip|py)(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
 
 ALLOWED_EXPECTED_POSTURES = frozenset({
     "QUIET_CLEAN_OFFICIAL",
@@ -463,30 +488,57 @@ def _parse_number(value):
 _NUM_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_-])(?<![0-9]\.)[+-]?(?:"
     r"\d(?:_?\d)*(?:,\d(?:_?\d){2})*\.\d(?:_?\d)*(?:[eE][+-]?\d(?:_?\d)*)?(?![0-9_])(?![eE][+-]?\d)(?!\.\d)"
-    r"|\d(?:_?\d)*(?:,\d(?:_?\d){2})*(?:\.\d(?:_?\d)*)?(?:[eE][+-]?\d(?:_?\d)*)?(?![A-Za-z0-9_])(?![-][A-Za-z_])(?!\.\d)"
-    r"|\.\d(?:_?\d)*(?:[eE][+-]?\d(?:_?\d)*)?(?![A-Za-z0-9_])(?![-][A-Za-z_])(?!\.\d)"
+    r"|\d(?:_?\d)*(?:,\d(?:_?\d){2})*(?:\.\d(?:_?\d)*)?(?:[eE][+-]?\d(?:_?\d)*)?(?![A-Za-z0-9_])(?![-_][A-Za-z_\u4e00-\u9fff])(?!\.\d)"
+    r"|\.\d(?:_?\d)*(?:[eE][+-]?\d(?:_?\d)*)?(?![A-Za-z0-9_])(?![-_][A-Za-z_\u4e00-\u9fff])(?!\.\d)"
     r")")
+
+
+def extract_v0123_inline_locators(verbatim_answer: str, *, authorized_locators=()) -> tuple:
+    """Extract cited locators ONLY from structured Connector v0.1.23 inline Drive/Docs links or chips.
+
+    Plain unlinked prose mentions (e.g. "来源文件：...") NEVER extract as citations.
+    """
+    if not isinstance(verbatim_answer, str) or not verbatim_answer:
+        return ()
+    allowed = tuple(authorized_locators or ())
+    allowed_set = set(allowed)
+    extracted = []
+    hits = []
+    for match in _INLINE_DRIVE_LINK_RE.finditer(verbatim_answer):
+        hits.append((match.start(), match.group(1).strip(), match.group(2).strip()))
+    for match in _CHIP_CITE_RE.finditer(verbatim_answer):
+        hits.append((match.start(), match.group(1).strip(), ""))
+    hits.sort(key=lambda item: item[0])
+    for _pos, label, url in hits:
+        resolved = None
+        if url and url in allowed_set:
+            resolved = url
+        elif label and label in allowed_set:
+            resolved = label
+        elif allowed_set and label:
+            matches = [a for a in allowed if a.rsplit("/", 1)[-1] == label]
+            if len(matches) == 1:
+                resolved = matches[0]
+        extracted.append(resolved or label or url)
+    return tuple(dict.fromkeys(tok for tok in extracted if tok))
 
 
 def _verbatim_numbers(text):
     """All numbers asserted in verbatim text, as Decimals (see _NUM_TOKEN_RE).
 
-    Text with no asserted number yields []; the caller skips the
-    cross-check there, never guessing. Every returned number counts:
-    any one contradicting the structured value fails the check.
-    A token the regex recognizes but Decimal cannot safely convert
-    (e.g. an exponent beyond the context range) raises OracleError
-    instead of being silently dropped: the caller must fail the
-    consistency check closed, never auto-pass on the remaining numbers.
-    A token that converts to a non-finite Decimal (NaN/Infinity -- e.g.
-    when the caller disabled the InvalidOperation trap, so the
-    construction returns NaN instead of raising) is rejected the same
-    way, so no comparison can silently pass on a NaN.
+    URLs, explicit filenames with extensions, and numbered doc prefixes
+    (e.g. ``00_README``, ``02-说明``, ``研究卡_..._CURRENT.md``) are decoupled
+    prior to numeric token scanning so inline v0.1.23 citations do not leak
+    URL/filename digits into factual consistency checks.
     """
     if not isinstance(text, str):
         return []
+    cleaned = _MD_HTTP_LINK_RE.sub("]()", text)
+    cleaned = _HTTP_URL_RE.sub(" ", cleaned)
+    cleaned = _NUMBERED_DOC_PREFIX_RE.sub(" ", cleaned)
+    cleaned = _EXT_FILENAME_RE.sub(" ", cleaned)
     numbers = []
-    for token in _NUM_TOKEN_RE.findall(text):
+    for token in _NUM_TOKEN_RE.findall(cleaned):
         try:
             number = Decimal(token.replace(",", "").replace("_", ""))
         except InvalidOperation:
@@ -913,6 +965,7 @@ class ClientReceipt:
     verbatim_answer: str
     cited_locators: tuple = ()
     receipt_mode: str = "VERBATIM"
+    citation_protocol: str = "NATIVE_FOOTER_PILLS"
 
     def __post_init__(self):
         if not _HEX40.match(self.engine_sha or ""):
@@ -923,6 +976,8 @@ class ClientReceipt:
         for name in ("question_set_version", "authorization_domain", "question_id"):
             _require_nonempty(getattr(self, name), name)
         _require_nonempty(self.receipt_mode, "receipt_mode")
+        if self.citation_protocol not in CONNECTOR_CITATION_PROTOCOLS:
+            raise OracleError(f"unsupported citation_protocol: {self.citation_protocol!r}")
         if not isinstance(self.verbatim_answer, str) or not self.verbatim_answer.strip():
             raise OracleError("verbatim_answer must be non-empty text")
         # Freeze cited locators: a caller list must not stay mutable, or
@@ -930,6 +985,38 @@ class ClientReceipt:
         if not isinstance(self.cited_locators, (list, tuple)):
             raise OracleError("cited_locators must be a list or tuple")
         object.__setattr__(self, "cited_locators", tuple(self.cited_locators))
+
+
+def build_v0123_client_receipt(
+    *,
+    engine_sha: str,
+    snapshot_digest: str,
+    manifest_digest: str,
+    question_set_version: str,
+    authorization_domain: str,
+    question_id: str,
+    verbatim_answer: str,
+    authorized_locators=(),
+    extra_cited_locators=(),
+    receipt_mode: str = "VERBATIM",
+) -> ClientReceipt:
+    """Build a ClientReceipt under Connector v0.1.23 inline link/chip citations."""
+    inline = extract_v0123_inline_locators(
+        verbatim_answer, authorized_locators=authorized_locators
+    )
+    cited = tuple(dict.fromkeys([*inline, *(extra_cited_locators or ())]))
+    return ClientReceipt(
+        engine_sha=engine_sha,
+        snapshot_digest=snapshot_digest,
+        manifest_digest=manifest_digest,
+        question_set_version=question_set_version,
+        authorization_domain=authorization_domain,
+        question_id=question_id,
+        verbatim_answer=verbatim_answer,
+        cited_locators=cited,
+        receipt_mode=receipt_mode,
+        citation_protocol="INLINE_LINK_CHIP_V0123",
+    )
 
 
 def validate_receipt(receipt: ClientReceipt, *, oracle: Oracle, authorized_locators=(),
@@ -972,6 +1059,14 @@ def validate_receipt(receipt: ClientReceipt, *, oracle: Oracle, authorized_locat
         if loc not in allowed:
             errors.append("cited locator outside authorized Snapshot: sha256:"
                           + _sha256_hex(str(loc).encode())[:12])
+    if receipt.citation_protocol == "INLINE_LINK_CHIP_V0123" and receipt.cited_locators:
+        inline_found = set(
+            extract_v0123_inline_locators(
+                receipt.verbatim_answer, authorized_locators=authorized_locators
+            )
+        )
+        if not set(receipt.cited_locators) <= inline_found:
+            errors.append("cited locator missing structured v0.1.23 inline link/chip evidence")
     if question.comparison == "locator" and not receipt.cited_locators:
         errors.append("locator question receipt cites no locator")
     if question.mandatory_locator and not receipt.cited_locators:

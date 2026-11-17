@@ -79,7 +79,10 @@ python scripts/run_cleanroom_smoke.py --output .cleanroom/ci-smoke
 | --- | --- | --- |
 | v1.5.x–v1.9.0 | 球员注册与导出、文档证据、来源采集、Statement 与 Claim | 历史里程碑 |
 | v2.0.2 | 可复用的公开 Engine、许可证、合成夹具和可复现工具 | 历史里程碑 |
-| [v2.0.4-2](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.0.4-2) | Inbox 与 Drive 发现、受控归档、文档检索及故障恢复 | 已发布里程碑 |
+| [v2.0.4-2](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.0.4-2) | Inbox 与 Drive 发现、受控归档、文档检索及故障恢复 | 历史里程碑 |
+| [v2.1.0](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.1.0)–[v2.1.1](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.1.1) | Drive 优先的受控消费入口（`ConsumeSession`）、快照与事实保证链路 | 历史里程碑 |
+| [v2.1.3](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.1.3) | 异常感知人物研究卡投影与独立评分 Oracle | 历史里程碑 |
+| [v2.1.4](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.1.4) / [v2.1.4-1](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.1.4-1) | 确定性测试与 CI 基座加固、锁耐久性修复、LACD v1.0.4 治理基线对齐 | 已发布里程碑 |
 
 知识消费组件已在合成资料上进行测试，包括隔离环境中的 ChatGPT Web + Google Drive 查询。这些测试支持开发验证，但不代表对特定私人资料、使用者或生产环境的完整验收。
 
@@ -96,7 +99,7 @@ python scripts/run_cleanroom_smoke.py --output .cleanroom/ci-smoke
 - **不能自动升格为 Fact。** Drive 文件可见，或来源出现在清单中，并不能自动证明其每一条正式事实。Fact 来源绑定及跨来源冲突判断仍需审慎验证。
 - **同名不等于同一人。** 身份候选必须有当前获授权的身份资料支持；没有证据时保留待澄清，不自动合并球员。
 - **Drive 可见性有条件。** Producer 上传不等于 ChatGPT 已看到当前资料；连接器索引、授权及撤权必须按目标和使用时点核验。
-- **多用户检索仍有限制。** 部分 Engine 底层搜索入口尚未一致执行逐用户授权（[Issue #169](https://github.com/SkyOneBranch/cba-kb-engine/issues/169)）；修复前不要直接将其作为面向不可信多用户的授权边界。
+- **检索逐 `principal` 授权边界说明。**[Issue #169](https://github.com/SkyOneBranch/cba-kb-engine/issues/169) 已**关闭**（`PR #170` 已在 `drive_search` 与 `drive_search_index` 实现 fail-closed 逐 `principal` ACL 校验）；因底层检索假定 `principal` 来自受信任的调用方身份上下文而不自建鉴权服务，切勿将其直接暴露为未鉴权的公开多用户端点。
 - **合成测试不等于生产验收。** 在使用真实资料前，应针对具体使用者和环境核验权限、来源绑定、新鲜度与实际查询结果。
 - **尊重原始资料版权。** 私人阅读和研究权限不自动包含公开转载权限。
 

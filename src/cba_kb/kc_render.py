@@ -19,9 +19,44 @@ import json
 import re
 from typing import Any, Dict, List
 
+from .aliases import format_club_team_display
 from .kc_projection import KcError
 
 READABILITY_STATUS = "NOT_VERIFIED_PENDING_PHASE_2"
+
+
+def _safe_filename_part(value: Any, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"UNSAFE_FILENAME_PART:{label}")
+    cleaned = value.strip()
+    if (
+        not cleaned
+        or "/" in cleaned
+        or "\\" in cleaned
+        or "\x00" in cleaned
+        or ".." in cleaned
+    ):
+        raise ValueError(f"UNSAFE_FILENAME_PART:{label}")
+    return "_".join(cleaned.split())
+
+
+def research_card_consumer_filename(player_name: str, player_id: str, season: str) -> str:
+    """Build self-describing Chinese consumer filename for promoted research cards."""
+    safe_name = _safe_filename_part(player_name, "player_name")
+    safe_id = _safe_filename_part(player_id, "player_id")
+    safe_season = _safe_filename_part(season, "season")
+    return f"研究卡_{safe_name}_{safe_id}_{safe_season}_CURRENT.md"
+
+
+def slice_consumer_filename(
+    player_name: str, player_id: str, season: str, match_type: str = "REGULAR"
+) -> str:
+    """Build self-describing Chinese consumer filename for promoted stats slices."""
+    safe_name = _safe_filename_part(player_name, "player_name")
+    safe_id = _safe_filename_part(player_id, "player_id")
+    safe_season = _safe_filename_part(season, "season")
+    safe_mt = _safe_filename_part(match_type, "match_type")
+    return f"研究切片_{safe_name}_{safe_id}_{safe_season}_{safe_mt}_CURRENT.md"
 
 
 def render_research_card(payload: Dict[str, Any], *, evidence_verified: bool = False) -> str:
@@ -32,11 +67,6 @@ def render_research_card(payload: Dict[str, Any], *, evidence_verified: bool = F
     """
     if evidence_verified is not True:
         raise KcRenderError("RESEARCH_CARD_NOT_VERIFIED")
-
-    lines: List[str] = [
-        "# Research Card (Serving Projection)",
-        "",
-    ]
 
     grains = payload.get("grains", {})
     stats_layer = grains.get("STATS", {})
@@ -49,10 +79,29 @@ def render_research_card(payload: Dict[str, Any], *, evidence_verified: bool = F
         stats_layer.get("posture") if isinstance(stats_layer, dict) else None
     ) or "UNKNOWN"
 
-    # 1. Stats & Scope Section
-    lines.append("## Statistical Evidence")
     scope_meta = transparency.get("scope_meta") or {}
     season = scope_meta.get("season") or stats_layer.get("season", "-")
+    player_name = scope_meta.get("player_name")
+    player_id = scope_meta.get("player_id") or transparency.get("subject_player_uid")
+
+    if posture != "UNKNOWN" and player_name and player_id and season and season != "-":
+        title = (
+            f"# 人物研究卡｜{player_name}（{player_id}）｜{season}｜CURRENT "
+            "— Research Card (Serving Projection)"
+        )
+    elif posture != "UNKNOWN" and (player_name or player_id) and season and season != "-":
+        entity_label = player_name or player_id
+        title = f"# 人物研究卡｜{entity_label}｜{season}｜CURRENT — Research Card (Serving Projection)"
+    else:
+        title = "# Research Card (Serving Projection)"
+
+    lines: List[str] = [
+        title,
+        "",
+    ]
+
+    # 1. Stats & Scope Section
+    lines.append("## Statistical Evidence")
     match_type = scope_meta.get("match_type") or stats_layer.get("match_type", "-")
     scope = scope_meta.get("scope") or stats_layer.get("scope", "-")
     games_played = scope_meta.get("games_played")
@@ -65,7 +114,16 @@ def render_research_card(payload: Dict[str, Any], *, evidence_verified: bool = F
     if val is None and isinstance(stats_layer, dict) and posture in ("CLEAN_OFFICIAL", "IDENTICAL_DUPLICATE"):
         val = stats_layer.get("value")
 
+    club_display = format_club_team_display(scope_meta.get("team_id"), scope_meta.get("club_name_zh") or scope_meta.get("team_name"))
+
     lines.append(f"- Posture: {posture}")
+    if posture != "UNKNOWN" and player_id:
+        if player_name:
+            lines.append(f"- Player: {player_name} ({player_id})")
+        else:
+            lines.append(f"- Player ID: {player_id}")
+    if club_display and posture != "UNKNOWN":
+        lines.append(f"- Club / Team: {club_display}")
     lines.append(f"- Season: {season}")
     lines.append(f"- Match Type: {match_type}")
     lines.append(f"- Scope: {scope}")
