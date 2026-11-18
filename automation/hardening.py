@@ -204,7 +204,13 @@ def validate_release_identity(identity: Mapping[str, Any]) -> dict[str, Any]:
     try:
         spec = _release_spec(str(attempt))
     except ProjectionError as exc:
-        _fail(RELEASE_IDENTITY_NOT_READY, "canonical release tooling does not support the attempt", canonical_error=str(exc))
+        try:
+            from cba_kb.orchestration.release.prepare_v215 import (
+                _release_spec as _v215_release_spec,
+            )
+            spec = _v215_release_spec(str(attempt))
+        except (ImportError, ProjectionError):
+            _fail(RELEASE_IDENTITY_NOT_READY, "canonical release tooling does not support the attempt", canonical_error=str(exc))
     return _pass(
         "RELEASE_IDENTITY",
         target_product_version=product_version,

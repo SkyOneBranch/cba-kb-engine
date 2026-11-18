@@ -100,7 +100,11 @@ from .kc_projection import (
     sha256_hex,
     validate_identity_authorization,
 )
-from .kc_render import check_completeness
+from .kc_render import (
+    check_completeness,
+    research_card_consumer_filename,
+    slice_consumer_filename,
+)
 from .kc_snapshot import (
     build_fact_guarantee,
     build_snapshot,
@@ -672,6 +676,20 @@ def build_local_projection(*, fixture: Dict[str, Any],
         manifest_files.append({
             "path": rel_path, "sha256": sha256_hex(data),
             "bytes": len(data)})
+    first_player_name = (
+        players[0].get("canonical_name")
+        or records[0].get("player_name")
+        or first_player
+    )
+    first_provider_id = str(
+        records[0].get("provider_player_id") or first_player
+    )
+    consumer_card_name = research_card_consumer_filename(
+        str(first_player_name), first_provider_id, str(season),
+    )
+    consumer_slice_name = slice_consumer_filename(
+        str(first_player_name), first_provider_id, str(season), "REGULAR",
+    )
     manifest: Dict[str, Any] = {
         "snapshot_id": snap.snapshot_id,
         "content_sha256": snap.content_sha256,
@@ -679,6 +697,8 @@ def build_local_projection(*, fixture: Dict[str, Any],
         "build_time": build_time,
         "local_only": True,
         "drive_publication": False,
+        "consumer_research_card_filename": consumer_card_name,
+        "consumer_slice_filename": consumer_slice_name,
         "identity": {"status": identity_status,
                      "candidates": identity_candidates,
                      "formal_authorization": formal_identity_info},

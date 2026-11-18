@@ -107,6 +107,7 @@ import uuid
 from types import MappingProxyType
 from typing import Any, Dict, List, Optional
 
+from .aliases import resolve_team_id_zh
 from .kc_current import KcCurrentError, SimulatedCurrentStore
 from .kc_passages import verify_passage_text
 from .kc_projection import (
@@ -1173,6 +1174,51 @@ class ConsumeSession:
         evidence_transparency = dict(stats_classification)
         if evidence_transparency.get("posture") != "UNKNOWN":
             evidence_transparency["subject_player_uid"] = player_uid
+            scope_meta = dict(evidence_transparency.get("scope_meta") or {})
+            matched_recs = [
+                r for r in authorized_stats_records
+                if (
+                    r.get("player_uid") == player_uid
+                    and str(r.get("season")) == str(season)
+                    and str(r.get("match_type")) == str(match_type)
+                    and r.get("scope", "WHOLE_SEASON") == scope
+                    and (scope != "TEAM_SPLIT" or team_id is None or str(r.get("team_id")) == str(team_id))
+                )
+            ]
+            rec_player_names = [
+                str(r.get("player_name")).strip()
+                for r in matched_recs
+                if isinstance(r.get("player_name"), str) and r.get("player_name").strip()
+            ]
+            rec_provider_ids = [
+                str(r.get("provider_player_id")).strip()
+                for r in matched_recs
+                if r.get("provider_player_id") not in (None, "")
+            ]
+            rec_team_ids = [
+                str(r.get("team_id")).strip()
+                for r in matched_recs
+                if r.get("team_id") not in (None, "")
+            ]
+            rec_team_names = [
+                str(r.get("team_name")).strip()
+                for r in matched_recs
+                if isinstance(r.get("team_name"), str) and r.get("team_name").strip()
+            ]
+            scope_meta["player_id"] = rec_provider_ids[0] if rec_provider_ids else player_uid
+            if rec_player_names:
+                scope_meta["player_name"] = rec_player_names[0]
+            effective_team_id = scope_meta.get("team_id")
+            if effective_team_id in (None, "") and len(set(rec_team_ids)) == 1:
+                effective_team_id = rec_team_ids[0]
+                scope_meta["team_id"] = effective_team_id
+            if effective_team_id not in (None, ""):
+                club_zh = resolve_team_id_zh(effective_team_id)
+                if club_zh:
+                    scope_meta["club_name_zh"] = club_zh
+            if rec_team_names and not scope_meta.get("team_name"):
+                scope_meta["team_name"] = rec_team_names[0]
+            evidence_transparency["scope_meta"] = scope_meta
         evidence_transparency["claim_transparency"] = claim_classification
 
         payload = {

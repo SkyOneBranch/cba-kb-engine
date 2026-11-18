@@ -1,7 +1,10 @@
 > [!WARNING]
 > **SUPERSEDED HISTORICAL RECORD**: This document is an archived historical specification/record and is no longer active. It has been sanitized for public repository compliance.
 
-# MASTER 载体迁移核对
+# MASTER 载体迁移核对（历史 v1.1 迁移快照）
+
+> [!NOTE]
+> 以下 `3451` 行统计系 **`2026-09-10`** 早期 v1.1 载体迁移期间的只读核对快照（已属历史迁移记录）；当前生产 `MASTER` 行数由发版构建期动态统计并写入权威消费面导览与字段字典（当前不再以静态 `3,451` 作为实时总行数）。
 
 2026-09-10 只读比较：归档 <DRIVE_ID>（677658字节、43列）与当前 <DRIVE_ID>（314762字节、20列）。两者均3451行，record_key集合相同。
 

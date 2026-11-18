@@ -79,7 +79,10 @@ This example does not move or publish real files. See the [Operations guide](doc
 | --- | --- | --- |
 | v1.5.x–v1.9.0 | Player registration and export, document evidence, source acquisition, Statements and Claims | Historical milestones |
 | v2.0.2 | Reusable public Engine, licensing, synthetic fixtures, reproducible tooling | Historical milestone |
-| [v2.0.4-2](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.0.4-2) | Inbox and Drive discovery, guarded archiving, document search, recovery | Released milestone |
+| [v2.0.4-2](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.0.4-2) | Inbox and Drive discovery, guarded archiving, document search, recovery | Historical milestone |
+| [v2.1.0](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.1.0)–[v2.1.1](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.1.1) | Drive-first controlled consumption entry (`ConsumeSession`), snapshot/fact guarantees | Historical milestones |
+| [v2.1.3](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.1.3) | Exception-aware research card projections and independent scoring oracle | Historical milestone |
+| [v2.1.4](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.1.4) / [v2.1.4-1](https://github.com/SkyOneBranch/cba-kb-engine/releases/tag/v2.1.4-1) | Deterministic test/CI substrate, file lock hardening, LACD v1.0.4 governance alignment | Released milestone |
 
 Evidence-consumption components have been tested with synthetic materials, including isolated ChatGPT Web + Google Drive checks. These tests support development but do not establish readiness for a particular private dataset, user, or production environment.
 
@@ -96,7 +99,7 @@ These are directions, not guaranteed release dates. See [Releases](https://githu
 - **No automatic promotion to Fact.** Being able to read a Drive file, or seeing a source in a manifest, does not by itself authenticate each claimed Fact. Fact-source mapping and cross-source conflict checks still require careful validation.
 - **Identity ambiguity is not a match.** Same-name candidates must remain unresolved until supported by authorized identity evidence. Do not merge players based only on names.
 - **Google Drive visibility is conditional.** A producer upload is not proof that ChatGPT observed the current material. Connector indexing, authorization, and revocation must be checked for the target and time of use.
-- **Multi-user access is limited.** Some lower-level Engine search paths do not consistently enforce per-user authorization ([Issue #169](https://github.com/SkyOneBranch/cba-kb-engine/issues/169)); do not expose them directly as an authorization boundary to untrusted users.
+- **Caller identity boundary for search authorization.** [Issue #169](https://github.com/SkyOneBranch/cba-kb-engine/issues/169) is **closed** (PR `#170` implemented fail-closed per-`principal` ACL enforcement in `drive_search` and `drive_search_index`). Because those helpers trust the caller-supplied `principal` string without an authentication server, do not expose them directly as an unauthenticated multi-user public endpoint.
 - **Synthetic tests are not production approval.** Before real-data use, operators must verify the relevant permissions, source bindings, freshness, and consumer behavior for their own environment.
 - **Respect upstream rights.** Permission to read or privately analyze documents does not authorize redistribution.
 
