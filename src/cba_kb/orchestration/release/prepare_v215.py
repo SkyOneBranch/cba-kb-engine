@@ -87,8 +87,14 @@ release_infra_compatibility_preflight = _base.release_infra_compatibility_prefli
 run_trusted_release_infra_compatibility_preflight = _base.run_trusted_release_infra_compatibility_preflight
 build_live_qualification_fingerprints = _base.build_live_qualification_fingerprints
 
-# Empty in PR 1 (Engine v2.1.5); populated in Stage 4 Release Spec PR 2 ("v2.1.5-1").
-V215_RELEASE_SPECS: dict[str, dict] = {}
+V215_BASELINE_SHA = "3874ebb4b20fdfd5c1d1fd7f9ed9426d9f26036f"
+
+V215_RELEASE_SPECS: dict[str, dict] = {
+    "v2.1.5-1": {
+        "product_baseline_sha": V215_BASELINE_SHA,
+        "enable_consumer_surface_v215": True,
+    },
+}
 
 _CLOSURE_BASE_RELEASES = frozenset({
     "v1.6.1-1", "v1.8.1-1", "v1.8.1-2", "v1.8.1-3",
