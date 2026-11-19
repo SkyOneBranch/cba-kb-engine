@@ -152,7 +152,7 @@ def record_revision(
     return chain
 
 
-def grant_rights(
+def _grant_rights_unlocked(
     registry_path: Any,
     ledger_path: Any,
     file_id: str,
@@ -163,30 +163,8 @@ def grant_rights(
     policy_version: str = "2.0.4-2-slice2",
     allowed_principals: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Explicitly grant rights for one discovered file (guarded, audited).
-
-    Fail-closed: unknown file_id raises ValueError; only objects currently in
-    ``review`` rights state can transition. The generated grant is a complete
-    strict-schema record (``approved``/``approver``/``file_id``/``scope``) so
-    it passes the base slice's ``decide_drive_rights``.
-
-    CF-01: ``allowed_principals`` optionally scopes the grant to named
-    principals. When supplied it must be a non-empty collection of non-empty
-    strings (anything else raises ValueError); it is stored as a sorted list
-    on the grant and recorded in the ledger event. The query path
-    (``drive_search_index.search_index``) enforces membership fail-closed:
-    a grant carrying an allowed set is visible ONLY to its members. When
-    omitted, the grant carries no allowed set and is NOT valid for any
-    principal-scoped query — document-level checks only.
-
-    Ordering (audit-first): the ledger event is appended BEFORE the registry
-    is persisted. If the ledger write fails, a ``DriveDiscoveryError`` is
-    raised and the registry is untouched — a retry can then complete the
-    grant instead of hitting a phantom "already approved".
-
-    Already-approved is idempotent only when the stored grant strictly
-    validates; a stale/incomplete grant (e.g. from the pre-fix order) is
-    healed by re-running the grant flow, which backfills the audit event.
+    """Inner implementation of ``grant_rights`` assuming caller holds
+    ``drive_resilience.file_lock(registry_path)``.
     """
     from .common import atomic
 
@@ -254,6 +232,61 @@ def grant_rights(
                                     sort_keys=True).encode("utf-8"))
     return {"file_id": file_id, "rights_status": "approved",
             "approver": approver.strip()}
+
+
+def grant_rights(
+    registry_path: Any,
+    ledger_path: Any,
+    file_id: str,
+    *,
+    approver: str,
+    note: str = "",
+    actor: str = "muse",
+    policy_version: str = "2.0.4-2-slice2",
+    allowed_principals: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Explicitly grant rights for one discovered file (guarded, audited).
+
+    Fail-closed: unknown file_id raises ValueError; only objects currently in
+    ``review`` rights state can transition. The generated grant is a complete
+    strict-schema record (``approved``/``approver``/``file_id``/``scope``) so
+    it passes the base slice's ``decide_drive_rights``.
+
+    CF-01: ``allowed_principals`` optionally scopes the grant to named
+    principals. When supplied it must be a non-empty collection of non-empty
+    strings (anything else raises ValueError); it is stored as a sorted list
+    on the grant and recorded in the ledger event. The query path
+    (``drive_search_index.search_index``) enforces membership fail-closed:
+    a grant carrying an allowed set is visible ONLY to its members. When
+    omitted, the grant carries no allowed set and is NOT valid for any
+    principal-scoped query — document-level checks only.
+
+    Ordering (audit-first): the ledger event is appended BEFORE the registry
+    is persisted. If the ledger write fails, a ``DriveDiscoveryError`` is
+    raised and the registry is untouched — a retry can then complete the
+    grant instead of hitting a phantom "already approved".
+
+    Already-approved is idempotent only when the stored grant strictly
+    validates; a stale/incomplete grant (e.g. from the pre-fix order) is
+    healed by re-running the grant flow, which backfills the audit event.
+
+    Concurrency: acquires ``drive_resilience.file_lock(registry_path)`` so
+    concurrent ``grant_rights`` calls never lose updates or split ledger/
+    registry state.
+    """
+    from .drive_resilience import file_lock
+
+    with file_lock(Path(registry_path)):
+        return _grant_rights_unlocked(
+            registry_path,
+            ledger_path,
+            file_id,
+            approver=approver,
+            note=note,
+            actor=actor,
+            policy_version=policy_version,
+            allowed_principals=allowed_principals,
+        )
 
 
 def _matches(record: Dict[str, Any], query: str,

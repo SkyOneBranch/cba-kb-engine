@@ -41,11 +41,18 @@ def build_routed_passage(*, source_id: str, revision: str, locator: str,
                          title: Optional[str] = None,
                          speaker: Optional[str] = None,
                          attribution: Optional[str] = None,
-                         authorized_url: Optional[str] = None
+                         authorized_url: Optional[str] = None,
+                         upstream_origin: Optional[str] = None,
+                         related_urls: Optional[List[str]] = None,
+                         source_tier: Optional[str] = None,
+                         raw_sha256: Optional[str] = None,
+                         extracted_sha256: Optional[str] = None,
+                         completeness: Optional[str] = None
                          ) -> Dict[str, Any]:
     """A routed passage: Slice A digest binding plus the consumer-safe
     representation (consumer_source_id), authorized title, speaker /
-    attribution where present, and the authorized-copy/original URL."""
+    attribution where present, authorized-copy/original URL, and optional
+    acquisition provenance fields."""
     passage = build_passage(source_id=source_id, revision=revision,
                             locator=locator, text=text,
                             player_uid=player_uid, aliases=aliases)
@@ -54,6 +61,18 @@ def build_routed_passage(*, source_id: str, revision: str, locator: str,
     passage["attribution"] = attribution
     passage["authorized_url"] = authorized_url
     passage["consumer_source_id"] = source_id
+    if upstream_origin is not None:
+        passage["upstream_origin"] = upstream_origin
+    if related_urls is not None:
+        passage["related_urls"] = list(related_urls)
+    if source_tier is not None:
+        passage["source_tier"] = source_tier
+    if raw_sha256 is not None:
+        passage["raw_sha256"] = raw_sha256
+    if extracted_sha256 is not None:
+        passage["extracted_sha256"] = extracted_sha256
+    if completeness is not None:
+        passage["completeness"] = completeness
     return passage
 
 

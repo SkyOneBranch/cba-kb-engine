@@ -199,6 +199,25 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _save_registry_unlocked(
+    registry_file: Any,
+    updates: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """Reload current on-disk registry, merge ``updates``, and write atomically.
+
+    Assumes the caller already holds ``drive_resilience.file_lock(registry_file)``.
+    """
+    from .drive_search import load_registry
+
+    path = Path(registry_file)
+    current = load_registry(path) if path.exists() else {}
+    current.update(updates)
+    atomic(path,
+           json.dumps(current, ensure_ascii=False, indent=2,
+                      sort_keys=True).encode("utf-8"))
+    return current
+
+
 def poll_once(
     source: Any,
     drive: Any,
@@ -320,10 +339,13 @@ def poll_once(
         if change_id in processed_ids:
             counts["duplicate_skipped"] += 1
             continue
+        updates: Dict[str, Dict[str, Any]] = {}
         try:
             if change.get("removed"):
                 action = POLL_FILE_REMOVED
                 existed = _tombstone(known, file_id, change_id, _utcnow())
+                if existed:
+                    updates[file_id] = known[file_id]
                 note = ("tombstoned" if existed
                         else "removal for unknown file; no registry entry")
                 event_extra: Dict[str, Any] = {}
@@ -385,6 +407,7 @@ def poll_once(
                 if identity["canonical_file_id"]:
                     new_record["duplicate_of"] = identity["canonical_file_id"]
                 known[file_id] = new_record
+                updates[file_id] = new_record
                 note = (f"classification={classification} "
                         f"rights={rights_status}/{rights_reason}")
                 event_extra = {"classification": classification,
@@ -410,9 +433,21 @@ def poll_once(
         # retry re-delivers the change. The change is only treated as
         # "processed" after its registry update is durable — a crash can
         # never silently lose it.
-        atomic(registry_file,
-               json.dumps(known, ensure_ascii=False, indent=2,
-                          sort_keys=True).encode("utf-8"))
+        from .drive_resilience import file_lock
+
+        with file_lock(registry_file):
+            if (not change.get("removed")
+                    and file_id in updates
+                    and registry_file.exists()):
+                disk_rec = load_registry(registry_file).get(file_id)
+                if (isinstance(disk_rec, dict)
+                        and "rights_grant" in disk_rec
+                        and "rights_grant" not in updates[file_id]):
+                    for key in ("rights_status", "rights_reason",
+                                "rights_grant"):
+                        if key in disk_rec:
+                            updates[file_id][key] = disk_rec[key]
+            known = _save_registry_unlocked(registry_file, updates)
         save_dedup_index(dedup_file, dedup_index)
         save_revision_history(history_file, revision_history)
         append_ledger(ledger, {

@@ -9,8 +9,11 @@ from datetime import date, datetime, timezone
 import hashlib
 import json
 import math
+import os
 import re
+import shutil
 import unicodedata
+import uuid
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -33,6 +36,7 @@ CAPTURE_CHANNELS = (
     "ima_file_export",
     "local_file",
     "google_drive_doc",
+    "acquisition_bundle_v1",
 )
 RIGHTS_CLASSIFICATIONS = ("public", "copyrighted", "private", "unknown")
 DEFAULT_RIGHTS = {
@@ -40,6 +44,7 @@ DEFAULT_RIGHTS = {
     "ima_file_export": "unknown",
     "local_file": "private",
     "google_drive_doc": "private",
+    "acquisition_bundle_v1": "copyrighted",
 }
 
 
@@ -227,11 +232,9 @@ def _shingles(text, width=5):
             for index in range(len(points) - width + 1)}
 
 
-def near_duplicate(left, right):
-    left_text, right_text = normalize_text(left), normalize_text(right)
+def _compare_shingles(left_text, left_shingles, right_text, right_shingles):
     if not left_text or not right_text:
         return {"jaccard": 0.0, "length_ratio": 0.0, "candidate": False}
-    left_shingles, right_shingles = _shingles(left_text), _shingles(right_text)
     union = left_shingles | right_shingles
     score = len(left_shingles & right_shingles) / len(union) if union else 0.0
     ratio = min(len(left_text), len(right_text)) / max(len(left_text), len(right_text))
@@ -240,6 +243,14 @@ def near_duplicate(left, right):
         "length_ratio": round(ratio, 12),
         "candidate": score >= 0.92 and ratio >= 0.90,
     }
+
+
+def near_duplicate(left, right):
+    left_text, right_text = normalize_text(left), normalize_text(right)
+    if not left_text or not right_text:
+        return {"jaccard": 0.0, "length_ratio": 0.0, "candidate": False}
+    left_shingles, right_shingles = _shingles(left_text), _shingles(right_text)
+    return _compare_shingles(left_text, left_shingles, right_text, right_shingles)
 
 
 def _capture_id(parsed, capture_channel):
@@ -258,6 +269,7 @@ def _raw_suffix(parsed):
         "docx": ".docx",
         "pdf": ".pdf",
         "google_docs": ".json",
+        "acquisition_bundle_v1": ".md",
     }.get(parsed.get("parser_name"), ".bin")
 
 
@@ -274,6 +286,61 @@ class DocumentLane:
         self.archive_root = Path(instance.document_archive_root).resolve()
         self.review_root = Path(instance.document_review_root).resolve()
         self.report_root = Path(instance.document_report_root).resolve()
+        self._records_cache = {}
+        self._text_cache = {}
+        self._shingles_cache = {}
+
+    def _parse_acquisition_bundle_raw(self, raw, *, source_locator):
+        from .source_intake import parse_acquisition_bundle_markdown
+
+        meta, body = parse_acquisition_bundle_markdown(raw)
+        return {
+            "capture_channel": "acquisition_bundle_v1",
+            "source_type": "acquisition_bundle_v1",
+            "parser_name": "acquisition_bundle_v1",
+            "parser_version": meta.get("extractor", PARSER_VERSION),
+            "source_locator": source_locator or meta["canonical_url"],
+            "raw": raw,
+            "text": body,
+            "title": meta.get("title"),
+            "canonical_url": meta["canonical_url"],
+            "published_at": meta["published_at"],
+            "captured_at": meta["acquired_at"],
+            "rights": meta["rights"],
+            "front_matter": meta,
+            "acquisition_meta": meta,
+        }
+
+    def ingest_acquisition_bundle(self, bundle_path, **options):
+        source = Path(bundle_path)
+        if not source.is_absolute():
+            candidate = self.input_root / source
+            source = candidate.resolve() if candidate.is_file() else source.resolve()
+        else:
+            source = source.resolve()
+        if not source.is_file():
+            raise RuntimeError("DOCUMENT_SOURCE_MISSING")
+        raw = source.read_bytes()
+        locator = (
+            source.relative_to(self.input_root).as_posix()
+            if source.is_relative_to(self.input_root)
+            else None
+        )
+        parsed = self._parse_acquisition_bundle_raw(raw, source_locator=locator)
+        call_options = dict(options)
+        call_options.setdefault("captured_at", parsed["captured_at"])
+        try:
+            return self._ingest_parsed(
+                parsed, capture_channel="acquisition_bundle_v1", **call_options
+            )
+        except ReviewRequired as exc:
+            if not exc.raw:
+                exc.raw = parsed.get("raw", b"")
+            return self._review(
+                exc,
+                source_locator=parsed["source_locator"],
+                capture_channel="acquisition_bundle_v1",
+            )
 
     def ingest_file(self, source, *, capture_channel, **options):
         source = Path(source)
@@ -301,13 +368,24 @@ class DocumentLane:
                     raw, suffix=source.suffix, source_locator=locator,
                     channel=capture_channel,
                 )
+            elif capture_channel == "acquisition_bundle_v1":
+                from .source_intake import SourceIntakeError
+                try:
+                    parsed = self._parse_acquisition_bundle_raw(
+                        raw, source_locator=locator
+                    )
+                except SourceIntakeError as exc:
+                    raise ReviewRequired(str(exc), raw=raw) from exc
             else:
                 raise ReviewRequired("DOCUMENT_FILE_CHANNEL_INVALID", raw=raw)
         except ReviewRequired as exc:
             return self._review(exc, source_locator=locator,
                                 capture_channel=capture_channel)
+        call_options = dict(options)
+        if capture_channel == "acquisition_bundle_v1" and parsed.get("captured_at"):
+            call_options.setdefault("captured_at", parsed["captured_at"])
         try:
-            return self._ingest_parsed(parsed, **options)
+            return self._ingest_parsed(parsed, **call_options)
         except ReviewRequired as exc:
             if not exc.raw:
                 exc.raw = parsed.get("raw", b"")
@@ -420,14 +498,86 @@ class DocumentLane:
 
     def _existing_records(self):
         if not self.archive_root.is_dir():
+            self._records_cache.clear()
+            self._text_cache.clear()
+            self._shingles_cache.clear()
             return []
-        records = []
-        for path in sorted(self.archive_root.glob("doc_*/record.json")):
+        disk_ids = set()
+        for entry in sorted(self.archive_root.iterdir(), key=lambda p: p.name):
+            if not entry.is_dir() or not entry.name.startswith("doc_"):
+                continue
+            did = entry.name
+            disk_ids.add(did)
+            if did not in self._records_cache:
+                path = entry / "record.json"
+                try:
+                    self._records_cache[did] = json.loads(
+                        path.read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError) as exc:
+                    raise RuntimeError("DOCUMENT_ARCHIVE_RECORD_INVALID") from exc
+        stale_ids = set(self._records_cache) - disk_ids
+        for did in stale_ids:
+            self._records_cache.pop(did, None)
+            self._text_cache.pop(did, None)
+            self._shingles_cache.pop(did, None)
+        return [self._records_cache[did] for did in sorted(self._records_cache)]
+
+    def _get_cached_text_and_shingles(self, doc_id_str):
+        if doc_id_str not in self._text_cache:
+            path = self.archive_root / doc_id_str / "text.txt"
             try:
-                records.append(json.loads(path.read_text(encoding="utf-8")))
-            except (OSError, ValueError) as exc:
-                raise RuntimeError("DOCUMENT_ARCHIVE_RECORD_INVALID") from exc
-        return records
+                candidate_text = path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise RuntimeError("DOCUMENT_ARCHIVE_TEXT_INVALID") from exc
+            self._text_cache[doc_id_str] = normalize_text(candidate_text)
+        if doc_id_str not in self._shingles_cache:
+            self._shingles_cache[doc_id_str] = _shingles(self._text_cache[doc_id_str])
+        return self._text_cache[doc_id_str], self._shingles_cache[doc_id_str]
+
+    def _write_revision_index(self):
+        records = self._existing_records()
+        by_url = {}
+        by_item_id = {}
+        for rec in records:
+            entry = {
+                "doc_id": rec["doc_id"],
+                "revision_seq": int(rec.get("revision_seq") or 1),
+                "content_hash": rec.get("content_hash"),
+                "supersedes_doc_id": rec.get("supersedes_doc_id"),
+                "superseded_by_doc_id": rec.get("superseded_by_doc_id"),
+                "captured_at": rec.get("captured_at"),
+            }
+            url = rec.get("canonical_url")
+            if url:
+                by_url.setdefault(url, []).append(entry)
+            iid = rec.get("item_id")
+            if iid:
+                by_item_id.setdefault(iid, []).append(entry)
+
+        def _sort_chain(items):
+            return sorted(
+                items,
+                key=lambda x: (
+                    x["revision_seq"],
+                    str(x.get("captured_at") or ""),
+                    x["doc_id"],
+                ),
+            )
+
+        index_payload = {
+            "schema_version": SCHEMA_VERSION,
+            "by_canonical_url": {
+                url: _sort_chain(items) for url, items in sorted(by_url.items())
+            },
+            "by_item_id": {
+                iid: _sort_chain(items) for iid, items in sorted(by_item_id.items())
+            },
+        }
+        atomic(
+            self.archive_root / "revision_index.json",
+            canonical_bytes(index_payload),
+        )
 
     def _capture(self, parsed, capture_channel):
         capture_id = _capture_id(parsed, capture_channel)
@@ -456,7 +606,7 @@ class DocumentLane:
                 "bytes": len(data),
                 "_data": data,
             })
-        return {
+        capture_dict = {
             "capture_id": capture_id,
             "capture_channel": capture_channel,
             "source_type": parsed.get("source_type"),
@@ -475,6 +625,24 @@ class DocumentLane:
             ),
             "attachments": attachments,
         }
+        acq = parsed.get("acquisition_meta")
+        if isinstance(acq, dict):
+            capture_dict["bundle_raw_sha256"] = capture_dict["raw_sha256"]
+            capture_dict["raw_sha256"] = acq["raw_sha256"]
+            capture_dict["extracted_sha256"] = acq["extracted_sha256"]
+            capture_dict["upstream_origin"] = acq.get("upstream_origin")
+            capture_dict["related_urls"] = list(acq.get("related_urls") or [])
+            capture_dict["source_tier"] = acq.get("source_tier")
+            capture_dict["item_id"] = acq.get("item_id")
+            capture_dict["source_id"] = acq.get("source_id")
+            capture_dict["completeness"] = acq.get("completeness")
+            capture_dict["event_class"] = acq.get("event_class")
+            capture_dict["matched_persons"] = list(acq.get("matched_persons") or [])
+            capture_dict["extractor"] = acq.get("extractor")
+            capture_dict["final_url"] = acq.get("final_url")
+            capture_dict["raw_ref"] = acq.get("raw_ref")
+            capture_dict["canonical_url"] = acq.get("canonical_url")
+        return capture_dict
 
     def _write_capture(self, root, capture, raw):
         atomic(root / capture["raw_path"], raw)
@@ -535,6 +703,8 @@ class DocumentLane:
         )
         capture = self._capture({**parsed, "capture_channel": channel}, channel)
         capture["rights"] = rights
+        acq = parsed.get("acquisition_meta") if isinstance(parsed.get("acquisition_meta"), dict) else None
+        selected_item_id = acq.get("item_id") if acq else None
         record = {
             "schema_version": SCHEMA_VERSION,
             "doc_id": identifier,
@@ -551,6 +721,22 @@ class DocumentLane:
             "parser_version": parsed.get("parser_version", PARSER_VERSION),
             "canonical_write_allowed": False,
         }
+        if acq is not None:
+            record.update({
+                "item_id": acq["item_id"],
+                "source_id": acq["source_id"],
+                "source_tier": acq["source_tier"],
+                "upstream_origin": acq.get("upstream_origin"),
+                "related_urls": list(acq.get("related_urls") or []),
+                "raw_sha256": acq["raw_sha256"],
+                "extracted_sha256": acq["extracted_sha256"],
+                "completeness": acq["completeness"],
+                "event_class": acq["event_class"],
+                "matched_persons": list(acq.get("matched_persons") or []),
+                "extractor": acq["extractor"],
+                "final_url": acq["final_url"],
+                "raw_ref": acq.get("raw_ref"),
+            })
         root = self.archive_root / identifier
         existing = root.is_dir()
         if existing:
@@ -562,19 +748,24 @@ class DocumentLane:
                 raise ReviewRequired("DOCUMENT_ID_COLLISION")
             return self._merge_exact(root, previous, capture, parsed["raw"])
 
-        related = sorted(
-            item["doc_id"] for item in self._existing_records()
-            if selected_url and item.get("canonical_url") == selected_url
-        )
+        existing_records = self._existing_records()
+        related_records = [
+            item for item in existing_records
+            if (selected_url and item.get("canonical_url") == selected_url)
+            or (selected_item_id and item.get("item_id") == selected_item_id)
+        ]
+        related = sorted(item["doc_id"] for item in related_records)
         near = []
+        normalized_shingles = None
         if not related:
-            for item in self._existing_records():
-                path = self.archive_root / item["doc_id"] / "text.txt"
-                try:
-                    candidate_text = path.read_text(encoding="utf-8")
-                except OSError as exc:
-                    raise RuntimeError("DOCUMENT_ARCHIVE_TEXT_INVALID") from exc
-                comparison = near_duplicate(normalized, candidate_text)
+            normalized_shingles = _shingles(normalized)
+            for item in existing_records:
+                cand_text, cand_shingles = self._get_cached_text_and_shingles(
+                    item["doc_id"]
+                )
+                comparison = _compare_shingles(
+                    normalized, normalized_shingles, cand_text, cand_shingles
+                )
                 if comparison["candidate"]:
                     near.append({"doc_id": item["doc_id"], **comparison})
         near.sort(key=lambda item: item["doc_id"])
@@ -583,12 +774,61 @@ class DocumentLane:
             "review_required" if near else
             "new"
         )
+        prior_rec = None
+        prior_doc_id = None
+        revision_seq = 1
+        if related_records:
+            active_heads = [
+                item for item in related_records
+                if not item.get("superseded_by_doc_id")
+            ]
+            candidates = active_heads if active_heads else related_records
+            candidates.sort(
+                key=lambda item: (
+                    int(item.get("revision_seq") or 1),
+                    str(item.get("captured_at") or ""),
+                    item["doc_id"],
+                )
+            )
+            prior_rec = candidates[-1]
+            prior_doc_id = prior_rec["doc_id"]
+            revision_seq = int(prior_rec.get("revision_seq") or 1) + 1
+
         record["dedup_disposition"] = disposition
+        record["supersedes_doc_id"] = prior_doc_id
+        record["superseded_by_doc_id"] = None
+        record["revision_seq"] = revision_seq
+
         provenance = {
             "schema_version": SCHEMA_VERSION,
             "doc_id": identifier,
             "captures": [self._capture_provenance(capture)],
         }
+        if acq is not None:
+            provenance["acquisition"] = {
+                "item_id": acq["item_id"],
+                "source_id": acq["source_id"],
+                "source_tier": acq["source_tier"],
+                "upstream_origin": acq.get("upstream_origin"),
+                "related_urls": list(acq.get("related_urls") or []),
+                "raw_sha256": acq["raw_sha256"],
+                "extracted_sha256": acq["extracted_sha256"],
+                "completeness": acq["completeness"],
+                "event_class": acq["event_class"],
+                "matched_persons": list(acq.get("matched_persons") or []),
+                "extractor": acq["extractor"],
+                "final_url": acq["final_url"],
+                "raw_ref": acq.get("raw_ref"),
+            }
+            provenance["upstream_origin"] = acq.get("upstream_origin")
+            provenance["related_urls"] = list(acq.get("related_urls") or [])
+            provenance["source_tier"] = acq["source_tier"]
+            provenance["raw_sha256"] = acq["raw_sha256"]
+            provenance["extracted_sha256"] = acq["extracted_sha256"]
+            provenance["completeness"] = acq["completeness"]
+            provenance["item_id"] = acq["item_id"]
+            provenance["source_id"] = acq["source_id"]
+
         dedup = {
             "schema_version": SCHEMA_VERSION,
             "doc_id": identifier,
@@ -597,6 +837,9 @@ class DocumentLane:
             "disposition": disposition,
             "capture_ids": [capture["capture_id"]],
             "revision_of": related,
+            "supersedes_doc_id": prior_doc_id,
+            "superseded_by_doc_id": None,
+            "revision_seq": revision_seq,
             "near_duplicates": near,
         }
         latency = float(latency_seconds or 0.0)
@@ -615,14 +858,61 @@ class DocumentLane:
             "review_minutes_per_document": 0.0,
             "llm_used": False,
         }
-        self._write_capture(root, capture, parsed["raw"])
-        atomic(root / "text.txt", normalized.encode("utf-8"))
-        atomic(root / "record.json", canonical_bytes(record))
-        atomic(root / "provenance.json", canonical_bytes(provenance))
-        atomic(root / "dedup.json", canonical_bytes(dedup))
-        atomic(root / "metrics.json", canonical_bytes(metrics))
-        (root / "attachments").mkdir(parents=True, exist_ok=True)
-        return {
+
+        staging_parent = self.archive_root / ".staging"
+        staging_dir = staging_parent / f"{identifier}.{uuid.uuid4().hex[:12]}"
+        try:
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            self._write_capture(staging_dir, capture, parsed["raw"])
+            atomic(staging_dir / "text.txt", normalized.encode("utf-8"))
+            atomic(staging_dir / "record.json", canonical_bytes(record))
+            atomic(staging_dir / "provenance.json", canonical_bytes(provenance))
+            atomic(staging_dir / "dedup.json", canonical_bytes(dedup))
+            atomic(staging_dir / "metrics.json", canonical_bytes(metrics))
+            (staging_dir / "attachments").mkdir(parents=True, exist_ok=True)
+            self.archive_root.mkdir(parents=True, exist_ok=True)
+            os.replace(staging_dir, root)
+        except BaseException:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+
+        self._records_cache[identifier] = record
+        self._text_cache[identifier] = normalized
+        if normalized_shingles is not None:
+            self._shingles_cache[identifier] = normalized_shingles
+
+        revision_summary = None
+        if disposition == "revision" and prior_rec is not None and prior_doc_id is not None:
+            prior_root = self.archive_root / prior_doc_id
+            prior_updated = dict(prior_rec)
+            prior_updated["superseded_by_doc_id"] = identifier
+            prior_updated.setdefault("revision_seq", revision_seq - 1)
+            atomic(prior_root / "record.json", canonical_bytes(prior_updated))
+            prior_dedup_path = prior_root / "dedup.json"
+            if prior_dedup_path.is_file():
+                try:
+                    prior_dedup = json.loads(
+                        prior_dedup_path.read_text(encoding="utf-8")
+                    )
+                    prior_dedup["superseded_by_doc_id"] = identifier
+                    prior_dedup.setdefault("revision_seq", revision_seq - 1)
+                    atomic(prior_dedup_path, canonical_bytes(prior_dedup))
+                except (OSError, ValueError):
+                    pass
+            self._records_cache[prior_doc_id] = prior_updated
+            self._write_revision_index()
+            revision_summary = {
+                "prior_doc_id": prior_doc_id,
+                "new_doc_id": identifier,
+                "canonical_url": selected_url,
+                "item_id": selected_item_id,
+                "revision_seq": revision_seq,
+                "prior_content_hash": prior_rec.get("content_hash"),
+                "new_content_hash": normalized_hash,
+                "disclosure_posture": "LOUD_REVISION",
+            }
+
+        result = {
             "status": "REVIEW_REQUIRED" if disposition == "review_required"
             else "ACCEPTED",
             "accepted": disposition != "review_required",
@@ -632,18 +922,79 @@ class DocumentLane:
             "archive_path": str(root),
             "review_candidates": review_tags,
         }
+        if revision_summary is not None:
+            result["revision_summary"] = revision_summary
+        return result
 
     def _merge_exact(self, root, record, capture, raw):
         record_path = root / "record.json"
         provenance_path = root / "provenance.json"
         dedup_path = root / "dedup.json"
+        text_path = root / "text.txt"
+        if not text_path.is_file():
+            raise ReviewRequired("DOCUMENT_ARCHIVE_PROVENANCE_INVALID")
+        needs_repair = False
         try:
             provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+            if not isinstance(provenance, dict) or not isinstance(
+                provenance.get("captures"), list
+            ):
+                raise ValueError("INVALID_PROVENANCE_SHAPE")
+        except (OSError, ValueError):
+            provenance = {
+                "schema_version": SCHEMA_VERSION,
+                "doc_id": record["doc_id"],
+                "captures": [],
+            }
+            needs_repair = True
+        try:
             dedup = json.loads(dedup_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise ReviewRequired("DOCUMENT_ARCHIVE_PROVENANCE_INVALID") from exc
-        capture_ids = {item["capture_id"] for item in provenance.get("captures", [])}
+            if not isinstance(dedup, dict):
+                raise ValueError("INVALID_DEDUP_SHAPE")
+        except (OSError, ValueError):
+            dedup = {
+                "schema_version": SCHEMA_VERSION,
+                "doc_id": record["doc_id"],
+                "content_hash": record["content_hash"],
+                "canonical_url": record.get("canonical_url"),
+                "disposition": record.get("dedup_disposition", "new"),
+                "capture_ids": [
+                    item["capture_id"]
+                    for item in provenance.get("captures", [])
+                    if isinstance(item, dict) and item.get("capture_id")
+                ],
+                "revision_of": [],
+                "near_duplicates": [],
+            }
+            needs_repair = True
+        capture_ids = {
+            item["capture_id"]
+            for item in provenance.get("captures", [])
+            if isinstance(item, dict) and item.get("capture_id")
+        }
+        dedup_capture_ids = set(dedup.get("capture_ids") or [])
         if capture["capture_id"] in capture_ids:
+            if (
+                not needs_repair
+                and capture["capture_id"] in dedup_capture_ids
+                and (len(capture_ids) <= 1 or dedup.get("disposition") == "exact_merge")
+            ):
+                return {
+                    "status": "ACCEPTED",
+                    "accepted": True,
+                    "doc_id": record["doc_id"],
+                    "content_hash": record["content_hash"],
+                    "disposition": "exact_merge",
+                    "archive_path": str(root),
+                    "changed": False,
+                }
+            # Recover interrupted merge where provenance had capture_id but dedup/record lagged
+            dedup["disposition"] = "exact_merge"
+            dedup["capture_ids"] = sorted(dedup_capture_ids | capture_ids)
+            if needs_repair:
+                atomic(provenance_path, canonical_bytes(provenance))
+            atomic(dedup_path, canonical_bytes(dedup))
+            self._records_cache[record["doc_id"]] = record
             return {
                 "status": "ACCEPTED",
                 "accepted": True,
@@ -651,7 +1002,7 @@ class DocumentLane:
                 "content_hash": record["content_hash"],
                 "disposition": "exact_merge",
                 "archive_path": str(root),
-                "changed": False,
+                "changed": True,
             }
         public = self._capture_provenance(capture)
         self._write_capture(root, capture, raw)
@@ -698,6 +1049,7 @@ class DocumentLane:
         atomic(record_path, canonical_bytes(record))
         atomic(provenance_path, canonical_bytes(provenance))
         atomic(dedup_path, canonical_bytes(dedup))
+        self._records_cache[record["doc_id"]] = record
         return {
             "status": "ACCEPTED",
             "accepted": True,

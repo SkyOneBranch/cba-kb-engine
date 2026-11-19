@@ -517,3 +517,147 @@ def discover_document_mentions(
             "evidence_ref": f"candidate:document-text-sha256:{text_hash}",
         }))
     return sorted(mentions, key=_mention_sort_key)
+
+
+_APPROVED_MENTION_METHODS = frozenset({"manual", "external_id"})
+
+
+def compute_dirty_set(
+    documents,
+    identity_registry,
+    *,
+    approved_mentions=None,
+    existing_doc_hashes=None,
+):
+    """Deterministically compute dirty players, dirty docs, and undecided queue.
+
+    Identity red line:
+    - Only explicitly approved mentions (`mention_status == "same"` AND
+      `mention_method in {"manual", "external_id"}`) may add a `player_uid`
+      to `dirty_player_uids`.
+    - Ambiguous homonyms (multiple active players sharing a name/alias) and
+      unapproved candidate mentions ALWAYS remain `mention_status == "undecided"`
+      in `verification_queue` and are NEVER auto-bound as `"same"`.
+    """
+    if not isinstance(documents, (list, tuple)):
+        raise DocumentMentionError("DOCUMENT_COLLECTION_REQUIRED")
+    existing_hashes = existing_doc_hashes if isinstance(existing_doc_hashes, dict) else {}
+
+    # Build normalized name/alias -> set of active player_uids from identity_registry.
+    # Supports both full player_identity registries and lightweight {players, aliases} dicts.
+    reg = identity_registry if isinstance(identity_registry, dict) else {}
+    active_uids = set()
+    name_to_uids = {}
+    for player in reg.get("players") or []:
+        if not isinstance(player, dict):
+            continue
+        if player.get("status", "ACTIVE") != "ACTIVE":
+            continue
+        uid = player.get("player_uid")
+        cname = player.get("canonical_name")
+        if not isinstance(uid, str) or not uid.strip():
+            continue
+        uid = uid.strip()
+        active_uids.add(uid)
+        if isinstance(cname, str) and cname.strip():
+            norm = normalize_name(cname)
+            name_to_uids.setdefault(norm, set()).add(uid)
+
+    for alias_entry in reg.get("aliases") or []:
+        if not isinstance(alias_entry, dict):
+            continue
+        uid = alias_entry.get("player_uid")
+        alias = alias_entry.get("alias")
+        if not isinstance(uid, str) or uid.strip() not in active_uids:
+            continue
+        if isinstance(alias, str) and alias.strip():
+            norm = normalize_name(alias)
+            name_to_uids.setdefault(norm, set()).add(uid.strip())
+
+    # Identify dirty (new or changed) documents.
+    dirty_docs = []
+    dirty_doc_id_set = set()
+    for doc in documents:
+        if not isinstance(doc, dict):
+            raise DocumentMentionError("DOCUMENT_OBJECT_REQUIRED")
+        doc_id = validate_doc_id(doc.get("doc_id"))
+        content_hash = doc.get("content_hash")
+        if (
+            doc_id in existing_hashes
+            and isinstance(content_hash, str)
+            and content_hash
+            and existing_hashes[doc_id] == content_hash
+        ):
+            continue
+        dirty_docs.append((doc_id, doc))
+        dirty_doc_id_set.add(doc_id)
+
+    # Index approved mentions strictly enforcing mention_status == "same" and
+    # mention_method in {"manual", "external_id"}.
+    approved_uids_by_doc = {}
+    dirty_player_uids = set()
+    for mention in approved_mentions or []:
+        if not isinstance(mention, dict):
+            continue
+        if mention.get("mention_status") != "same":
+            continue
+        if mention.get("mention_method") not in _APPROVED_MENTION_METHODS:
+            continue
+        m_doc_id = mention.get("doc_id")
+        m_uid = mention.get("player_uid")
+        if not isinstance(m_doc_id, str) or m_doc_id not in dirty_doc_id_set:
+            continue
+        if not isinstance(m_uid, str) or not m_uid.strip():
+            continue
+        m_uid = m_uid.strip()
+        approved_uids_by_doc.setdefault(m_doc_id, set()).add(m_uid)
+        dirty_player_uids.add(m_uid)
+
+    # Discover candidate mentions and build verification_queue for homonyms & unapproved names.
+    verification_queue = []
+    seen_queue_keys = set()
+    for doc_id, doc in sorted(dirty_docs, key=lambda pair: pair[0]):
+        raw_text = doc.get("text")
+        normalized_text = (
+            unicodedata.normalize("NFKC", raw_text)
+            if isinstance(raw_text, str) and raw_text.strip()
+            else ""
+        )
+        matched_names = set()
+        if normalized_text:
+            for norm_name in name_to_uids:
+                if norm_name in normalized_text:
+                    matched_names.add(norm_name)
+        for person in doc.get("matched_persons") or []:
+            if isinstance(person, str) and person.strip():
+                matched_names.add(normalize_name(person))
+
+        approved_for_doc = approved_uids_by_doc.get(doc_id, set())
+        for matched_name in sorted(matched_names):
+            candidates = sorted(name_to_uids.get(matched_name, set()))
+            # Skip unambiguous mentions already covered by an approved binding for this doc.
+            if len(candidates) == 1 and candidates[0] in approved_for_doc:
+                continue
+            reason = (
+                "AMBIGUOUS_HOMONYM"
+                if len(candidates) > 1
+                else "UNAPPROVED_MENTION"
+            )
+            key = (doc_id, matched_name)
+            if key in seen_queue_keys:
+                continue
+            seen_queue_keys.add(key)
+            verification_queue.append({
+                "doc_id": doc_id,
+                "mention_status": "undecided",
+                "matched_name": matched_name,
+                "candidate_player_uids": candidates,
+                "reason": reason,
+            })
+
+    return {
+        "dirty_player_uids": sorted(dirty_player_uids),
+        "dirty_doc_ids": sorted(dirty_doc_id_set),
+        "verification_queue": verification_queue,
+        "undecided_count": len(verification_queue),
+    }

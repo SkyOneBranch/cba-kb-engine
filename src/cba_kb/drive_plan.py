@@ -293,8 +293,9 @@ def _apply_rebuild_index(params: Dict[str, Any],
     return {"indexed_docs": len(index["docs"]), "terms": len(index["terms"])}
 
 
-def _apply_purge_tombstones(params: Dict[str, Any],
-                            ctx: Dict[str, Any]) -> Dict[str, Any]:
+def _apply_purge_tombstones_unlocked(params: Dict[str, Any],
+                                     ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Purge expired tombstones assuming caller holds ``file_lock(registry)``."""
     from .drive_search import load_registry
     from .common import atomic as _atomic
     import json as _json
@@ -317,6 +318,18 @@ def _apply_purge_tombstones(params: Dict[str, Any],
     _atomic(reg_path, _json.dumps(registry, ensure_ascii=False, indent=2,
                                   sort_keys=True).encode("utf-8"))
     return {"purged": purged}
+
+
+def _apply_purge_tombstones(params: Dict[str, Any],
+                            ctx: Dict[str, Any],
+                            *,
+                            _registry_locked: bool = False) -> Dict[str, Any]:
+    from .drive_resilience import file_lock
+
+    if _registry_locked:
+        return _apply_purge_tombstones_unlocked(params, ctx)
+    with file_lock(Path(params["registry"])):
+        return _apply_purge_tombstones_unlocked(params, ctx)
 
 
 def _apply_revoke_index_grant(params: Dict[str, Any],
@@ -640,6 +653,10 @@ def _apply_plan_resilient(plan_path: Any, ledger_path: Any,
                     bool(params.get("index"))
                     and handler is _apply_revoke_index_grant
                 )
+                registry_locked = (
+                    bool(params.get("registry"))
+                    and handler is _apply_purge_tombstones
+                )
                 with ExitStack() as stack:
                     for target in sorted(set(lock_targets)):
                         stack.enter_context(file_lock(target))
@@ -647,6 +664,13 @@ def _apply_plan_resilient(plan_path: Any, ledger_path: Any,
                         result = run_with_timeout(
                             lambda p=params: _apply_revoke_index_grant(
                                 p, ctx, _index_locked=True
+                            ),
+                            timeout_s,
+                        )
+                    elif registry_locked:
+                        result = run_with_timeout(
+                            lambda p=params: _apply_purge_tombstones(
+                                p, ctx, _registry_locked=True
                             ),
                             timeout_s,
                         )
