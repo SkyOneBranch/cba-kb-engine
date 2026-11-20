@@ -80,7 +80,7 @@ def _write_bundle(
         f'canonical_url: "{canonical_url}"',
         f'final_url: "{canonical_url}"',
         "related_urls: []",
-        "upstream_origin: null",
+        f'upstream_origin: "{source_id}:origin"',
         f'source_id: "{source_id}"',
         f'source_tier: "{source_tier}"',
         'event_class: "roster_update"',

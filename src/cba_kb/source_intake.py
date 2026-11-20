@@ -415,9 +415,7 @@ def validate_acquisition_bundle_v1(metadata: Dict[str, Any]) -> Dict[str, Any]:
     ):
         raise SourceIntakeError("RELATED_URLS_LIST_OF_STR_REQUIRED")
 
-    upstream_origin = metadata["upstream_origin"]
-    if upstream_origin is not None:
-        upstream_origin = _required_text(upstream_origin, "UPSTREAM_ORIGIN")
+    upstream_origin = _required_text(metadata["upstream_origin"], "UPSTREAM_ORIGIN")
 
     source_id = _required_text(metadata["source_id"], "SOURCE_ID")
     event_class = _required_text(metadata["event_class"], "EVENT_CLASS")

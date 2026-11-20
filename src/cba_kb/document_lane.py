@@ -579,6 +579,147 @@ class DocumentLane:
             canonical_bytes(index_payload),
         )
 
+    @staticmethod
+    def _revision_index_has_edge(
+        rev_index, *, prior_doc_id, new_doc_id, canonical_url, item_id
+    ):
+        def _chain_has_edge(entries):
+            if not isinstance(entries, list):
+                return False
+            has_prior = any(
+                isinstance(e, dict)
+                and e.get("doc_id") == prior_doc_id
+                and e.get("superseded_by_doc_id") == new_doc_id
+                for e in entries
+            )
+            has_new = any(
+                isinstance(e, dict)
+                and e.get("doc_id") == new_doc_id
+                and e.get("supersedes_doc_id") == prior_doc_id
+                for e in entries
+            )
+            return has_prior and has_new
+
+        checked = False
+        if canonical_url:
+            checked = True
+            by_url = rev_index.get("by_canonical_url")
+            if not isinstance(by_url, dict) or not _chain_has_edge(by_url.get(canonical_url)):
+                return False
+        if item_id:
+            checked = True
+            by_item = rev_index.get("by_item_id")
+            if not isinstance(by_item, dict) or not _chain_has_edge(by_item.get(item_id)):
+                return False
+        return checked
+
+    def _reconcile_revision_chain(self, record):
+        """Idempotently reconcile prior-doc links and revision_index.json.
+
+        Fail-closed: raises ReviewRequired('DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID')
+        if the prior archive is missing or corrupt. Performs zero file writes
+        when the revision chain and revision_index.json are already consistent.
+        """
+        prior_doc_id = record.get("supersedes_doc_id")
+        if not prior_doc_id:
+            return False, None
+
+        new_doc_id = record["doc_id"]
+        revision_seq = int(record.get("revision_seq") or 2)
+        expected_prior_seq = max(1, revision_seq - 1)
+
+        prior_root = self.archive_root / prior_doc_id
+        prior_record_path = prior_root / "record.json"
+        prior_text_path = prior_root / "text.txt"
+        prior_dedup_path = prior_root / "dedup.json"
+
+        if not prior_record_path.is_file() or not prior_text_path.is_file():
+            raise ReviewRequired("DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID")
+        try:
+            prior_rec = json.loads(prior_record_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ReviewRequired("DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID") from exc
+        if not isinstance(prior_rec, dict) or prior_rec.get("doc_id") != prior_doc_id:
+            raise ReviewRequired("DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID")
+
+        repaired = False
+        if (
+            prior_rec.get("superseded_by_doc_id") != new_doc_id
+            or prior_rec.get("revision_seq") is None
+        ):
+            prior_updated = dict(prior_rec)
+            prior_updated["superseded_by_doc_id"] = new_doc_id
+            prior_updated.setdefault("revision_seq", expected_prior_seq)
+            atomic(prior_record_path, canonical_bytes(prior_updated))
+            prior_rec = prior_updated
+            repaired = True
+
+        self._records_cache[prior_doc_id] = prior_rec
+        self._records_cache[new_doc_id] = record
+
+        if prior_dedup_path.is_file():
+            try:
+                prior_dedup = json.loads(prior_dedup_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise ReviewRequired("DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID") from exc
+            if not isinstance(prior_dedup, dict):
+                raise ReviewRequired("DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID")
+            if (
+                prior_dedup.get("superseded_by_doc_id") != new_doc_id
+                or prior_dedup.get("revision_seq") is None
+            ):
+                prior_dedup["superseded_by_doc_id"] = new_doc_id
+                prior_dedup.setdefault("revision_seq", expected_prior_seq)
+                atomic(prior_dedup_path, canonical_bytes(prior_dedup))
+                repaired = True
+        else:
+            prior_dedup = {
+                "schema_version": SCHEMA_VERSION,
+                "doc_id": prior_doc_id,
+                "content_hash": prior_rec.get("content_hash"),
+                "canonical_url": prior_rec.get("canonical_url"),
+                "disposition": prior_rec.get("dedup_disposition", "new"),
+                "capture_ids": [],
+                "revision_of": [],
+                "supersedes_doc_id": prior_rec.get("supersedes_doc_id"),
+                "superseded_by_doc_id": new_doc_id,
+                "revision_seq": int(prior_rec.get("revision_seq") or expected_prior_seq),
+                "near_duplicates": [],
+            }
+            atomic(prior_dedup_path, canonical_bytes(prior_dedup))
+            repaired = True
+
+        rev_index_path = self.archive_root / "revision_index.json"
+        index_consistent = False
+        if rev_index_path.is_file():
+            try:
+                rev_index = json.loads(rev_index_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                rev_index = None
+            if isinstance(rev_index, dict):
+                index_consistent = self._revision_index_has_edge(
+                    rev_index,
+                    prior_doc_id=prior_doc_id,
+                    new_doc_id=new_doc_id,
+                    canonical_url=record.get("canonical_url"),
+                    item_id=record.get("item_id"),
+                )
+        if not index_consistent:
+            self._write_revision_index()
+            repaired = True
+
+        revision_summary = {
+            "prior_doc_id": prior_doc_id,
+            "new_doc_id": new_doc_id,
+            "canonical_url": record.get("canonical_url"),
+            "item_id": record.get("item_id"),
+            "revision_seq": revision_seq,
+            "prior_content_hash": prior_rec.get("content_hash"),
+            "new_content_hash": record.get("content_hash"),
+            "disclosure_posture": "LOUD_REVISION",
+        }
+        return repaired, revision_summary
+
     def _capture(self, parsed, capture_channel):
         capture_id = _capture_id(parsed, capture_channel)
         raw_name = capture_id + _raw_suffix(parsed)
@@ -883,34 +1024,7 @@ class DocumentLane:
 
         revision_summary = None
         if disposition == "revision" and prior_rec is not None and prior_doc_id is not None:
-            prior_root = self.archive_root / prior_doc_id
-            prior_updated = dict(prior_rec)
-            prior_updated["superseded_by_doc_id"] = identifier
-            prior_updated.setdefault("revision_seq", revision_seq - 1)
-            atomic(prior_root / "record.json", canonical_bytes(prior_updated))
-            prior_dedup_path = prior_root / "dedup.json"
-            if prior_dedup_path.is_file():
-                try:
-                    prior_dedup = json.loads(
-                        prior_dedup_path.read_text(encoding="utf-8")
-                    )
-                    prior_dedup["superseded_by_doc_id"] = identifier
-                    prior_dedup.setdefault("revision_seq", revision_seq - 1)
-                    atomic(prior_dedup_path, canonical_bytes(prior_dedup))
-                except (OSError, ValueError):
-                    pass
-            self._records_cache[prior_doc_id] = prior_updated
-            self._write_revision_index()
-            revision_summary = {
-                "prior_doc_id": prior_doc_id,
-                "new_doc_id": identifier,
-                "canonical_url": selected_url,
-                "item_id": selected_item_id,
-                "revision_seq": revision_seq,
-                "prior_content_hash": prior_rec.get("content_hash"),
-                "new_content_hash": normalized_hash,
-                "disclosure_posture": "LOUD_REVISION",
-            }
+            _, revision_summary = self._reconcile_revision_chain(record)
 
         result = {
             "status": "REVIEW_REQUIRED" if disposition == "review_required"
@@ -979,15 +1093,19 @@ class DocumentLane:
                 and capture["capture_id"] in dedup_capture_ids
                 and (len(capture_ids) <= 1 or dedup.get("disposition") == "exact_merge")
             ):
-                return {
+                repaired, revision_summary = self._reconcile_revision_chain(record)
+                result = {
                     "status": "ACCEPTED",
                     "accepted": True,
                     "doc_id": record["doc_id"],
                     "content_hash": record["content_hash"],
                     "disposition": "exact_merge",
                     "archive_path": str(root),
-                    "changed": False,
+                    "changed": repaired,
                 }
+                if repaired and revision_summary is not None:
+                    result["revision_summary"] = revision_summary
+                return result
             # Recover interrupted merge where provenance had capture_id but dedup/record lagged
             dedup["disposition"] = "exact_merge"
             dedup["capture_ids"] = sorted(dedup_capture_ids | capture_ids)
@@ -995,7 +1113,8 @@ class DocumentLane:
                 atomic(provenance_path, canonical_bytes(provenance))
             atomic(dedup_path, canonical_bytes(dedup))
             self._records_cache[record["doc_id"]] = record
-            return {
+            repaired, revision_summary = self._reconcile_revision_chain(record)
+            result = {
                 "status": "ACCEPTED",
                 "accepted": True,
                 "doc_id": record["doc_id"],
@@ -1004,6 +1123,9 @@ class DocumentLane:
                 "archive_path": str(root),
                 "changed": True,
             }
+            if repaired and revision_summary is not None:
+                result["revision_summary"] = revision_summary
+            return result
         public = self._capture_provenance(capture)
         self._write_capture(root, capture, raw)
         provenance["captures"].append(public)
@@ -1050,7 +1172,8 @@ class DocumentLane:
         atomic(provenance_path, canonical_bytes(provenance))
         atomic(dedup_path, canonical_bytes(dedup))
         self._records_cache[record["doc_id"]] = record
-        return {
+        repaired, revision_summary = self._reconcile_revision_chain(record)
+        result = {
             "status": "ACCEPTED",
             "accepted": True,
             "doc_id": record["doc_id"],
@@ -1059,3 +1182,6 @@ class DocumentLane:
             "archive_path": str(root),
             "changed": True,
         }
+        if repaired and revision_summary is not None:
+            result["revision_summary"] = revision_summary
+        return result
