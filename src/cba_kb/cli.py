@@ -388,6 +388,18 @@ def main():
     q=sub.add_parser('stats-validate')
     q.add_argument('--input',type=Path,required=True)
     q.add_argument('--output',type=Path)
+    q=sub.add_parser('ops-sync')
+    q.add_argument('--bundles-dir',type=Path,required=True)
+    q.add_argument('--output-dir',type=Path,default=None)
+    q.add_argument('--registration-snapshots-dir',type=Path,default=None)
+    q.add_argument('--published-status',type=Path,default=None)
+    q.add_argument('--consumer-manifest',type=Path,default=None)
+    q.add_argument('--player-fixtures',type=Path,default=None)
+    q.add_argument('--identity-registry',type=Path,default=None)
+    q.add_argument('--approved-mentions',type=Path,default=None)
+    q.add_argument('--max-external-citations-per-card','--max-external-citations',
+                   dest='max_external_citations_per_card',type=int,default=10)
+    q.add_argument('--dry-run',action='store_true',default=False)
     q=sub.add_parser('plan'); q.add_argument('--entries',type=Path,required=True); q.add_argument('--release-id',required=True)
     q.add_argument('--status-id',required=True); q.add_argument('--archive-id',required=True)
     q.add_argument('--dependencies',type=Path);q.add_argument('--environment',choices=['sandbox','production'],default='sandbox')
@@ -1757,6 +1769,24 @@ def main():
             result = {"validated_count": len(validated), "status": "VALID"}
             if a.output:
                 save(a.output, result)
+        elif a.command == 'ops-sync':
+            from .operational_sync import run_operational_sync
+            instance = private_instance()
+            out_dir = a.output_dir if a.output_dir is not None else (instance.data_root / 'ops_sync')
+            result = run_operational_sync(
+                engine_root=root,
+                instance=instance,
+                bundles_dir=a.bundles_dir,
+                output_dir=out_dir,
+                registration_snapshots_dir=a.registration_snapshots_dir,
+                published_status_path=a.published_status,
+                consumer_manifest_path=a.consumer_manifest,
+                player_fixtures_path=a.player_fixtures,
+                identity_registry_path=a.identity_registry,
+                approved_mentions_path=a.approved_mentions,
+                max_external_citations_per_card=a.max_external_citations_per_card,
+                dry_run=a.dry_run,
+            )
         elif a.command=='plan':
             from .current_state import clean
             def read_plan_input(path):

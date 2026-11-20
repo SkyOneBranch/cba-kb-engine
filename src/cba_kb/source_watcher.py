@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import gzip
 import hashlib
 import json
 from pathlib import Path
@@ -162,3 +163,161 @@ def run_planned(instance, output, *, previous_root=None, sleeper=time.sleep,
     }
     (output / "planned_run_ledger.json").write_bytes(canonical_bytes(ledger))
     return ledger
+
+
+def _load_replay_snapshot(path: Path) -> dict:
+    if path.name.endswith(".json.gz"):
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    else:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"REPLAY_SNAPSHOT_OBJECT_REQUIRED:{path.name}")
+    if "index" not in payload or not isinstance(payload.get("children"), dict):
+        raise ValueError(f"REPLAY_SNAPSHOT_SCHEMA_INVALID:{path.name}")
+    return payload
+
+
+def _encode_replay_payload(value) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    return json.dumps(value, ensure_ascii=False).encode("utf-8")
+
+
+def _parse_observed_at(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _resolve_replay_source(sid: str) -> dict:
+    reg = cba_registration.registry()
+    if sid in reg:
+        return dict(reg[sid])
+    season = sid.split(":", 1)[-1] if ":" in sid else "2025-2026"
+    article_id = "replay-index"
+    return {
+        "source_id": sid,
+        "season": season,
+        "article_id": article_id,
+        "kind": "discovery",
+        "source_contract_revision": cba_registration.SOURCE_CONTRACT_REVISION,
+        "api_url": f"{cba_registration.API}?id={article_id}",
+        "page_url": cba_registration.PAGE.format(article_id=article_id),
+        "rights_basis": "official_public_read_only",
+    }
+
+
+def replay_registration_snapshots(
+    snapshots_dir,
+    output_dir,
+    *,
+    source_id=None,
+    clubs=None,
+):
+    """Replay offline .json / .json.gz registration snapshots chronologically via run_source.
+
+    Performs zero network calls and strictly preserves canonical_publish_allowed == False.
+    """
+    snap_root = Path(snapshots_dir)
+    if not snap_root.is_dir():
+        raise ValueError(f"REPLAY_SNAPSHOTS_DIR_NOT_FOUND:{snap_root}")
+    out_root = Path(output_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    candidates = []
+    for path in sorted(snap_root.iterdir()):
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        if path.name.endswith(".json.gz") or path.name.endswith(".json"):
+            payload = _load_replay_snapshot(path)
+            observed_at = payload.get("observed_at")
+            sort_key = (str(observed_at) if observed_at is not None else "", path.name)
+            candidates.append((sort_key, path, payload))
+
+    candidates.sort(key=lambda item: item[0])
+
+    prev_snapshot_by_source = {}
+    runs = []
+    for idx, (_sort_key, path, payload) in enumerate(candidates, start=1):
+        sid = source_id or payload.get("source_id") or "cba-registration:2025-2026"
+        source = _resolve_replay_source(sid)
+        index_bytes = _encode_replay_payload(payload["index"])
+        children_map = payload["children"]
+
+        def _offline_fetcher(target, _idx_bytes=index_bytes, _children=children_map):
+            if target.get("kind") == "discovery":
+                return _idx_bytes, 1
+            art_id = target.get("article_id")
+            if art_id not in _children:
+                raise cba_registration.SourceSchemaDrift(f"REPLAY_CHILD_MISSING:{art_id}")
+            return _encode_replay_payload(_children[art_id]), 1
+
+        stem = path.name[:-8] if path.name.endswith(".json.gz") else path.stem
+        run_out = out_root / f"{idx:03d}_{stem}"
+        obs_dt = _parse_observed_at(payload.get("observed_at"))
+        res = run_source(
+            source,
+            run_out,
+            previous_snapshot=prev_snapshot_by_source.get(sid),
+            fetcher=_offline_fetcher,
+            started_at=obs_dt,
+            ended_at=obs_dt,
+            sleeper=lambda _: None,
+            clubs=clubs,
+        )
+        report = res["report"]
+        prev_snapshot_by_source[sid] = run_out / "snapshot.json"
+        raw_counts = report["diff_counts"]
+        snap_rows = json.loads(
+            (run_out / "snapshot.json").read_text(encoding="utf-8")
+        ).get("rows", [])
+        added = raw_counts.get("add", 0)
+        modified = raw_counts.get("modify", 0)
+        removed = raw_counts.get("delete", 0)
+        schema_drift_count = raw_counts.get("schema_drift", 0)
+        unchanged = max(0, len(snap_rows) - added - modified)
+        replay_validation = report["validation_result"]
+        if (
+            replay_validation == "FAIL_CLOSED"
+            and report.get("failure_reason") == "destructive_or_schema_change"
+            and schema_drift_count == 0
+        ):
+            replay_validation = "REVIEW_REQUIRED"
+        runs.append({
+            "snapshot_file": path.name,
+            "observed_at": payload.get("observed_at"),
+            "source_id": sid,
+            "run_id": report["run_id"],
+            "snapshot_hash": report["snapshot_hash"],
+            "diff_counts": {
+                "added": added,
+                "modified": modified,
+                "removed": removed,
+                "unchanged": unchanged,
+                "schema_drift": schema_drift_count,
+            },
+            "candidate_count": report["candidate_count"],
+            "validation_result": replay_validation,
+            "raw_validation_result": report["validation_result"],
+            "failure_reason": report["failure_reason"],
+            "canonical_publish_allowed": False,
+            "output_path": str(run_out),
+        })
+
+    summary = {
+        "schema_version": 1,
+        "replayed_count": len(runs),
+        "canonical_publish_allowed": False,
+        "runs": runs,
+    }
+    (out_root / "replay_summary.json").write_bytes(canonical_bytes(summary))
+    return summary

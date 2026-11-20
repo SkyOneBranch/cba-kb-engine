@@ -35,6 +35,95 @@ CONSUMER_DICTIONARY_FILENAME = "CBA_核心数据表字段字典与权威口径_C
 CONSUMER_SOURCE_REGISTRY_FILENAME = "CBA_来源注册索引_脱敏视图_CURRENT.csv"
 CONSUMER_DOC_INDEX_FILENAME = "CBA_文档索引_脱敏视图_CURRENT.json"
 
+DEFAULT_MAX_EXTERNAL_CITATIONS_PER_CARD = 10
+
+_SOURCE_TIER_RANK = {
+    "T1": 0,
+    "T1.5": 1,
+    "T2": 2,
+    "MANUAL": 3,
+}
+_COMPLETENESS_RANK = {
+    "full": 0,
+    "partial": 1,
+    "metadata_only": 2,
+}
+
+
+class _DescStr:
+    """Wrapper for descending lexicographic string ordering in sort keys."""
+
+    __slots__ = ("val",)
+
+    def __init__(self, val: str) -> None:
+        self.val = val
+
+    def __lt__(self, other: "_DescStr") -> bool:
+        return self.val > other.val
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _DescStr) and self.val == other.val
+
+
+def _published_at_sort_key(value: Any) -> tuple[int, _DescStr]:
+    if value is None:
+        return (1, _DescStr(""))
+    if hasattr(value, "isoformat") and callable(value.isoformat):
+        text = str(value.isoformat()).strip()
+    elif isinstance(value, str):
+        text = value.strip()
+    else:
+        text = ""
+    if not text:
+        return (1, _DescStr(""))
+    return (0, _DescStr(text))
+
+
+def select_external_citations(
+    citations: Sequence[Dict[str, Any]],
+    *,
+    max_external_citations_per_card: int = DEFAULT_MAX_EXTERNAL_CITATIONS_PER_CARD,
+) -> Dict[str, Any]:
+    """Deterministically rank and cap external citations for a player research card.
+
+    Rank order:
+      1. source_tier: T1 > T1.5 > T2 > MANUAL > other
+      2. completeness: full > partial > metadata_only > other
+      3. published_at descending (None / empty sorts last)
+      4. doc_id ascending
+    """
+    if (
+        isinstance(max_external_citations_per_card, bool)
+        or not isinstance(max_external_citations_per_card, int)
+        or max_external_citations_per_card < 1
+    ):
+        raise ValueError("MAX_EXTERNAL_CITATIONS_PER_CARD_INVALID")
+
+    items = [dict(c) for c in (citations or ()) if isinstance(c, dict)]
+
+    def _sort_key(c: Dict[str, Any]) -> tuple[int, int, tuple[int, _DescStr], str]:
+        tier = str(c.get("source_tier") or "")
+        comp = str(c.get("completeness") or "")
+        doc_id = str(c.get("doc_id") or "")
+        return (
+            _SOURCE_TIER_RANK.get(tier, 4),
+            _COMPLETENESS_RANK.get(comp, 3),
+            _published_at_sort_key(c.get("published_at")),
+            doc_id,
+        )
+
+    ranked = sorted(items, key=_sort_key)
+    selected = ranked[:max_external_citations_per_card]
+    total_linked = len(ranked)
+    displayed = len(selected)
+    return {
+        "selected": selected,
+        "total_linked_count": total_linked,
+        "displayed_count": displayed,
+        "truncated": total_linked > displayed,
+        "max_external_citations_per_card": max_external_citations_per_card,
+    }
+
 _REDACT_JSON_KEYS = frozenset({
     "drive_file_id",
     "current_parent_id",

@@ -627,6 +627,22 @@ def _load_registry(registry_path: Path) -> Dict[str, Dict[str, Any]]:
     return {}
 
 
+def _save_registry_unlocked(
+    registry_file: Any,
+    updates: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """Reload current on-disk registry, merge ``updates``, and write atomically.
+
+    Assumes the caller already holds ``drive_resilience.file_lock(registry_file)``.
+    """
+    path = Path(registry_file)
+    current = _load_registry(path)
+    current.update(updates)
+    atomic(path, json.dumps(current, ensure_ascii=False, indent=2,
+                            sort_keys=True).encode("utf-8"))
+    return current
+
+
 def _append_ledger_run(ledger: Path, event: Dict[str, Any],
                        file_id: Optional[str]) -> None:
     """Ledger append inside a discovery run: any write failure becomes an
@@ -679,6 +695,7 @@ def run_discovery(
 
     counts = {"discovered": 0, "verified": 0, "review": 0, "failed": 0,
               "duplicate": 0, "revision_linked": 0}
+    updates: Dict[str, Dict[str, Any]] = {}
     for obj in objects:
         counts["discovered"] += 1
         verified = verify_object(drive, obj, verify_bytes=verify_bytes, max_bytes=max_bytes)
@@ -695,7 +712,7 @@ def run_discovery(
         elif classification == REVISION_LINKED:
             counts["revision_linked"] += 1
 
-        known[obj["file_id"]] = {
+        entry = {
             "revision": record["revision"],
             "source_id": record["source_id"],
             "doc_id": record["doc_id"],
@@ -708,6 +725,8 @@ def run_discovery(
             "rights_reason": rights_reason,
             "discovered_ts": obj.get("discovered_ts"),
         }
+        known[obj["file_id"]] = entry
+        updates[obj["file_id"]] = entry
         _append_ledger_run(ledger, {
             "ts": _utcnow(), "actor": actor, "action": "drive_object_discovered",
             "prev_state": "UNDISCOVERED", "new_state": verified["status"],
@@ -734,8 +753,10 @@ def run_discovery(
         "note": f"counts={counts}",
         "counts": counts,
     }, folder_id)
-    atomic(registry_file, json.dumps(known, ensure_ascii=False, indent=2,
-                                    sort_keys=True).encode("utf-8"))
+    from .drive_resilience import file_lock
+
+    with file_lock(registry_file):
+        _save_registry_unlocked(registry_file, updates)
     return {
         "folder_id": folder_id,
         "base_sha": None,

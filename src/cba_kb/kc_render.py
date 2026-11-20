@@ -59,7 +59,12 @@ def slice_consumer_filename(
     return f"研究切片_{safe_name}_{safe_id}_{safe_season}_{safe_mt}_CURRENT.md"
 
 
-def render_research_card(payload: Dict[str, Any], *, evidence_verified: bool = False) -> str:
+def render_research_card(
+    payload: Dict[str, Any],
+    *,
+    evidence_verified: bool = False,
+    max_external_citations_per_card: int = 10,
+) -> str:
     """Render compact exception-aware research card.
 
     Enforces evidence_verified=True guard. Renders grains and evidence posture.
@@ -204,6 +209,64 @@ def render_research_card(payload: Dict[str, Any], *, evidence_verified: bool = F
             f"- Locator: {doc_layer.get('locator')}",
             f"> {doc_layer.get('verbatim')}",
         ])
+
+    # 4. External Citations Section (REQ-220 P0-3: ranked & capped with honest disclosure)
+    raw_external_citations = payload.get("external_citations")
+    if isinstance(raw_external_citations, (list, tuple)) and raw_external_citations:
+        from .consumer_surface import select_external_citations
+
+        selection = select_external_citations(
+            raw_external_citations,
+            max_external_citations_per_card=max_external_citations_per_card,
+        )
+        total_linked = selection["total_linked_count"]
+        displayed = selection["displayed_count"]
+        cap = selection["max_external_citations_per_card"]
+        lines.extend([
+            "",
+            "## External Citations",
+            f"- Archive External Evidence: {total_linked} linked, {displayed} displayed (cap={cap})",
+        ])
+        if selection["truncated"]:
+            omitted = total_linked - displayed
+            lines.append(
+                f"- Truncated: {omitted} additional linked archive document(s) omitted from card surface"
+            )
+        for cite in selection["selected"]:
+            tier = cite.get("source_tier") or "UNKNOWN"
+            comp = cite.get("completeness") or "unknown"
+            pub = cite.get("published_at") or "-"
+            title_str = cite.get("title") or cite.get("doc_id") or "-"
+            doc_id = cite.get("doc_id") or "-"
+            url = cite.get("canonical_url") or ""
+            rev_note = ""
+            if cite.get("disclosure_posture") == "LOUD_REVISION" or cite.get("revision_summary"):
+                rev_note = " [LOUD_REVISION]"
+            url_part = f" ({url})" if url else ""
+            lines.append(
+                f"  * [{tier}] ({comp}, {pub}) {title_str} — {doc_id}{url_part}{rev_note}"
+            )
+
+    # 5. Revision Disclosures Section (REQ-220 P0-2 / P0-3: LOUD_REVISION disclosure)
+    rev_disclosures = payload.get("revision_disclosures")
+    if not rev_disclosures and isinstance(payload.get("revision_summary"), dict):
+        rev_disclosures = [payload["revision_summary"]]
+    if isinstance(rev_disclosures, (list, tuple)) and rev_disclosures:
+        lines.extend([
+            "",
+            "## Revision Disclosures",
+        ])
+        for rev in rev_disclosures:
+            if not isinstance(rev, dict):
+                continue
+            posture_label = rev.get("disclosure_posture") or "LOUD_REVISION"
+            prior_id = rev.get("prior_doc_id") or "-"
+            new_id = rev.get("new_doc_id") or "-"
+            seq = rev.get("revision_seq") or "-"
+            notice = rev.get("disclosure_notice") or (
+                f"Document revision {seq}: {new_id} supersedes {prior_id}"
+            )
+            lines.append(f"- [{posture_label}] {notice}")
 
     lines.extend([
         "",

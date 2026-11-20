@@ -278,6 +278,8 @@ def classify_stats_evidence(
         }
         return {
             "posture": "REVISION_SUPERSEDED",
+            "disclosure_posture": "LOUD_REVISION",
+            "loud_disclosure_required": True,
             "adopted_value": rev_item["value"],
             "published_value": rev_item["value"],
             "provider": provider,
@@ -460,6 +462,39 @@ def _claim_statement_text(c: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _extract_provenance_upstream_origin(provenance: Any) -> Optional[str]:
+    """Extract upstream_origin from a provenance dict or its captures list."""
+    if not isinstance(provenance, dict):
+        return None
+    if provenance.get("upstream_origin"):
+        return str(provenance["upstream_origin"])
+    acq = provenance.get("acquisition")
+    if isinstance(acq, dict) and acq.get("upstream_origin"):
+        return str(acq["upstream_origin"])
+    captures = provenance.get("captures")
+    if isinstance(captures, (list, tuple)):
+        for cap in captures:
+            if isinstance(cap, dict) and cap.get("upstream_origin"):
+                return str(cap["upstream_origin"])
+    return None
+
+
+def _extract_doc_origin(doc: Any) -> Optional[str]:
+    """Resolve canonical syndication origin from a document record or archive metadata."""
+    if not isinstance(doc, dict):
+        return None
+    if doc.get("upstream_origin"):
+        return str(doc["upstream_origin"])
+    prov_origin = _extract_provenance_upstream_origin(doc.get("provenance"))
+    if prov_origin:
+        return prov_origin
+    if doc.get("canonical_url"):
+        return str(doc["canonical_url"])
+    if doc.get("source_locator"):
+        return str(doc["source_locator"])
+    return None
+
+
 def _claim_origin(
     c: Dict[str, Any],
     *,
@@ -472,41 +507,34 @@ def _claim_origin(
         return str(claim_origins[cid])
     if c.get("upstream_origin"):
         return str(c["upstream_origin"])
+    claim_prov_origin = _extract_provenance_upstream_origin(c.get("provenance"))
+    if claim_prov_origin:
+        return claim_prov_origin
+    doc_ref = c.get("doc_id") or c.get("source_id") or c.get("source")
+    if isinstance(doc_ref, str) and doc_ref in documents_by_id:
+        resolved = _extract_doc_origin(documents_by_id[doc_ref])
+        if resolved:
+            return resolved
+        return doc_ref
     if c.get("canonical_url"):
         return str(c["canonical_url"])
-    src_id = c.get("source_id") or c.get("source")
-    if isinstance(src_id, str) and src_id in documents_by_id:
-        doc = documents_by_id[src_id]
-        if isinstance(doc, dict):
-            return str(
-                doc.get("upstream_origin")
-                or doc.get("canonical_url")
-                or doc.get("source_locator")
-                or src_id
-            )
     stmt_ids = c.get("supporting_statement_ids")
     if isinstance(stmt_ids, (list, tuple)) and stmt_ids:
         resolved_stmt_origins: List[str] = []
         for sid in stmt_ids:
             stmt = statements_by_id.get(sid)
             if isinstance(stmt, dict):
-                sref = stmt.get("source_ref")
+                sref = stmt.get("source_ref") or stmt.get("doc_id")
                 if isinstance(sref, str) and sref in documents_by_id:
-                    doc = documents_by_id[sref]
-                    if isinstance(doc, dict):
-                        resolved_stmt_origins.append(str(
-                            doc.get("upstream_origin")
-                            or doc.get("canonical_url")
-                            or doc.get("source_locator")
-                            or sref
-                        ))
-                        continue
+                    resolved = _extract_doc_origin(documents_by_id[sref])
+                    resolved_stmt_origins.append(resolved or sref)
+                    continue
                 if isinstance(sref, str) and sref:
                     resolved_stmt_origins.append(sref)
         if resolved_stmt_origins:
             return resolved_stmt_origins[0]
-    if src_id:
-        return str(src_id)
+    if doc_ref:
+        return str(doc_ref)
     if cid:
         return str(cid)
     return None
@@ -575,6 +603,8 @@ def classify_claim_independence(
         if len(active_stmts) <= 1:
             return {
                 "posture": "REVISION_SUPERSEDED",
+                "disclosure_posture": "LOUD_REVISION",
+                "loud_disclosure_required": True,
                 "revision_history": rev_history,
                 "independent_source_count": len(active_claims) or 1,
                 "warnings": [],
@@ -629,4 +659,39 @@ def classify_claim_independence(
         "origins": sorted(origins),
         "warnings": [],
         "revision_history": [],
+    }
+
+
+def build_revision_disclosure(revision_summary: Dict[str, Any]) -> Dict[str, Any]:
+    """Build structured LOUD_REVISION disclosure payload from a DocumentLane revision_summary."""
+    if not isinstance(revision_summary, dict):
+        raise ValueError("REVISION_SUMMARY_OBJECT_REQUIRED")
+    prior_doc_id = revision_summary.get("prior_doc_id")
+    new_doc_id = revision_summary.get("new_doc_id")
+    revision_seq = revision_summary.get("revision_seq")
+    if not isinstance(prior_doc_id, str) or not prior_doc_id.strip():
+        raise ValueError("REVISION_SUMMARY_PRIOR_DOC_ID_REQUIRED")
+    if not isinstance(new_doc_id, str) or not new_doc_id.strip():
+        raise ValueError("REVISION_SUMMARY_NEW_DOC_ID_REQUIRED")
+    if not isinstance(revision_seq, int) or isinstance(revision_seq, bool) or revision_seq < 2:
+        raise ValueError("REVISION_SUMMARY_REVISION_SEQ_INVALID")
+
+    canonical_url = revision_summary.get("canonical_url")
+    url_suffix = f" ({canonical_url})" if canonical_url else ""
+    disclosure_notice = (
+        f"修订披露 (LOUD_REVISION): revision #{revision_seq} — "
+        f"{new_doc_id} supersedes {prior_doc_id}{url_suffix}"
+    )
+    return {
+        "posture": "REVISION_SUPERSEDED",
+        "disclosure_posture": "LOUD_REVISION",
+        "loud_disclosure_required": True,
+        "prior_doc_id": prior_doc_id,
+        "new_doc_id": new_doc_id,
+        "revision_seq": revision_seq,
+        "canonical_url": canonical_url,
+        "prior_content_hash": revision_summary.get("prior_content_hash"),
+        "new_content_hash": revision_summary.get("new_content_hash"),
+        "disclosure_notice": disclosure_notice,
+        "warnings": ["LOUD_REVISION"],
     }

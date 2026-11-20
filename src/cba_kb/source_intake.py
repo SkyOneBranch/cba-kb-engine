@@ -23,9 +23,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
+
+import yaml
 
 from .common import atomic
 from .document_lane import content_hash as doc_content_hash, doc_id as compute_doc_id, normalize_text
@@ -35,12 +38,37 @@ from .evidence_ledger import canonical_bytes
 SCHEMA_VERSION = 1
 SOURCE_INTAKE_VERSION = "v1.9"
 
+ACQUISITION_BUNDLE_V1_SCHEMA = "acquisition_bundle_v1"
+ACQUISITION_BUNDLE_V1_REQUIRED_KEYS = frozenset({
+    "bundle_schema",
+    "item_id",
+    "canonical_url",
+    "final_url",
+    "related_urls",
+    "upstream_origin",
+    "source_id",
+    "source_tier",
+    "event_class",
+    "matched_persons",
+    "published_at",
+    "acquired_at",
+    "raw_sha256",
+    "raw_ref",
+    "extracted_sha256",
+    "extractor",
+    "completeness",
+    "rights",
+})
+ACQUISITION_SOURCE_TIERS = frozenset({"T1", "T1.5", "T2", "MANUAL"})
+ACQUISITION_COMPLETENESS_VALUES = frozenset({"full", "partial", "metadata_only"})
+
 SOURCE_PROVIDERS = frozenset({
     "local_file",
     "google_drive_doc",
     "wechat_browser_clip",
     "ima_file_export",
     "synthetic_fixture",
+    "acquisition_bundle_v1",
 })
 
 INTAKE_STATUSES = frozenset({
@@ -305,3 +333,194 @@ def load_normalized_document(path: Path | str) -> Dict[str, Any]:
         raise SourceIntakeError(f"NORMALIZED_DOCUMENT_FILE_NOT_FOUND:{path}")
     data = json.loads(p.read_text(encoding="utf-8"))
     return validate_normalized_document(data)
+
+
+def canonicalize_bundle_url(url: Any) -> str:
+    """Validate and return a canonical http/https URL for acquisition_bundle_v1."""
+    if not isinstance(url, str) or not url.strip():
+        raise SourceIntakeError("BUNDLE_URL_REQUIRED")
+    if "\x00" in url:
+        raise SourceIntakeError("BUNDLE_URL_INVALID")
+    cleaned = url.strip()
+    parts = urlsplit(cleaned)
+    if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+        raise SourceIntakeError("BUNDLE_URL_HTTP_HTTPS_REQUIRED")
+    return cleaned
+
+
+def compute_bundle_item_id(canonical_url: str) -> str:
+    """Compute deterministic 64-char sha256 item_id from canonical_url."""
+    cleaned = canonicalize_bundle_url(canonical_url)
+    return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()
+
+
+def _normalize_bundle_timestamp(
+    value: Any,
+    *,
+    label: str,
+    allow_none: bool,
+    allow_date: bool = True,
+) -> Optional[str]:
+    if value is None:
+        if allow_none:
+            return None
+        raise SourceIntakeError(f"{label}_REQUIRED")
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        return value.isoformat()
+    if isinstance(value, date):
+        if not allow_date:
+            raise SourceIntakeError(f"{label}_DATETIME_OR_STR_REQUIRED")
+        return value.isoformat()
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned or "\x00" in cleaned:
+            raise SourceIntakeError(f"{label}_INVALID")
+        return cleaned
+    raise SourceIntakeError(f"{label}_INVALID")
+
+
+def _validate_sha256_hex(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not _HASH_SHA256.fullmatch(value):
+        raise SourceIntakeError(f"{label}_SHA256_INVALID")
+    return value
+
+
+def validate_acquisition_bundle_v1(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate an acquisition_bundle_v1 18-key metadata contract (cba-kb-collector v0.3.1)."""
+    if not isinstance(metadata, dict):
+        raise SourceIntakeError("ACQUISITION_BUNDLE_OBJECT_REQUIRED")
+
+    missing = ACQUISITION_BUNDLE_V1_REQUIRED_KEYS - set(metadata)
+    if missing:
+        raise SourceIntakeError(f"ACQUISITION_BUNDLE_KEYS_MISSING:{sorted(missing)}")
+
+    if metadata.get("bundle_schema") != ACQUISITION_BUNDLE_V1_SCHEMA:
+        raise SourceIntakeError("ACQUISITION_BUNDLE_SCHEMA_INVALID")
+
+    canonical_url = canonicalize_bundle_url(metadata["canonical_url"])
+    final_url = canonicalize_bundle_url(metadata["final_url"])
+
+    item_id = _validate_sha256_hex(metadata["item_id"], "ITEM_ID")
+    expected_item_id = compute_bundle_item_id(canonical_url)
+    if item_id != expected_item_id:
+        raise SourceIntakeError(
+            f"ITEM_ID_MISMATCH: expected {expected_item_id} got {item_id}"
+        )
+
+    related_urls = metadata["related_urls"]
+    if not isinstance(related_urls, list) or not all(
+        isinstance(u, str) and u.strip() and "\x00" not in u for u in related_urls
+    ):
+        raise SourceIntakeError("RELATED_URLS_LIST_OF_STR_REQUIRED")
+
+    upstream_origin = _required_text(metadata["upstream_origin"], "UPSTREAM_ORIGIN")
+
+    source_id = _required_text(metadata["source_id"], "SOURCE_ID")
+    event_class = _required_text(metadata["event_class"], "EVENT_CLASS")
+    extractor = _required_text(metadata["extractor"], "EXTRACTOR")
+
+    source_tier = metadata["source_tier"]
+    if not isinstance(source_tier, str) or source_tier not in ACQUISITION_SOURCE_TIERS:
+        raise SourceIntakeError("SOURCE_TIER_INVALID")
+
+    matched_persons = metadata["matched_persons"]
+    if not isinstance(matched_persons, list) or not all(
+        isinstance(p, str) and p.strip() and "\x00" not in p for p in matched_persons
+    ):
+        raise SourceIntakeError("MATCHED_PERSONS_LIST_OF_STR_REQUIRED")
+
+    published_at = _normalize_bundle_timestamp(
+        metadata["published_at"], label="PUBLISHED_AT", allow_none=True, allow_date=True
+    )
+    acquired_at = _normalize_bundle_timestamp(
+        metadata["acquired_at"], label="ACQUIRED_AT", allow_none=False, allow_date=False
+    )
+
+    raw_sha256 = _validate_sha256_hex(metadata["raw_sha256"], "RAW_SHA256")
+    extracted_sha256 = _validate_sha256_hex(metadata["extracted_sha256"], "EXTRACTED_SHA256")
+
+    raw_ref = metadata["raw_ref"]
+    if raw_ref is not None:
+        raw_ref = _required_text(raw_ref, "RAW_REF")
+
+    completeness = metadata["completeness"]
+    if not isinstance(completeness, str) or completeness not in ACQUISITION_COMPLETENESS_VALUES:
+        raise SourceIntakeError("COMPLETENESS_INVALID")
+
+    rights = metadata["rights"]
+    if not isinstance(rights, dict):
+        raise SourceIntakeError("RIGHTS_OBJECT_REQUIRED")
+    if rights.get("classification") != "copyrighted":
+        raise SourceIntakeError("RIGHTS_CLASSIFICATION_MUST_BE_COPYRIGHTED")
+    if rights.get("public_export_allowed") is not False:
+        raise SourceIntakeError("RIGHTS_PUBLIC_EXPORT_MUST_BE_FALSE")
+
+    validated = dict(metadata)
+    validated.update({
+        "bundle_schema": ACQUISITION_BUNDLE_V1_SCHEMA,
+        "item_id": item_id,
+        "canonical_url": canonical_url,
+        "final_url": final_url,
+        "related_urls": [u.strip() for u in related_urls],
+        "upstream_origin": upstream_origin,
+        "source_id": source_id,
+        "source_tier": source_tier,
+        "event_class": event_class,
+        "matched_persons": [p.strip() for p in matched_persons],
+        "published_at": published_at,
+        "acquired_at": acquired_at,
+        "raw_sha256": raw_sha256,
+        "raw_ref": raw_ref,
+        "extracted_sha256": extracted_sha256,
+        "extractor": extractor,
+        "completeness": completeness,
+        "rights": {
+            **rights,
+            "classification": "copyrighted",
+            "public_export_allowed": False,
+        },
+    })
+    return validated
+
+
+def parse_acquisition_bundle_markdown(
+    raw_content: bytes | str,
+) -> Tuple[Dict[str, Any], str]:
+    """Parse and validate a markdown file with acquisition_bundle_v1 YAML front-matter."""
+    if isinstance(raw_content, bytes):
+        try:
+            text = raw_content.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise SourceIntakeError("ACQUISITION_BUNDLE_UTF8_REQUIRED") from exc
+    elif isinstance(raw_content, str):
+        text = raw_content.lstrip("\ufeff")
+    else:
+        raise SourceIntakeError("ACQUISITION_BUNDLE_CONTENT_BYTES_OR_STR_REQUIRED")
+
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if not normalized.startswith("---\n"):
+        raise SourceIntakeError("ACQUISITION_BUNDLE_FRONTMATTER_REQUIRED")
+
+    lines = normalized.split("\n")
+    end_idx = None
+    for idx in range(1, len(lines)):
+        if lines[idx].strip() == "---":
+            end_idx = idx
+            break
+    if end_idx is None:
+        raise SourceIntakeError("ACQUISITION_BUNDLE_FRONTMATTER_UNTERMINATED")
+
+    fm_text = "\n".join(lines[1:end_idx])
+    body = "\n".join(lines[end_idx + 1:]).strip()
+    if not body:
+        raise SourceIntakeError("ACQUISITION_BUNDLE_BODY_REQUIRED")
+
+    try:
+        metadata = yaml.safe_load(fm_text)
+    except yaml.YAMLError as exc:
+        raise SourceIntakeError("ACQUISITION_BUNDLE_YAML_INVALID") from exc
+
+    validated = validate_acquisition_bundle_v1(metadata)
+    return validated, body

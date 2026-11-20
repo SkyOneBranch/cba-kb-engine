@@ -84,11 +84,18 @@ objects never reach a file.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
 
 from .canonical_registry import canonical_routes, manifest_index
+from .common import atomic
+from .consumer_surface import (
+    DEFAULT_MAX_EXTERNAL_CITATIONS_PER_CARD,
+    select_external_citations,
+)
 from .kc_consume import (
     ConsumeSession,
     _content_digest,
@@ -102,6 +109,7 @@ from .kc_projection import (
 )
 from .kc_render import (
     check_completeness,
+    render_research_card,
     research_card_consumer_filename,
     slice_consumer_filename,
 )
@@ -301,7 +309,10 @@ def build_local_projection(*, fixture: Dict[str, Any],
                            engine_candidate: str = "SIMULATED_ENGINE_CANDIDATE_1",
                            build_code: str = "SIMULATED_BUILD_CODE_1",
                            formal_registry: Any = None,
-                           identity_authorization: Any = None
+                           identity_authorization: Any = None,
+                           external_citations: Optional[Sequence[Dict[str, Any]]] = None,
+                           max_external_citations_per_card: int = DEFAULT_MAX_EXTERNAL_CITATIONS_PER_CARD,
+                           revision_disclosures: Optional[Sequence[Dict[str, Any]]] = None,
                            ) -> Dict[str, Any]:
     """Build one local materialisation from a fixture dict and write
     it to output_dir. Returns a summary including the snapshot id,
@@ -603,6 +614,17 @@ def build_local_projection(*, fixture: Dict[str, Any],
     passage_md = session.render_verified(cited, kind="passage")
     answer_json = session.render_verified(answer, kind="answer")
     research_card_md = session.render_verified(answer, kind="research_card")
+    if external_citations or revision_disclosures:
+        card_payload = dict(answer["payload"])
+        if external_citations:
+            card_payload["external_citations"] = list(external_citations)
+        if revision_disclosures:
+            card_payload["revision_disclosures"] = list(revision_disclosures)
+        research_card_md = render_research_card(
+            card_payload,
+            evidence_verified=True,
+            max_external_citations_per_card=max_external_citations_per_card,
+        )
     identity_payload = identity.get("payload", identity)
     identity_status = identity_payload.get("status")
     identity_candidates = identity_payload.get("candidates", [])
@@ -975,3 +997,143 @@ def verify_local_projection(output_dir: str) -> Dict[str, Any]:
     except Exception:  # noqa: BLE001 - verifier never raises
         fail("verifier", "VERIFIER_INTERNAL_ERROR")
     return {"valid": not failures, "checks": checks, "failures": failures}
+
+
+def build_incremental_player_cards(
+    *,
+    player_fixtures: Dict[str, Dict[str, Any]],
+    dirty_player_uids: Sequence[str],
+    output_dir: str | Path,
+    external_citations_by_player: Optional[Dict[str, Sequence[Dict[str, Any]]]] = None,
+    max_external_citations_per_card: int = DEFAULT_MAX_EXTERNAL_CITATIONS_PER_CARD,
+    **build_kwargs: Any,
+) -> Dict[str, Any]:
+    """Incrementally recompute player cards ONLY for players in `dirty_player_uids`.
+
+    Unimpacted players are skipped without touching their existing card files
+    so file bytes and SHA-256 remain 100% identical. Each recomputed player
+    writes both `research_card.md` and Chinese self-describing
+    `研究卡_<name>_<id>_<season>_CURRENT.md`, rendering deterministically ranked
+    and capped external citations with honest total-vs-displayed disclosure.
+    """
+    out_root = Path(output_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+    dirty_set = set(dirty_player_uids or ())
+    citations_map = external_citations_by_player or {}
+
+    recomputed_player_uids: List[str] = []
+    skipped_player_uids: List[str] = []
+    cards: Dict[str, Dict[str, Any]] = {}
+
+    for player_uid in sorted(player_fixtures.keys()):
+        fixture = player_fixtures[player_uid]
+        players = fixture.get("players") or []
+        records = fixture.get("stats_records") or []
+        if not players or not records:
+            raise KcLocalProducerError(
+                f"INCREMENTAL_PLAYER_FIXTURE_INCOMPLETE:{player_uid}"
+            )
+        player_name = str(
+            players[0].get("canonical_name")
+            or records[0].get("player_name")
+            or player_uid
+        )
+        player_id = str(records[0].get("provider_player_id") or player_uid)
+        season = str(records[0].get("season") or "UNKNOWN")
+        consumer_card_name = research_card_consumer_filename(
+            player_name, player_id, season
+        )
+        player_dir = out_root / player_uid
+        research_card_path = player_dir / "research_card.md"
+        consumer_card_path = player_dir / consumer_card_name
+
+        player_citations = list(citations_map.get(player_uid) or ())
+        selection = select_external_citations(
+            player_citations,
+            max_external_citations_per_card=max_external_citations_per_card,
+        )
+
+        if player_uid not in dirty_set:
+            skipped_player_uids.append(player_uid)
+            existing_sha = (
+                sha256_hex(consumer_card_path.read_bytes())
+                if consumer_card_path.is_file()
+                else None
+            )
+            cards[player_uid] = {
+                "research_card_path": str(research_card_path),
+                "consumer_card_path": str(consumer_card_path),
+                "consumer_card_sha256": existing_sha,
+                "total_linked_citations": selection["total_linked_count"],
+                "displayed_citations": selection["displayed_count"],
+            }
+            continue
+
+        from .stats import build_record_id
+
+        normalized_fixture = copy.deepcopy(fixture)
+        deduped_records = []
+        seen_slice_keys = set()
+        for rec in normalized_fixture.get("stats_records") or []:
+            if not isinstance(rec, dict):
+                continue
+            if rec.get("identity_status") == "RESOLVED" and rec.get("player_uid") == player_uid:
+                id_res = rec.get("identity_resolution")
+                if isinstance(id_res, dict) and id_res.get("candidate_player_uids") != [player_uid]:
+                    id_res["candidate_player_uids"] = [player_uid]
+            if (
+                rec.get("scope") == "TEAM_SPLIT"
+                and rec.get("provider")
+                and rec.get("season")
+                and rec.get("match_type")
+                and rec.get("provider_player_id")
+                and rec.get("team_id")
+            ):
+                rec["record_id"] = build_record_id(
+                    provider=rec["provider"],
+                    season=rec["season"],
+                    match_type=rec["match_type"],
+                    scope=rec["scope"],
+                    provider_player_id=rec["provider_player_id"],
+                    team_id=rec["team_id"],
+                )
+            slice_key = (
+                rec.get("player_uid"),
+                rec.get("provider"),
+                rec.get("competition"),
+                rec.get("season"),
+                rec.get("match_type"),
+                rec.get("scope"),
+                rec.get("team_id") if rec.get("scope") == "TEAM_SPLIT" else None,
+            )
+            if slice_key in seen_slice_keys:
+                continue
+            seen_slice_keys.add(slice_key)
+            deduped_records.append(rec)
+        normalized_fixture["stats_records"] = deduped_records
+
+        build_local_projection(
+            fixture=normalized_fixture,
+            output_dir=str(player_dir),
+            external_citations=player_citations,
+            max_external_citations_per_card=max_external_citations_per_card,
+            **build_kwargs,
+        )
+        card_bytes = research_card_path.read_bytes()
+        atomic(consumer_card_path, card_bytes)
+        consumer_sha = sha256_hex(card_bytes)
+
+        recomputed_player_uids.append(player_uid)
+        cards[player_uid] = {
+            "research_card_path": str(research_card_path),
+            "consumer_card_path": str(consumer_card_path),
+            "consumer_card_sha256": consumer_sha,
+            "total_linked_citations": selection["total_linked_count"],
+            "displayed_citations": selection["displayed_count"],
+        }
+
+    return {
+        "recomputed_player_uids": recomputed_player_uids,
+        "skipped_player_uids": skipped_player_uids,
+        "cards": cards,
+    }
