@@ -15,6 +15,7 @@ import shutil
 import unicodedata
 import uuid
 from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import yaml
@@ -613,21 +614,16 @@ class DocumentLane:
                 return False
         return checked
 
-    def _reconcile_revision_chain(self, record):
-        """Idempotently reconcile prior-doc links and revision_index.json.
+    def _validate_prior_archive_integrity(
+        self,
+        prior_doc_id: str,
+    ) -> Tuple[Path, Dict[str, Any], Optional[Dict[str, Any]]]:
+        """Read-only integrity preflight for a superseded prior archive.
 
-        Fail-closed: raises ReviewRequired('DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID')
-        if the prior archive is missing or corrupt. Performs zero file writes
-        when the revision chain and revision_index.json are already consistent.
+        Verifies record.json, text.txt (UTF-8 & sha256 == content_hash), and
+        optional dedup.json with zero filesystem writes. Raises ReviewRequired
+        ('DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID') on any failure.
         """
-        prior_doc_id = record.get("supersedes_doc_id")
-        if not prior_doc_id:
-            return False, None
-
-        new_doc_id = record["doc_id"]
-        revision_seq = int(record.get("revision_seq") or 2)
-        expected_prior_seq = max(1, revision_seq - 1)
-
         prior_root = self.archive_root / prior_doc_id
         prior_record_path = prior_root / "record.json"
         prior_text_path = prior_root / "text.txt"
@@ -653,6 +649,39 @@ class DocumentLane:
         if hashlib.sha256(prior_text_bytes).hexdigest() != prior_content_hash:
             raise ReviewRequired("DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID")
 
+        prior_dedup: Optional[Dict[str, Any]] = None
+        if prior_dedup_path.is_file():
+            try:
+                loaded_dedup = json.loads(prior_dedup_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise ReviewRequired("DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID") from exc
+            if not isinstance(loaded_dedup, dict):
+                raise ReviewRequired("DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID")
+            prior_dedup = loaded_dedup
+
+        return prior_root, prior_rec, prior_dedup
+
+    def _reconcile_revision_chain(self, record):
+        """Idempotently reconcile prior-doc links and revision_index.json.
+
+        Fail-closed: raises ReviewRequired('DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID')
+        if the prior archive is missing or corrupt. Performs zero file writes
+        when the revision chain and revision_index.json are already consistent.
+        """
+        prior_doc_id = record.get("supersedes_doc_id")
+        if not prior_doc_id:
+            return False, None
+
+        new_doc_id = record["doc_id"]
+        revision_seq = int(record.get("revision_seq") or 2)
+        expected_prior_seq = max(1, revision_seq - 1)
+
+        prior_root, prior_rec, prior_dedup = self._validate_prior_archive_integrity(
+            prior_doc_id
+        )
+        prior_record_path = prior_root / "record.json"
+        prior_dedup_path = prior_root / "dedup.json"
+
         repaired = False
         if (
             prior_rec.get("superseded_by_doc_id") != new_doc_id
@@ -668,13 +697,7 @@ class DocumentLane:
         self._records_cache[prior_doc_id] = prior_rec
         self._records_cache[new_doc_id] = record
 
-        if prior_dedup_path.is_file():
-            try:
-                prior_dedup = json.loads(prior_dedup_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as exc:
-                raise ReviewRequired("DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID") from exc
-            if not isinstance(prior_dedup, dict):
-                raise ReviewRequired("DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID")
+        if prior_dedup is not None:
             if (
                 prior_dedup.get("superseded_by_doc_id") != new_doc_id
                 or prior_dedup.get("revision_seq") is None
@@ -1011,6 +1034,9 @@ class DocumentLane:
             "llm_used": False,
         }
 
+        if disposition == "revision" and prior_doc_id is not None:
+            self._validate_prior_archive_integrity(prior_doc_id)
+
         staging_parent = self.archive_root / ".staging"
         staging_dir = staging_parent / f"{identifier}.{uuid.uuid4().hex[:12]}"
         try:
@@ -1052,6 +1078,9 @@ class DocumentLane:
         return result
 
     def _merge_exact(self, root, record, capture, raw):
+        prior_doc_id = record.get("supersedes_doc_id")
+        if prior_doc_id:
+            self._validate_prior_archive_integrity(prior_doc_id)
         record_path = root / "record.json"
         provenance_path = root / "provenance.json"
         dedup_path = root / "dedup.json"

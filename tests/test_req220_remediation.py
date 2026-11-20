@@ -1,4 +1,4 @@
-"""Regression & remediation tests for REQ-220 Q2 Round 1 & Round 2 FAIL findings.
+"""Regression & remediation tests for REQ-220 Q2 Round 1, Round 2 & Round 3 FAIL findings.
 
 Covers:
 - P0-1-F01: `upstream_origin` must be a non-empty string in acquisition_bundle_v1
@@ -8,6 +8,9 @@ Covers:
   `revision_index.json` updates.
 - P0-2-F02: Prior archive `text.txt` UTF-8 & `content_hash` integrity verification
   before any revision-chain mutation, plus zero-write counter proof on consistent retry.
+- P0-2-F02-R3-01: Read-only prior archive integrity preflight BEFORE any filesystem
+  write across `_ingest_parsed()`, `_merge_exact()` interrupted-merge recovery, and
+  `_merge_exact()` new-capture merge paths.
 """
 from __future__ import annotations
 
@@ -466,8 +469,20 @@ def test_p0_2_f02_recovery_fails_closed_on_tampered_prior_text_or_missing_hash(
         rec["content_hash"] = 12345
         prior_record_path.write_text(json.dumps(rec, indent=2) + "\n", encoding="utf-8")
 
+    new_doc_dirs = [
+        p for p in inst.document_archive_root.iterdir()
+        if p.is_dir() and p.name.startswith("doc_") and p.name != doc_a_id
+    ]
+    assert len(new_doc_dirs) == 1
+    new_root = new_doc_dirs[0]
+
+    snap_prior_text = prior_text_path.read_bytes()
     snap_prior_rec = prior_record_path.read_bytes()
     snap_prior_dedup = prior_dedup_path.read_bytes()
+    snap_new_rec = (new_root / "record.json").read_bytes()
+    snap_new_prov = (new_root / "provenance.json").read_bytes()
+    snap_new_dedup = (new_root / "dedup.json").read_bytes()
+    snap_new_text = (new_root / "text.txt").read_bytes()
     assert not rev_idx_path.exists()
 
     lane_retry = DocumentLane(REPO_ROOT, inst)
@@ -476,9 +491,191 @@ def test_p0_2_f02_recovery_fails_closed_on_tampered_prior_text_or_missing_hash(
     assert res["accepted"] is False
     assert res["reason"] == "DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID"
 
-    # Zero mutations to prior_record.json, prior_dedup.json, or revision_index.json
+    # Zero mutations to prior archive, new archive, or revision_index.json
+    assert prior_text_path.read_bytes() == snap_prior_text
     assert prior_record_path.read_bytes() == snap_prior_rec
     assert prior_dedup_path.read_bytes() == snap_prior_dedup
+    assert (new_root / "record.json").read_bytes() == snap_new_rec
+    assert (new_root / "provenance.json").read_bytes() == snap_new_prov
+    assert (new_root / "dedup.json").read_bytes() == snap_new_dedup
+    assert (new_root / "text.txt").read_bytes() == snap_new_text
+    assert not rev_idx_path.exists()
+
+
+def test_p0_2_f02_r3_01_normal_revision_preflight_writes_nothing_on_corrupt_prior_text(
+    tmp_path: Path,
+) -> None:
+    """_ingest_parsed() must fail closed BEFORE creating staging/new archive dir."""
+    inst = _make_instance(tmp_path)
+    lane = DocumentLane(REPO_ROOT, inst)
+    url = "https://example.invalid/cba/r3-normal-revision-preflight"
+    body_a = "R3 normal revision 1 synthetic body."
+    body_b = "R3 normal revision 2 synthetic body with updates."
+
+    bpath_a = _write_bundle(
+        inst.document_input_root / "r3_a.md",
+        _make_bundle_meta(canonical_url=url, body=body_a, upstream_origin="origin:r3"),
+        body_a,
+    )
+    res_a = lane.ingest_acquisition_bundle(bpath_a)
+    assert res_a["status"] == "ACCEPTED"
+    doc_a_id = res_a["doc_id"]
+    prior_root = lane.archive_root / doc_a_id
+
+    # Tamper prior text.txt before ingesting revision B
+    (prior_root / "text.txt").write_text("Tampered prior archive text.\n", encoding="utf-8")
+
+    snap_prior_text = (prior_root / "text.txt").read_bytes()
+    snap_prior_rec = (prior_root / "record.json").read_bytes()
+    snap_prior_dedup = (prior_root / "dedup.json").read_bytes()
+    rev_idx_path = lane.archive_root / "revision_index.json"
+    assert not rev_idx_path.exists()
+
+    bpath_b = _write_bundle(
+        inst.document_input_root / "r3_b.md",
+        _make_bundle_meta(canonical_url=url, body=body_b, upstream_origin="origin:r3"),
+        body_b,
+    )
+    lane_b = DocumentLane(REPO_ROOT, inst)
+    res_b = lane_b.ingest_acquisition_bundle(bpath_b)
+    assert res_b["status"] == "REVIEW_REQUIRED"
+    assert res_b["accepted"] is False
+    assert res_b["reason"] == "DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID"
+
+    # New archive dir must NOT exist and .staging must have no leftover dirs
+    doc_dirs = sorted(
+        p.name for p in lane.archive_root.iterdir()
+        if p.is_dir() and p.name.startswith("doc_")
+    )
+    assert doc_dirs == [doc_a_id]
+    staging_parent = lane.archive_root / ".staging"
+    assert not staging_parent.exists() or list(staging_parent.iterdir()) == []
+
+    # Prior archive files and revision_index.json remain byte-identical / untouched
+    assert (prior_root / "text.txt").read_bytes() == snap_prior_text
+    assert (prior_root / "record.json").read_bytes() == snap_prior_rec
+    assert (prior_root / "dedup.json").read_bytes() == snap_prior_dedup
+    assert not rev_idx_path.exists()
+
+
+@pytest.mark.parametrize("new_dedup_mode", ["missing", "corrupt"])
+def test_p0_2_f02_r3_01_merge_exact_interrupted_recovery_writes_nothing_on_corrupt_prior_text(
+    tmp_path: Path,
+    new_dedup_mode: str,
+) -> None:
+    """_merge_exact() interrupted-merge recovery must fail closed BEFORE any writes."""
+    (
+        inst,
+        _bpath_a,
+        bpath_b,
+        doc_a_id,
+        _prior_text_before,
+        _prior_hash_before,
+        _meta_b,
+        _body_b,
+    ) = _fault_inject_revision_b(tmp_path)
+
+    prior_root = inst.document_archive_root / doc_a_id
+    new_doc_dirs = [
+        p for p in inst.document_archive_root.iterdir()
+        if p.is_dir() and p.name.startswith("doc_") and p.name != doc_a_id
+    ]
+    assert len(new_doc_dirs) == 1
+    new_root = new_doc_dirs[0]
+
+    # Force _merge_exact() interrupted-merge recovery branch (same capture_id, broken dedup.json)
+    new_dedup_path = new_root / "dedup.json"
+    if new_dedup_mode == "missing":
+        new_dedup_path.unlink()
+    else:
+        new_dedup_path.write_text("{corrupt dedup json", encoding="utf-8")
+
+    # Tamper prior archive text.txt
+    (prior_root / "text.txt").write_text("Tampered prior text in interrupted merge.\n", encoding="utf-8")
+
+    snap_prior_text = (prior_root / "text.txt").read_bytes()
+    snap_prior_rec = (prior_root / "record.json").read_bytes()
+    snap_prior_dedup = (prior_root / "dedup.json").read_bytes()
+    snap_new_rec = (new_root / "record.json").read_bytes()
+    snap_new_prov = (new_root / "provenance.json").read_bytes()
+    snap_new_dedup = new_dedup_path.read_bytes() if new_dedup_path.exists() else None
+    rev_idx_path = inst.document_archive_root / "revision_index.json"
+    assert not rev_idx_path.exists()
+
+    lane_retry = DocumentLane(REPO_ROOT, inst)
+    res = lane_retry.ingest_acquisition_bundle(bpath_b)
+    assert res["status"] == "REVIEW_REQUIRED"
+    assert res["accepted"] is False
+    assert res["reason"] == "DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID"
+
+    # ALL pre-existing archive artifacts must remain byte-identical / untouched
+    assert (prior_root / "text.txt").read_bytes() == snap_prior_text
+    assert (prior_root / "record.json").read_bytes() == snap_prior_rec
+    assert (prior_root / "dedup.json").read_bytes() == snap_prior_dedup
+    assert (new_root / "record.json").read_bytes() == snap_new_rec
+    assert (new_root / "provenance.json").read_bytes() == snap_new_prov
+    if snap_new_dedup is None:
+        assert not new_dedup_path.exists()
+    else:
+        assert new_dedup_path.read_bytes() == snap_new_dedup
+    assert not rev_idx_path.exists()
+
+
+def test_p0_2_f02_r3_01_merge_exact_new_capture_writes_nothing_on_corrupt_prior_text(
+    tmp_path: Path,
+) -> None:
+    """_merge_exact() new-capture merge branch must fail closed BEFORE any writes."""
+    (
+        inst,
+        _bpath_a,
+        _bpath_b,
+        doc_a_id,
+        _prior_text_before,
+        _prior_hash_before,
+        meta_b,
+        body_b,
+    ) = _fault_inject_revision_b(tmp_path)
+
+    prior_root = inst.document_archive_root / doc_a_id
+    new_doc_dirs = [
+        p for p in inst.document_archive_root.iterdir()
+        if p.is_dir() and p.name.startswith("doc_") and p.name != doc_a_id
+    ]
+    assert len(new_doc_dirs) == 1
+    new_root = new_doc_dirs[0]
+
+    # Tamper prior archive text.txt
+    (prior_root / "text.txt").write_text("Tampered prior text in new capture merge.\n", encoding="utf-8")
+
+    # Snapshot all archive artifacts including raw/ capture files
+    raw_dir = new_root / "raw"
+    snap_raw_files = sorted(p.name for p in raw_dir.iterdir())
+    assert len(snap_raw_files) == 1
+    snap_prior_text = (prior_root / "text.txt").read_bytes()
+    snap_prior_rec = (prior_root / "record.json").read_bytes()
+    snap_prior_dedup = (prior_root / "dedup.json").read_bytes()
+    snap_new_rec = (new_root / "record.json").read_bytes()
+    snap_new_prov = (new_root / "provenance.json").read_bytes()
+    snap_new_dedup = (new_root / "dedup.json").read_bytes()
+    rev_idx_path = inst.document_archive_root / "revision_index.json"
+    assert not rev_idx_path.exists()
+
+    # Alternate locator -> new capture_id on existing revision archive -> new-capture merge branch
+    bpath_b_alt = _write_bundle(inst.document_input_root / "doc_b_alt_r3.md", meta_b, body_b)
+    lane_retry = DocumentLane(REPO_ROOT, inst)
+    res = lane_retry.ingest_acquisition_bundle(bpath_b_alt)
+    assert res["status"] == "REVIEW_REQUIRED"
+    assert res["accepted"] is False
+    assert res["reason"] == "DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID"
+
+    # Zero writes to raw/, new archive metadata, prior archive, or revision_index.json
+    assert sorted(p.name for p in raw_dir.iterdir()) == snap_raw_files
+    assert (new_root / "record.json").read_bytes() == snap_new_rec
+    assert (new_root / "provenance.json").read_bytes() == snap_new_prov
+    assert (new_root / "dedup.json").read_bytes() == snap_new_dedup
+    assert (prior_root / "text.txt").read_bytes() == snap_prior_text
+    assert (prior_root / "record.json").read_bytes() == snap_prior_rec
+    assert (prior_root / "dedup.json").read_bytes() == snap_prior_dedup
     assert not rev_idx_path.exists()
 
 
