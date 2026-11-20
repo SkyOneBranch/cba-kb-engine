@@ -642,6 +642,17 @@ class DocumentLane:
         if not isinstance(prior_rec, dict) or prior_rec.get("doc_id") != prior_doc_id:
             raise ReviewRequired("DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID")
 
+        prior_content_hash = prior_rec.get("content_hash")
+        if not isinstance(prior_content_hash, str) or not prior_content_hash:
+            raise ReviewRequired("DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID")
+        try:
+            prior_text_bytes = prior_text_path.read_bytes()
+            prior_text_bytes.decode("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ReviewRequired("DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID") from exc
+        if hashlib.sha256(prior_text_bytes).hexdigest() != prior_content_hash:
+            raise ReviewRequired("DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID")
+
         repaired = False
         if (
             prior_rec.get("superseded_by_doc_id") != new_doc_id

@@ -1,4 +1,4 @@
-"""Regression & remediation tests for REQ-220 Q2 Round 1 FAIL findings.
+"""Regression & remediation tests for REQ-220 Q2 Round 1 & Round 2 FAIL findings.
 
 Covers:
 - P0-1-F01: `upstream_origin` must be a non-empty string in acquisition_bundle_v1
@@ -6,6 +6,8 @@ Covers:
 - P0-2-F01: Crash-safe, idempotent, fail-closed revision-chain reconciliation when
   interrupted between `os.replace(staging_dir, root)` and prior-doc /
   `revision_index.json` updates.
+- P0-2-F02: Prior archive `text.txt` UTF-8 & `content_hash` integrity verification
+  before any revision-chain mutation, plus zero-write counter proof on consistent retry.
 """
 from __future__ import annotations
 
@@ -19,7 +21,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 
-from cba_kb import kc_passages, source_intake
+from cba_kb import document_lane, kc_passages, source_intake
 from cba_kb.document_lane import DocumentLane
 from cba_kb.document_sources import ReviewRequired
 from cba_kb.instance import Instance
@@ -409,3 +411,113 @@ def test_p0_2_f01_uninterrupted_revision_control_preserves_old_text_and_hash(
         res1["doc_id"],
         res2["doc_id"],
     ]
+
+
+# ---------------------------------------------------------------------------
+# Replay C (P0-2-F02): prior text.txt integrity & zero-write retry proof
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "tamper_mode",
+    [
+        "tampered_text_utf8",
+        "corrupt_text_non_utf8",
+        "missing_content_hash",
+        "empty_content_hash",
+        "non_str_content_hash",
+    ],
+)
+def test_p0_2_f02_recovery_fails_closed_on_tampered_prior_text_or_missing_hash(
+    tmp_path: Path,
+    tamper_mode: str,
+) -> None:
+    (
+        inst,
+        _bpath_a,
+        bpath_b,
+        doc_a_id,
+        _prior_text_before,
+        _prior_hash_before,
+        _meta_b,
+        _body_b,
+    ) = _fault_inject_revision_b(tmp_path)
+
+    prior_root = inst.document_archive_root / doc_a_id
+    prior_record_path = prior_root / "record.json"
+    prior_dedup_path = prior_root / "dedup.json"
+    prior_text_path = prior_root / "text.txt"
+    rev_idx_path = inst.document_archive_root / "revision_index.json"
+
+    if tamper_mode == "tampered_text_utf8":
+        prior_text_path.write_text("Tampered prior archive text.\n", encoding="utf-8")
+    elif tamper_mode == "corrupt_text_non_utf8":
+        prior_text_path.write_bytes(b"\xff\xfe\x00corrupt-non-utf8-bytes")
+    elif tamper_mode == "missing_content_hash":
+        rec = json.loads(prior_record_path.read_text(encoding="utf-8"))
+        rec.pop("content_hash", None)
+        prior_record_path.write_text(json.dumps(rec, indent=2) + "\n", encoding="utf-8")
+    elif tamper_mode == "empty_content_hash":
+        rec = json.loads(prior_record_path.read_text(encoding="utf-8"))
+        rec["content_hash"] = ""
+        prior_record_path.write_text(json.dumps(rec, indent=2) + "\n", encoding="utf-8")
+    elif tamper_mode == "non_str_content_hash":
+        rec = json.loads(prior_record_path.read_text(encoding="utf-8"))
+        rec["content_hash"] = 12345
+        prior_record_path.write_text(json.dumps(rec, indent=2) + "\n", encoding="utf-8")
+
+    snap_prior_rec = prior_record_path.read_bytes()
+    snap_prior_dedup = prior_dedup_path.read_bytes()
+    assert not rev_idx_path.exists()
+
+    lane_retry = DocumentLane(REPO_ROOT, inst)
+    res = lane_retry.ingest_acquisition_bundle(bpath_b)
+    assert res["status"] == "REVIEW_REQUIRED"
+    assert res["accepted"] is False
+    assert res["reason"] == "DOCUMENT_ARCHIVE_REVISION_CHAIN_INVALID"
+
+    # Zero mutations to prior_record.json, prior_dedup.json, or revision_index.json
+    assert prior_record_path.read_bytes() == snap_prior_rec
+    assert prior_dedup_path.read_bytes() == snap_prior_dedup
+    assert not rev_idx_path.exists()
+
+
+def test_p0_2_f02_consistent_second_retry_makes_zero_atomic_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        inst,
+        _bpath_a,
+        bpath_b,
+        _doc_a_id,
+        _prior_text_before,
+        _prior_hash_before,
+        _meta_b,
+        _body_b,
+    ) = _fault_inject_revision_b(tmp_path)
+
+    # Retry 1 reconciles the revision chain
+    lane_retry_1 = DocumentLane(REPO_ROOT, inst)
+    res_1 = lane_retry_1.ingest_acquisition_bundle(bpath_b)
+    assert res_1["status"] == "ACCEPTED"
+    assert res_1["changed"] is True
+
+    # Retry 2 must perform 0 calls to document_lane.atomic()
+    orig_atomic = document_lane.atomic
+    atomic_calls: list[Path] = []
+
+    def _counting_atomic(path, data):
+        atomic_calls.append(Path(path))
+        return orig_atomic(path, data)
+
+    monkeypatch.setattr(document_lane, "atomic", _counting_atomic)
+
+    lane_retry_2 = DocumentLane(REPO_ROOT, inst)
+    res_2 = lane_retry_2.ingest_acquisition_bundle(bpath_b)
+    assert res_2["status"] == "ACCEPTED"
+    assert res_2["accepted"] is True
+    assert res_2["disposition"] == "exact_merge"
+    assert res_2["changed"] is False
+    assert atomic_calls == []
+
