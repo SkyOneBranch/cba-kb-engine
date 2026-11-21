@@ -30,6 +30,8 @@ from cba_kb.consumer_surface import (  # noqa: E402
     build_consumer_surface_targets_spec,
     build_promoted_research_slice_artifacts,
     compute_master_row_count,
+    merge_operational_docs_into_consumer_index,
+    render_collector_official_digest_md,
     render_consumer_surface_guide_section,
     scrub_raw_drive_ids_for_consumer,
 )
@@ -88,11 +90,17 @@ run_trusted_release_infra_compatibility_preflight = _base.run_trusted_release_in
 build_live_qualification_fingerprints = _base.build_live_qualification_fingerprints
 
 V215_BASELINE_SHA = "3874ebb4b20fdfd5c1d1fd7f9ed9426d9f26036f"
+V220_1_BASELINE_SHA = "fa9793c6db76e15880610ced728a7b0d563da604"
 
 V215_RELEASE_SPECS: dict[str, dict] = {
     "v2.1.5-1": {
         "product_baseline_sha": V215_BASELINE_SHA,
         "enable_consumer_surface_v215": True,
+    },
+    "v2.2.0-1": {
+        "product_baseline_sha": V220_1_BASELINE_SHA,
+        "enable_consumer_surface_v215": True,
+        "enable_operational_kb_v220": True,
     },
 }
 
@@ -958,7 +966,9 @@ def _content_preserving_candidate(
         for key in sorted(id_by_key)
     )
     consumer_guide = render_consumer_surface_guide_section(
-        release_id=release_id, master_row_count=master_row_count,
+        release_id=release_id,
+        master_row_count=master_row_count,
+        include_collector_digest=bool(_release_spec(release_id).get("enable_operational_kb_v220")),
     )
     if logical_key == "entry/context":
         operations = (
@@ -1212,10 +1222,93 @@ def _build_closure_contract(
     }
 
 
+def _parse_bundle_frontmatter_and_body(raw_text: str) -> tuple[dict, str]:
+    """Split YAML frontmatter and body from an acquisition_bundle_v1 markdown capture."""
+    if raw_text.startswith("---\n"):
+        parts = raw_text.split("---\n", 2)
+        if len(parts) == 3:
+            try:
+                loaded = yaml.safe_load(parts[1])
+                if isinstance(loaded, dict):
+                    return loaded, parts[2]
+            except yaml.YAMLError:
+                pass
+    return {}, raw_text
+
+
+def _load_operational_bundle_records(instance, checkpoint: dict) -> list[dict]:
+    """Load consumed bundle metadata + full sanitized bodies from document_archive."""
+    raw_consumed = checkpoint.get("consumed_bundles")
+    entries: list[tuple[str, dict]] = []
+    if isinstance(raw_consumed, dict):
+        for key in sorted(raw_consumed):
+            val = raw_consumed[key]
+            if isinstance(val, dict):
+                entries.append((str(key), val))
+    elif isinstance(raw_consumed, list):
+        for idx, val in enumerate(raw_consumed):
+            if isinstance(val, dict):
+                entries.append((str(idx), val))
+
+    records: list[dict] = []
+    seen_doc_ids: set[str] = set()
+    for _key, ckpt_meta in sorted(
+        entries, key=lambda item: (str(item[1].get("doc_id") or ""), item[0])
+    ):
+        doc_id = str(ckpt_meta.get("doc_id") or "").strip()
+        if not doc_id or doc_id in seen_doc_ids:
+            continue
+        seen_doc_ids.add(doc_id)
+
+        doc_dir = instance.document_archive_root / doc_id
+        fm: dict = {}
+        body = ""
+        raw_dir = doc_dir / "raw"
+        raw_mds = sorted(raw_dir.glob("*.md")) if raw_dir.is_dir() else []
+        if raw_mds:
+            fm, body = _parse_bundle_frontmatter_and_body(
+                raw_mds[0].read_text(encoding="utf-8")
+            )
+        else:
+            text_path = doc_dir / "text.txt"
+            if text_path.is_file():
+                body = text_path.read_text(encoding="utf-8")
+
+        record_meta: dict = {}
+        record_path = doc_dir / "record.json"
+        if record_path.is_file():
+            try:
+                loaded_rec = json.loads(record_path.read_text(encoding="utf-8"))
+                if isinstance(loaded_rec, dict):
+                    record_meta = loaded_rec
+            except (OSError, ValueError):
+                pass
+
+        records.append({
+            "doc_id": doc_id,
+            "title": fm.get("title") or ckpt_meta.get("title") or record_meta.get("title") or doc_id,
+            "source_tier": fm.get("source_tier") or ckpt_meta.get("source_tier") or record_meta.get("source_tier"),
+            "event_class": fm.get("event_class") or ckpt_meta.get("event_class") or record_meta.get("event_class"),
+            "published_at": (
+                fm.get("published_at")
+                if "published_at" in fm
+                else ckpt_meta.get("published_at", record_meta.get("published_at"))
+            ),
+            "acquired_at": fm.get("acquired_at") or record_meta.get("captured_at"),
+            "canonical_url": fm.get("canonical_url") or ckpt_meta.get("canonical_url") or record_meta.get("canonical_url"),
+            "upstream_origin": fm.get("upstream_origin") or record_meta.get("upstream_origin"),
+            "raw_sha256": fm.get("raw_sha256") or ckpt_meta.get("file_sha256") or ckpt_meta.get("content_hash"),
+            "matched_persons": fm.get("matched_persons") if isinstance(fm.get("matched_persons"), list) else (ckpt_meta.get("matched_persons") or []),
+            "body": body,
+        })
+    return records
+
+
 def _build_instance_consumer_targets(
     drive, instance, *, release_id, engine_sha, manifest_rows, data_parent
 ):
     """Build declared consumer-surface targets from existing Drive inputs & instance fixtures."""
+    release_spec = _release_spec(release_id)
     by_key = _manifest_rows(manifest_rows)
     id_for = {logical_key: fid for fid, logical_key in by_key.items()}
     master_csv_id = id_for.get("derived/MASTER.csv")
@@ -1227,6 +1320,27 @@ def _build_instance_consumer_targets(
     doc_idx_bytes = None
     if "data/normalized_document_index.json" in id_for:
         doc_idx_bytes, _ = snapshot(drive, id_for["data/normalized_document_index.json"], "binary")
+
+    include_collector_digest = bool(release_spec.get("enable_operational_kb_v220"))
+    collector_official_digest_bytes = None
+    ops_dir = instance.data_root / "ops_sync_v040_1"
+    ops_checkpoint_path = ops_dir / "operational_checkpoint.json"
+    if include_collector_digest and ops_checkpoint_path.is_file():
+        checkpoint = json.loads(ops_checkpoint_path.read_text(encoding="utf-8"))
+        doc_idx_bytes = merge_operational_docs_into_consumer_index(
+            doc_idx_bytes, checkpoint
+        )
+        reg_diff = None
+        reg_diff_path = ops_dir / "reg_diff_2526_2627.json"
+        if reg_diff_path.is_file():
+            reg_diff = json.loads(reg_diff_path.read_text(encoding="utf-8"))
+        bundle_records = _load_operational_bundle_records(instance, checkpoint)
+        collector_official_digest_bytes = render_collector_official_digest_md(
+            bundles=bundle_records,
+            reg_diff=reg_diff,
+            release_id=release_id,
+            engine_sha=engine_sha,
+        )
 
     promoted_research = {}
     slice_spec_path = instance.data_root / "promoted_research_slices.json"
@@ -1257,6 +1371,8 @@ def _build_instance_consumer_targets(
         master_csv_bytes=master_bytes,
         source_registry_bytes=sr_bytes,
         doc_index_bytes=doc_idx_bytes,
+        collector_official_digest_bytes=collector_official_digest_bytes,
+        include_collector_digest=include_collector_digest,
         promoted_research_artifacts=promoted_research,
     )
     for spec in targets.values():
