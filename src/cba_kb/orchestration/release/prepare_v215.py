@@ -328,6 +328,7 @@ def project_targets(
         for logical_key in new_keys
     ]
     declared_consumer_keys = set()
+    updated_consumer_specs: dict[str, str] = {}
     if declared_consumer_targets:
         if not isinstance(declared_consumer_targets, dict):
             raise ProjectionError("DECLARED_CONSUMER_TARGETS_INVALID")
@@ -337,9 +338,16 @@ def project_targets(
                 not isinstance(ckey, str)
                 or not ckey
                 or ckey.startswith("code/")
-                or ckey in existing
                 or ckey in current_code
             ):
+                raise ProjectionError(f"DECLARED_TARGET_CONFLICT:{ckey}")
+            is_existing_updatable = (
+                ckey in existing
+                and ckey.startswith(("consumer/", "research/"))
+                and ckey not in retiring_keys
+                and ckey not in CONTROL_KEYS
+            )
+            if ckey in existing and not is_existing_updatable:
                 raise ProjectionError(f"DECLARED_TARGET_CONFLICT:{ckey}")
             if not isinstance(spec, dict) or not spec.get("name") or not spec.get("mime"):
                 raise ProjectionError(f"DECLARED_CONSUMER_TARGET_INVALID:{ckey}")
@@ -350,21 +358,24 @@ def project_targets(
                 content_sha = spec["sha256"]
             else:
                 raise ProjectionError(f"DECLARED_CONSUMER_TARGET_HASH_REQUIRED:{ckey}")
-            target_parent = spec.get("publish_parent") or code_parent
-            declared_consumer_keys.add(ckey)
-            new_targets.append({
-                "logical_key": ckey,
-                "name": str(spec["name"]),
-                "mime": str(spec["mime"]),
-                "mode": str(spec.get("mode", "binary")),
-                "publish_parent": target_parent,
-                "sha256": content_sha,
-                "consumer_target_kind": "consumer_surface",
-                **(
-                    {"id": reserved_keys[ckey]}
-                    if ckey in reserved_keys else {}
-                ),
-            })
+            if is_existing_updatable:
+                updated_consumer_specs[ckey] = content_sha
+            else:
+                target_parent = spec.get("publish_parent") or code_parent
+                declared_consumer_keys.add(ckey)
+                new_targets.append({
+                    "logical_key": ckey,
+                    "name": str(spec["name"]),
+                    "mime": str(spec["mime"]),
+                    "mode": str(spec.get("mode", "binary")),
+                    "publish_parent": target_parent,
+                    "sha256": content_sha,
+                    "consumer_target_kind": "consumer_surface",
+                    **(
+                        {"id": reserved_keys[ckey]}
+                        if ckey in reserved_keys else {}
+                    ),
+                })
         new_targets.sort(key=lambda item: item["logical_key"])
     if allocation is not None and (set(new_keys) | declared_consumer_keys) != set(reserved_keys):
         raise ProjectionError("RESERVATION_KEY_SET_MISMATCH")
@@ -376,6 +387,13 @@ def project_targets(
             item["current_sha256"] = current_code[logical_key]["sha256"]
             item["disposition"] = (
                 "modified" if logical_key in modified else "unchanged"
+            )
+        elif logical_key in updated_consumer_specs:
+            new_sha = updated_consumer_specs[logical_key]
+            item["current_sha256"] = new_sha
+            item["consumer_target_kind"] = "consumer_surface"
+            item["disposition"] = (
+                "unchanged" if item["previous_sha256"] == new_sha else "modified"
             )
         elif logical_key in control_keys:
             item["disposition"] = "metadata_update"
@@ -454,22 +472,24 @@ def project_targets(
         "status_before_meta": status_meta,
         "active_release_id": previous_status.get("current_release_id"),
     }
+    all_consumer_hashes = {
+        item["logical_key"]: item["sha256"]
+        for item in new_targets
+        if item.get("consumer_target_kind") == "consumer_surface"
+    }
+    all_consumer_hashes.update(updated_consumer_specs)
+    modified_consumer = sorted(
+        k for k, sha in updated_consumer_specs.items()
+        if existing[k]["previous_sha256"] != sha
+    )
     projection["semantic_delta_signature"] = _json_hash({
         "keys": final_keys,
         "new": sorted(set(new_keys) | declared_consumer_keys),
         "modified": modified,
         "removed": removed_code_keys,
         **({"retired": sorted(retiring_keys)} if retiring_keys else {}),
-        **(
-            {
-                "consumer_surface_hashes": {
-                    item["logical_key"]: item["sha256"]
-                    for item in new_targets
-                    if item.get("consumer_target_kind") == "consumer_surface"
-                }
-            }
-            if declared_consumer_keys else {}
-        ),
+        **({"modified_consumer": modified_consumer} if modified_consumer else {}),
+        **({"consumer_surface_hashes": all_consumer_hashes} if all_consumer_hashes else {}),
         "counts": {
             "previous": projection["previous_artifact_count"],
             "final": projection["final_artifact_count"],
@@ -695,8 +715,14 @@ def _candidate_inputs(
             data = consumer_target_contents[logical_key]
             if not isinstance(data, bytes):
                 raise ProjectionError(f"CONSUMER_SURFACE_BYTES_REQUIRED:{logical_key}")
-            if digest(data) != item.get("sha256"):
+            expected_sha = item.get("current_sha256") or item.get("sha256")
+            if digest(data) != expected_sha:
                 raise ProjectionError(f"CONSUMER_SURFACE_HASH_MISMATCH:{logical_key}")
+            if logical_key in existing_by_key:
+                previous, _ = snapshot(
+                    drive, item["id"], item.get("mode", "binary"),
+                )
+                previous_by_key[logical_key] = previous
             generated = True
         else:
             previous, _ = snapshot(
@@ -735,6 +761,12 @@ def _candidate_inputs(
                 "NEW_CONSUMER_SURFACE"
                 if item.get("consumer_target_kind") == "consumer_surface"
                 else "NEW_CODE_MIRROR"
+            )
+        elif item.get("consumer_target_kind") == "consumer_surface":
+            change_class = (
+                "CONSUMER_SURFACE_UPDATE"
+                if data != previous_by_key.get(logical_key)
+                else "CONSUMER_SURFACE_CARRY_FORWARD"
             )
         elif logical_key in CONTROL_KEYS:
             change_class = "CONTROL_METADATA_UPDATE"
