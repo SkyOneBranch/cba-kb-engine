@@ -1971,6 +1971,24 @@ def freeze_closure(drive, root, plan):
         raise ValueError('PROTECTED_BASELINE_DUPLICATE')
 
     bundle_mode = plan.get('archive_format') == ARCHIVE_FORMAT_BUNDLE_V1
+    legacy_annotation_ids = set()
+    if bundle_mode:
+        from .canonical_registry import load_registry, manifest_index
+        reg_entry = entries.get(closure['registry_key'])
+        man_entry = entries.get(closure['manifest_key'])
+        if reg_entry and man_entry:
+            reg = load_registry(verified_local(root, reg_entry, 'candidate'))
+            by_key = manifest_index(verified_local(root, man_entry, 'candidate'))
+            for prod in reg.get('products') or []:
+                if not isinstance(prod, dict):
+                    continue
+                ann = (prod.get('projection') or {}).get('legacy_annotations')
+                if isinstance(ann, dict) and ann.get('artifact_key'):
+                    row = by_key.get(ann['artifact_key'])
+                    fid = (row.get('drive_file_id') or row.get('id')) if row else None
+                    if fid:
+                        legacy_annotation_ids.add(fid)
+
     remote_index = {}
     if closure.get('zones'):
         try:
@@ -1989,7 +2007,7 @@ def freeze_closure(drive, root, plan):
         needs_local_bytes = (
             not bundle_mode
             or item.get('kind') in {'master', 'six_table', 'source_registry'}
-            or item.get('name') == 'bayi_legacy_context.md'
+            or item['id'] in legacy_annotation_ids
             or server_sha is None
         )
         if not needs_local_bytes:
@@ -2817,6 +2835,8 @@ def validate_closure(
                 from .aliases import Clubs
                 if annotation['parser'] != 'midseason_md':
                     raise ValueError('LEGACY_ANNOTATION_PARSER_FORBIDDEN')
+                if not source.get('before'):
+                    raise ValueError('LEGACY_ANNOTATION_BEFORE_MISSING')
                 result = midseason_md.extract(
                     child(root, source['before']),
                     product['projection']['scope']['domestic']['season'],
