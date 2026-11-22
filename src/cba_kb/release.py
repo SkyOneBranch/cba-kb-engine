@@ -1485,7 +1485,7 @@ def archive_snapshot(drive, root, plan):
             for item in plan['closure']['protected']:
                 if item['id'] in snapshotted:
                     continue
-                if item.get('before') and child(root, item['before']).exists():
+                if item.get('before'):
                     data = child(root, item['before']).read_bytes()
                     if digest(data) != item['sha256']:
                         raise RuntimeError('Frozen protected snapshot was altered')
@@ -2919,49 +2919,87 @@ def verify(drive, root, execution_authority=None):
     return {'verified':len(plan['entries'])}
 
 
+def _verify_existing_local_frozen_files(root, plan):
+    """Fail closed if any present local frozen artifact under root was tampered."""
+    root = Path(root)
+    local_status_before_raw = None
+    status_before_path = root / 'status.before.json'
+    if status_before_path.exists() or status_before_path.is_symlink():
+        if status_before_path.is_symlink() or not status_before_path.is_file():
+            raise RuntimeError('Frozen previous status was altered')
+        raw = status_before_path.read_bytes()
+        if digest(raw) != plan['status_before_hash']:
+            raise RuntimeError('Frozen previous status was altered')
+        local_status_before_raw = raw
+
+    local_before_by_id = {}
+    for e in plan['entries']:
+        before_path = child(root, e['before'])
+        if before_path.exists() or before_path.is_symlink():
+            if before_path.is_symlink() or not before_path.is_file():
+                raise RuntimeError('Frozen local artifact was altered')
+            local_before_by_id[e['id']] = verified_local(root, e, 'before')
+        candidate_path = child(root, e['candidate'])
+        if candidate_path.exists() or candidate_path.is_symlink():
+            if candidate_path.is_symlink() or not candidate_path.is_file():
+                raise RuntimeError('Frozen local artifact was altered')
+            verified_local(root, e, 'candidate')
+
+    for item in (plan.get('closure') or {}).get('protected', []):
+        before_rel = item.get('before')
+        if not before_rel:
+            continue
+        prot_path = child(root, before_rel)
+        if prot_path.exists() or prot_path.is_symlink():
+            if prot_path.is_symlink() or not prot_path.is_file():
+                raise RuntimeError('Frozen protected snapshot was altered')
+            if digest(prot_path.read_bytes()) != item['sha256']:
+                raise RuntimeError('Frozen protected snapshot was altered')
+
+    return local_before_by_id, local_status_before_raw
+
+
 def _resolve_restore_sources(
     drive, root, plan, journal, status, *, bundle_file_id=None, max_bundle_bytes=MAX_BUNDLE_EXTRACT_BYTES
 ):
     """Load verified pre-release bytes from local files or cloud release_bundle.tar.gz."""
     root = Path(root)
-    status_before_path = root / 'status.before.json'
-    local_complete = status_before_path.is_file() and all(
-        child(root, e['before']).is_file() for e in plan['entries']
+    # Verify every existing local frozen file BEFORE any cloud-bundle fallback or
+    # explicit bundle_file_id path so partial local deletion can never mask tampering.
+    local_before_by_id, local_status_before_raw = _verify_existing_local_frozen_files(root, plan)
+    local_complete = (
+        local_status_before_raw is not None
+        and len(local_before_by_id) == len(plan['entries'])
     )
     if local_complete and bundle_file_id is None:
-        status_before_raw = status_before_path.read_bytes()
-        if digest(status_before_raw) != plan['status_before_hash']:
-            raise RuntimeError('Frozen previous status was altered')
-        before_by_id = {
-            e['id']: verified_local(root, e, 'before') for e in plan['entries']
-        }
-        return before_by_id, json.loads(status_before_raw)
+        return local_before_by_id, json.loads(local_status_before_raw)
 
     # Fallback to cloud bundle_v1 archive when local before/ or status.before.json is missing
     if bundle_file_id is None and plan.get('archive_format') != ARCHIVE_FORMAT_BUNDLE_V1:
         # Preserve original local error path for non-bundle legacy releases
-        if not status_before_path.is_file():
-            raise FileNotFoundError(str(status_before_path))
-        status_before_raw = status_before_path.read_bytes()
-        if digest(status_before_raw) != plan['status_before_hash']:
-            raise RuntimeError('Frozen previous status was altered')
-        before_by_id = {
-            e['id']: verified_local(root, e, 'before') for e in plan['entries']
-        }
-        return before_by_id, json.loads(status_before_raw)
+        if local_status_before_raw is None:
+            raise FileNotFoundError(str(root / 'status.before.json'))
+        for e in plan['entries']:
+            if e['id'] not in local_before_by_id:
+                raise FileNotFoundError(str(child(root, e['before'])))
+        return local_before_by_id, json.loads(local_status_before_raw)
 
-    expected_bundle_sha = None
-    if bundle_file_id is None:
-        for snap_source in (journal.get('previous_snapshot'), status.get('previous_snapshot')):
-            if not isinstance(snap_source, list):
-                continue
-            for item in snap_source:
-                if isinstance(item, dict) and item.get('bundle_file_id'):
-                    bundle_file_id = item['bundle_file_id']
-                    expected_bundle_sha = item.get('bundle_sha256')
-                    break
-            if bundle_file_id:
+    recorded_bundle_id = None
+    recorded_bundle_sha = None
+    for snap_source in (journal.get('previous_snapshot'), status.get('previous_snapshot')):
+        if not isinstance(snap_source, list):
+            continue
+        for item in snap_source:
+            if isinstance(item, dict) and item.get('bundle_file_id'):
+                recorded_bundle_id = item['bundle_file_id']
+                recorded_bundle_sha = item.get('bundle_sha256')
                 break
+        if recorded_bundle_id:
+            break
+
+    if bundle_file_id is None:
+        bundle_file_id = recorded_bundle_id
+    expected_bundle_sha = recorded_bundle_sha
     if not bundle_file_id:
         raise RuntimeError('RESTORE_BUNDLE_NOT_FOUND')
 
@@ -2979,13 +3017,20 @@ def _resolve_restore_sources(
     members = extracted['members']
     if manifest.get('release_id') != plan['release_id']:
         raise ReleaseContractError('BUNDLE_RELEASE_ID_MISMATCH')
+    plan_bytes_sha = digest((root / 'plan.json').read_bytes())
+    if manifest.get('plan_sha256') != plan_bytes_sha:
+        raise ReleaseContractError('BUNDLE_PLAN_HASH_MISMATCH')
     status_before_raw = members.get('status.before.json')
     if status_before_raw is None or digest(status_before_raw) != plan['status_before_hash']:
+        raise RuntimeError('Frozen previous status was altered')
+    if local_status_before_raw is not None and status_before_raw != local_status_before_raw:
         raise RuntimeError('Frozen previous status was altered')
     before_by_id = {}
     for e in plan['entries']:
         b_data = members.get(e['before'])
         if b_data is None or digest(b_data) != e['before_hash']:
+            raise RuntimeError('Frozen local artifact was altered')
+        if e['id'] in local_before_by_id and b_data != local_before_by_id[e['id']]:
             raise RuntimeError('Frozen local artifact was altered')
         before_by_id[e['id']] = b_data
     return before_by_id, json.loads(status_before_raw)
