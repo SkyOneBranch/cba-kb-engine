@@ -32,7 +32,7 @@ DEFAULT_MAX_REDIRECTS = 5
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307})
 _ALLOWED_REDIRECT_SCHEMES = frozenset({"http", "https"})
 _SENSITIVE_REDIRECT_HEADERS = frozenset({"authorization", "proxy-authorization", "cookie"})
-_BODY_HEADERS = frozenset({"content-length", "content-type"})
+_BODY_HEADERS = frozenset({"content-length", "content-type", "content-encoding", "transfer-encoding"})
 
 
 class RequestsHttpResponse(dict):
@@ -68,8 +68,15 @@ def _same_origin(url_a: str, url_b: str) -> bool:
 
 def _validate_redirect_url(url: str) -> None:
     parsed = urlsplit(url)
-    if parsed.scheme.lower() not in _ALLOWED_REDIRECT_SCHEMES or not parsed.hostname:
-        raise ValueError("UNSAFE_REDIRECT_URL: redirect target must use http or https with a valid host")
+    if (
+        parsed.scheme.lower() not in _ALLOWED_REDIRECT_SCHEMES
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ValueError(
+            "UNSAFE_REDIRECT_URL: redirect target must use http or https with a valid host and no embedded credentials"
+        )
 
 
 def _strip_headers(headers: dict, names: frozenset[str]) -> dict:
@@ -93,6 +100,24 @@ def _needs_credential_free_transport(client) -> bool:
     )
 
 
+def _assert_credential_free_session(client, auth_client) -> None:
+    import requests
+
+    if (
+        client is auth_client
+        or type(client) is not requests.Session
+        or getattr(client, "credentials", None) is not None
+        or getattr(client, "auth", None) is not None
+        or any(
+            str(k).lower() in _SENSITIVE_REDIRECT_HEADERS
+            for k in dict(getattr(client, "headers", {}) or {})
+        )
+    ):
+        raise RuntimeError(
+            "UNAUTHENTICATED_CLIENT_NOT_ISOLATED: crossed-origin redirects require an independent credential-free requests.Session"
+        )
+
+
 def _header_get(headers, name: str):
     target = name.lower()
     for k, v in dict(headers or {}).items():
@@ -109,12 +134,11 @@ class RequestsHttp:
         session,
         timeout: float = DEFAULT_TIMEOUT_SEC,
         *,
-        unauthenticated_client=None,
         pool_connections: int = DEFAULT_POOL_CONNECTIONS,
         pool_maxsize: int = DEFAULT_POOL_MAXSIZE,
     ) -> None:
         self._http_client = session
-        self._unauth_client = unauthenticated_client
+        self._unauth_client = None
         self._pool_connections = pool_connections
         self._pool_maxsize = pool_maxsize
         self.timeout = timeout
@@ -130,6 +154,7 @@ class RequestsHttp:
 
             client = requests.Session()
             client.auth = None
+            client.trust_env = False
             adapter = HTTPAdapter(
                 pool_connections=self._pool_connections,
                 pool_maxsize=self._pool_maxsize,
@@ -137,6 +162,7 @@ class RequestsHttp:
             client.mount("https://", adapter)
             client.mount("http://", adapter)
             self._unauth_client = client
+        _assert_credential_free_session(self._unauth_client, self._http_client)
         return self._unauth_client
 
     def close(self) -> None:
@@ -164,10 +190,7 @@ class RequestsHttp:
         crossed_origin = False
 
         for hop in range(max_redirects + 1):
-            use_unauth = crossed_origin and (
-                self._unauth_client is not None
-                or _needs_credential_free_transport(self._http_client)
-            )
+            use_unauth = crossed_origin and _needs_credential_free_transport(self._http_client)
             if crossed_origin:
                 current_headers = _strip_sensitive_headers(current_headers)
             active_client = (
@@ -205,8 +228,9 @@ class RequestsHttp:
                 if not _same_origin(current_uri, next_uri) or not _same_origin(uri, next_uri):
                     crossed_origin = True
                     current_headers = _strip_sensitive_headers(current_headers)
-                if status == 303 and current_method.upper() not in ("GET", "HEAD"):
-                    current_method = "GET"
+                if status == 303:
+                    if current_method.upper() not in ("GET", "HEAD"):
+                        current_method = "GET"
                     current_body = None
                     current_headers = _strip_headers(current_headers, _BODY_HEADERS)
                 current_uri = next_uri

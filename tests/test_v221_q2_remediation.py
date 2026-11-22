@@ -276,6 +276,149 @@ def test_b1_same_origin_keeps_auth_303_clears_body_and_unsafe_scheme_rejected(mo
         http_bad.close()
 
 
+def test_b1a_http_303_discards_body_and_headers_for_get_and_head_with_real_authorized_session(monkeypatch):
+    """Every HTTP 303 (including GET/HEAD with body) must discard body and body headers."""
+    for orig_method, location, cross_origin in (
+        ("GET", "/drive/v3/files/redirected-get", False),
+        ("GET", "https://other-cdn.example/redirected-get", True),
+        ("HEAD", "/drive/v3/files/redirected-head", False),
+        ("HEAD", "https://other-cdn.example/redirected-head", True),
+    ):
+        creds = _SpyCredentials()
+        auth_client = drive_http.build_authorized_session(creds)
+        recorded_sends: List[Dict[str, Any]] = []
+        scripted = [
+            _make_requests_response(
+                303,
+                headers={"Location": location},
+                reason="See Other",
+            ),
+            _make_requests_response(200, content=b"" if orig_method == "HEAD" else b"ok", reason="OK"),
+        ]
+
+        def _fake_adapter_send(self, request, **kwargs):
+            recorded_sends.append({
+                "method": request.method,
+                "url": request.url,
+                "body": request.body,
+                "headers": _lower_headers(request.headers),
+            })
+            resp = scripted.pop(0)
+            resp.request = request
+            return resp
+
+        monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", _fake_adapter_send)
+
+        http = drive_http.RequestsHttp(auth_client)
+        try:
+            resp, _ = http.request(
+                "https://www.googleapis.com/drive/v3/files/start",
+                method=orig_method,
+                body=b"stale-body-payload",
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": "18",
+                    "Content-Encoding": "identity",
+                    "Accept": "*/*",
+                },
+            )
+            assert resp.status == 200
+            assert len(recorded_sends) == 2
+
+            hop1 = recorded_sends[1]
+            assert hop1["method"] == orig_method
+            assert hop1["body"] is None
+            assert "content-type" not in hop1["headers"]
+            assert "content-length" not in hop1["headers"]
+            assert "content-encoding" not in hop1["headers"]
+            assert hop1["headers"].get("accept") == "*/*"
+
+            if cross_origin:
+                assert len(creds.before_request_urls) == 1
+                assert "authorization" not in hop1["headers"]
+            else:
+                assert len(creds.before_request_urls) == 2
+                assert "authorization" in hop1["headers"]
+        finally:
+            http.close()
+
+
+def test_b1b_unauthenticated_client_injection_removed_and_tampered_slot_fails_closed(monkeypatch):
+    """RequestsHttp must not allow injecting an authenticated client for crossed-origin hops."""
+    creds = _SpyCredentials()
+    auth_client = drive_http.build_authorized_session(creds)
+    try:
+        # 1. Public constructor rejects unauthenticated_client injection outright
+        with pytest.raises(TypeError):
+            drive_http.RequestsHttp(auth_client, unauthenticated_client=auth_client)
+
+        # 2. Defense-in-depth: even if internal slot is tampered to AuthorizedSession or
+        #    credentialed Session, crossing origins fails closed with 0 extra before_request calls
+        for case_kind in ("same_auth", "header_auth"):
+            creds_case = _SpyCredentials()
+            auth_case = drive_http.build_authorized_session(creds_case)
+            scripted = [
+                _make_requests_response(
+                    302,
+                    headers={"Location": "https://other-origin.example/secret"},
+                    reason="Found",
+                ),
+                _make_requests_response(200, content=b"should-never-send", reason="OK"),
+            ]
+            sends: List[str] = []
+
+            def _fake_adapter_send(self, request, **kwargs):
+                sends.append(request.url)
+                resp = scripted.pop(0)
+                resp.request = request
+                return resp
+
+            monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", _fake_adapter_send)
+
+            http = drive_http.RequestsHttp(auth_case)
+            bad_client = auth_case if case_kind == "same_auth" else _make_credentialed_plain_session()
+            http._unauth_client = bad_client
+            try:
+                with pytest.raises(RuntimeError, match="UNAUTHENTICATED_CLIENT_NOT_ISOLATED"):
+                    http.request("https://www.googleapis.com/drive/v3/files/start")
+                assert len(creds_case.before_request_urls) == 1
+                assert sends == ["https://www.googleapis.com/drive/v3/files/start"]
+            finally:
+                http._unauth_client = None
+                if bad_client is not auth_case:
+                    bad_client.close()
+                http.close()
+
+        # 3. Embedded userinfo credentials in redirect URL fail closed
+        creds_ui = _SpyCredentials()
+        auth_ui = drive_http.build_authorized_session(creds_ui)
+        unsafe_loc = "https://" + "u" + ":" + "p" + "@other.example/file"
+        scripted_ui = [
+            _make_requests_response(302, headers={"Location": unsafe_loc}, reason="Found"),
+        ]
+
+        def _fake_send_ui(self, request, **kwargs):
+            resp = scripted_ui.pop(0)
+            resp.request = request
+            return resp
+
+        monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", _fake_send_ui)
+        http_ui = drive_http.RequestsHttp(auth_ui)
+        try:
+            with pytest.raises(ValueError, match="UNSAFE_REDIRECT_URL"):
+                http_ui.request("https://www.googleapis.com/drive/v3/files/ui")
+        finally:
+            http_ui.close()
+    finally:
+        auth_client.close()
+
+
+def _make_credentialed_plain_session() -> requests.Session:
+    client = requests.Session()
+    client.headers["Authorization"] = "Bearer [REDACTED]"
+    return client
+
+
 # ---------------------------------------------------------------------------
 # B2: restore() must verify ALL existing local frozen files before bundle fallback
 # ---------------------------------------------------------------------------
