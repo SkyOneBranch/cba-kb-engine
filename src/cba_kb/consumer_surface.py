@@ -65,6 +65,12 @@ _CURATED_HISTORICAL_PINNED_KEYWORDS = (
     "杭州亚运会",
     "亚运会总结",
 )
+_CURATED_PROTECTED_EVENT_CLASSES = frozenset({
+    "注册与转会",
+    "伤病与名单",
+    "判罚与规则",
+    "联赛政策",
+})
 _CURATED_ACTIVE_COMPETITIVE_KEYWORDS = (
     "注册",
     "取消注册",
@@ -75,8 +81,13 @@ _CURATED_ACTIVE_COMPETITIVE_KEYWORDS = (
     "伤病",
     "大名单",
     "出征名单",
+    "集训名单",
+    "国家队",
     "#判罚解析#",
     "判罚解析",
+    "NBL-CBA",
+    "工作会议",
+    "规则对接",
 )
 
 DEFAULT_MAX_EXTERNAL_CITATIONS_PER_CARD = 10
@@ -656,6 +667,11 @@ def merge_operational_docs_into_consumer_index(
         raw_sha = bundle.get("raw_sha256") or bundle.get("file_sha256")
         persons = bundle.get("matched_persons")
         evidence_fields: Dict[str, Any] = {
+            k: v
+            for k, v in bundle.items()
+            if k != "_bundle_key" and k not in _REDACT_JSON_KEYS
+        }
+        evidence_fields.update({
             "doc_id": doc_id,
             "title": bundle.get("title"),
             "canonical_url": bundle.get("canonical_url"),
@@ -668,7 +684,7 @@ def merge_operational_docs_into_consumer_index(
             "matched_persons": list(persons) if isinstance(persons, list) else [],
             "disclosure_posture": bundle.get("disclosure_posture"),
             "layer": "evidence",
-        }
+        })
         if doc_id in index_by_doc_id:
             existing_entry = dict(merged_docs[index_by_doc_id[doc_id]])
             existing_entry.update(evidence_fields)
@@ -1067,6 +1083,29 @@ def export_domestic_registration_diff_csv(
     return out.getvalue().encode("utf-8-sig")
 
 
+def _is_protected_operational_announcement(
+    bundle: Dict[str, Any], *, event_class: str, combined: str
+) -> bool:
+    if event_class in _CURATED_PROTECTED_EVENT_CLASSES:
+        return True
+    return any(kw in combined for kw in _CURATED_ACTIVE_COMPETITIVE_KEYWORDS)
+
+
+def _explicit_historical_pinned_reason(
+    bundle: Dict[str, Any], *, event_class: str, combined: str
+) -> Optional[str]:
+    if bundle.get("is_pinned") is True or bundle.get("pinned") is True:
+        return "out_of_window_historical_pinned:pinned_flag"
+    if event_class == "历史总结":
+        return "out_of_window_historical_pinned:historical_summary"
+    for kw in _CURATED_HISTORICAL_PINNED_KEYWORDS:
+        if kw in combined:
+            return f"out_of_window_historical_pinned:{kw}"
+    if "置顶" in combined:
+        return "out_of_window_historical_pinned:置顶"
+    return None
+
+
 def _denoising_filter_reason(
     bundle: Dict[str, Any], *, active_window_start: str
 ) -> Optional[str]:
@@ -1088,14 +1127,24 @@ def _denoising_filter_reason(
     if "唁电" in combined and not any(kw in combined for kw in _CURATED_ACTIVE_COMPETITIVE_KEYWORDS):
         return "noise_non_active_condolence"
 
+    pinned_reason = _explicit_historical_pinned_reason(
+        bundle, event_class=event_class, combined=combined
+    )
     pub_date = _normalize_date_prefix(bundle.get("published_at"))
     if pub_date is not None:
         if pub_date < active_window_start:
+            if pinned_reason is not None:
+                return pinned_reason
+            if _is_protected_operational_announcement(
+                bundle, event_class=event_class, combined=combined
+            ):
+                return None
             return f"out_of_window_published_at:{pub_date}<{active_window_start}"
-    else:
         for kw in _CURATED_HISTORICAL_PINNED_KEYWORDS:
             if kw in combined:
                 return f"out_of_window_historical_pinned:{kw}"
+    elif pinned_reason is not None:
+        return pinned_reason
 
     return None
 

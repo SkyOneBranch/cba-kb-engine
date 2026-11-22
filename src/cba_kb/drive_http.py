@@ -20,6 +20,7 @@ Security & correctness invariants:
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import os
 import socket
 import ssl
@@ -91,10 +92,26 @@ def _env_var_case_insensitive(name: str) -> str:
     return ""
 
 
+def _parse_ip_address(value: str):
+    cleaned = value.strip()
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        cleaned = cleaned[1:-1]
+    if "%" in cleaned:
+        cleaned = cleaned.split("%", 1)[0]
+    try:
+        return ipaddress.ip_address(cleaned)
+    except ValueError:
+        return None
+
+
 def _should_bypass_proxy(hostname: str, port: int | None, no_proxy_raw: str) -> bool:
     if not no_proxy_raw:
         return False
-    host = hostname.lower().rstrip(".")
+    host = hostname.strip().lower().rstrip(".")
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    target_ip = _parse_ip_address(host)
+
     for raw_entry in no_proxy_raw.split(","):
         entry = raw_entry.strip().lower()
         if not entry:
@@ -108,8 +125,13 @@ def _should_bypass_proxy(hostname: str, port: int | None, no_proxy_raw: str) -> 
                 continue
             entry_host = entry[1:bracket_end]
             rest = entry[bracket_end + 1:]
-            if rest.startswith(":") and rest[1:].isdigit():
-                entry_port = int(rest[1:])
+            if rest:
+                if rest.startswith(":") and rest[1:].isdigit():
+                    entry_port = int(rest[1:])
+                else:
+                    continue
+        elif "/" in entry:
+            entry_host = entry
         elif entry.count(":") == 1:
             entry_host, port_str = entry.split(":", 1)
             if port_str.isdigit():
@@ -118,8 +140,27 @@ def _should_bypass_proxy(hostname: str, port: int | None, no_proxy_raw: str) -> 
                 continue
         else:
             entry_host = entry
+
         if entry_port is not None and port != entry_port:
             continue
+
+        if "/" in entry_host:
+            if target_ip is None:
+                continue
+            try:
+                network = ipaddress.ip_network(entry_host, strict=False)
+            except ValueError:
+                continue
+            if target_ip.version == network.version and target_ip in network:
+                return True
+            continue
+
+        entry_ip = _parse_ip_address(entry_host)
+        if entry_ip is not None:
+            if target_ip is not None and target_ip == entry_ip:
+                return True
+            continue
+
         normalized = entry_host.lstrip(".").rstrip(".")
         if not normalized:
             continue

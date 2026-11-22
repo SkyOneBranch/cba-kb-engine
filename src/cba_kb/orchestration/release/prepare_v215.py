@@ -1085,15 +1085,34 @@ def _content_preserving_candidate(
         for key in sorted(id_by_key)
     )
     release_spec = _release_spec(release_id)
+    if release_id in V215_RELEASE_SPECS:
+        include_curated_v222 = bool(release_spec.get("enable_curated_compact_surface_v222"))
+    else:
+        ver_match = re.match(r"^v(\d+)\.(\d+)\.(\d+)", str(release_id or "").strip())
+        include_curated_v222 = bool(
+            ver_match
+            and (int(ver_match.group(1)), int(ver_match.group(2)), int(ver_match.group(3))) >= (2, 2, 2)
+        )
     consumer_guide = render_consumer_surface_guide_section(
         release_id=release_id,
         master_row_count=master_row_count,
         include_collector_digest=bool(release_spec.get("enable_operational_kb_v220")),
-        include_curated_csvs=bool(release_spec.get("enable_curated_compact_surface_v222")),
+        include_curated_csvs=include_curated_v222,
     )
-    master_count_stamp = (
-        f"权威国内注册主表规模：{master_row_count:,} 行（2017-2027 权威总表，精确行数 {master_row_count}）"
-    )
+    if include_curated_v222:
+        master_count_stamp = (
+            f"权威国内注册主表规模：{master_row_count:,} 行（2017-2027 权威总表，精确行数 {master_row_count}）"
+        )
+        header_stamp = (
+            f"当前发布：{release_id}\n"
+            f"代码提交：{engine_sha}\n"
+            f"{master_count_stamp}\n\n"
+        )
+    else:
+        header_stamp = (
+            f"当前发布：{release_id}\n\n"
+            f"代码提交：{engine_sha}\n\n"
+        )
     if logical_key == "entry/context":
         operations = (
             Path(engine_root) / "docs/OPERATIONS_V1_5.md"
@@ -1103,9 +1122,7 @@ def _content_preserving_candidate(
         ).read_text()
         body_text = (
             f"# {title}\n\n"
-            f"当前发布：{release_id}\n"
-            f"代码提交：{engine_sha}\n"
-            f"{master_count_stamp}\n\n"
+            f"{header_stamp}"
             "读取前请校验 release_status；"
             "PUBLISHING/FAILED/ROLLING_BACK 时使用上一快照。\n\n"
             f"代码镜像：https://github.com/SkyOneBranch/cba-kb-engine/tree/{engine_sha}\n\n"
@@ -1144,9 +1161,7 @@ def _content_preserving_candidate(
         )
     return (
         f"# {title}\n\n"
-        f"当前发布：{release_id}\n"
-        f"代码提交：{engine_sha}\n"
-        f"{master_count_stamp}\n\n"
+        f"{header_stamp}"
         "读取前请校验 release_status；"
         "PUBLISHING/FAILED/ROLLING_BACK 时使用上一快照。\n\n"
         f"代码镜像：https://github.com/SkyOneBranch/cba-kb-engine/tree/{engine_sha}\n\n"
