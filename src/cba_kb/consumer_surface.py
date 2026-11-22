@@ -38,6 +38,46 @@ CONSUMER_DICTIONARY_FILENAME = "CBA_核心数据表字段字典与权威口径_C
 CONSUMER_SOURCE_REGISTRY_FILENAME = "CBA_来源注册索引_脱敏视图_CURRENT.csv"
 CONSUMER_DOC_INDEX_FILENAME = "CBA_文档索引_脱敏视图_CURRENT.json"
 COLLECTOR_DIGEST_FILENAME = "CBA_官方采集动态与注册增量摘要_CURRENT.md"
+FOREIGN_REGISTRATION_CSV_FILENAME = "CBA_外籍球员注册官方快照_CURRENT.csv"
+DOMESTIC_REG_DIFF_CSV_FILENAME = "CBA_跨季国内球员注册增量观测_2025-2027_CURRENT.csv"
+COLLECTOR_DIGEST_MAX_BYTES = 25 * 1024
+
+_EVIDENCE_LAYER_LABEL = "evidence / candidate_observation"
+_DEFAULT_STATEMENT_NOTICE = (
+    "Candidate observation derived from official public CBA captures. "
+    "Statement != Fact. Evidence != Fact. Unknown != 0."
+)
+_RELEASE_SEMVER_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)")
+_ISO_DATE_PREFIX_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+_MD_SEP_CELL_RE = re.compile(r"^:?-{2,}:?$")
+
+_CURATED_NOISE_KEYWORDS = (
+    "每日预言家",
+    "每日名场面",
+    "图文征集",
+    "我和我的篮球",
+    "有奖互动",
+    "抽奖",
+    "投票评选",
+    "最佳高光",
+)
+_CURATED_HISTORICAL_PINNED_KEYWORDS = (
+    "杭州亚运会",
+    "亚运会总结",
+)
+_CURATED_ACTIVE_COMPETITIVE_KEYWORDS = (
+    "注册",
+    "取消注册",
+    "签约",
+    "裁员",
+    "试训",
+    "伤情",
+    "伤病",
+    "大名单",
+    "出征名单",
+    "#判罚解析#",
+    "判罚解析",
+)
 
 DEFAULT_MAX_EXTERNAL_CITATIONS_PER_CARD = 10
 
@@ -288,11 +328,25 @@ def _should_include_collector_digest(
     return isinstance(release_id, str) and release_id.startswith("v2.2")
 
 
+def _should_include_curated_csvs(
+    release_id: str, include_curated_csvs: Optional[bool]
+) -> bool:
+    if include_curated_csvs is not None:
+        return bool(include_curated_csvs)
+    if not isinstance(release_id, str):
+        return False
+    m = _RELEASE_SEMVER_RE.match(release_id.strip())
+    if not m:
+        return False
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) >= (2, 2, 2)
+
+
 def render_consumer_surface_guide_section(
     *,
     release_id: str,
     master_row_count: int,
     include_collector_digest: Optional[bool] = None,
+    include_curated_csvs: Optional[bool] = None,
 ) -> str:
     """Render standardized consumer-surface guide block with exact dynamic MASTER count."""
     exact_count = _require_positive_master_row_count(master_row_count)
@@ -312,6 +366,11 @@ def render_consumer_surface_guide_section(
             f"  - `{CONSUMER_DOC_INDEX_FILENAME}`（已合并最新受控采集文档索引的脱敏视图，隐去物理 Drive ID、`file_id` 与本地路径）",
             f"  - `{COLLECTOR_DIGEST_FILENAME}`（`evidence / candidate_observation` 层级官方采集动态与注册增量摘要：含 2026-2027 外籍球员注册快照、近三赛季国内注册与跨季增量比对及官方公告摘要；**遵守 `Statement != Fact. Evidence != Fact. Unknown != 0.`，不得直接视作已晋升的 `canonical` 事实**）",
         ])
+    if _should_include_curated_csvs(release_id, include_curated_csvs):
+        lines.extend([
+            f"  - `{FOREIGN_REGISTRATION_CSV_FILENAME}`（`evidence / candidate_observation` 层级 2026-2027 外籍球员官方注册快照结构化 UTF-8-SIG CSV，推荐使用 Python CSV 直接读取解析）",
+            f"  - `{DOMESTIC_REG_DIFF_CSV_FILENAME}`（`evidence / candidate_observation` 层级 2025-2026 → 2026-2027 跨季国内球员注册增量观测结构化 UTF-8-SIG CSV，推荐使用 Python CSV 直接读取解析）",
+        ])
     lines.extend([
         "- **人物研究切片（`CURRENT` 正式入列）**：正式上线的已授权球员研究卡采用 `研究卡_<中文姓名>_<球员ID>_<赛季>_CURRENT.md`（及对应 `研究切片_..._CURRENT.md`、`研究摘录_..._CURRENT.md`）命名并置于 `current`；全联盟通用赛季技术统计总表与球员人民币精确薪资未在公开事实层发布，未入列对象一律按 `UNKNOWN` 诚实拒答（`Unknown != 0`）。",
         "- **关键字段语义消歧（严禁跨表混淆）**：",
@@ -327,10 +386,12 @@ def render_consumer_field_dictionary_md(
     engine_sha: str,
     master_row_count: int,
     include_collector_digest: Optional[bool] = None,
+    include_curated_csvs: Optional[bool] = None,
 ) -> bytes:
     """Generate the self-describing CURRENT consumer field dictionary Markdown document."""
     exact_count = _require_positive_master_row_count(master_row_count)
     include_digest = _should_include_collector_digest(release_id, include_collector_digest)
+    include_csvs = _should_include_curated_csvs(release_id, include_curated_csvs)
     lines = [
         f"# CBA-KB 核心数据表字段字典与权威口径（{release_id} / CURRENT）",
         "",
@@ -354,6 +415,11 @@ def render_consumer_field_dictionary_md(
             f"| `{CONSUMER_DOC_INDEX_FILENAME}` | `control / metadata` | 官方文档脱敏索引（含 `consumed_bundles` 合并视图，隐去原始 Drive ID、`file_id` 与本地路径） |",
             f"| `{COLLECTOR_DIGEST_FILENAME}` | `evidence / candidate_observation` | 受控官方采集动态与注册增量摘要（2026-2027 外籍注册快照、三赛季国内注册与跨季 `25-26 -> 26-27` 增量观察、官方公告摘录；`Statement != Fact. Evidence != Fact. Unknown != 0.`） |",
         ])
+    if include_csvs:
+        lines.extend([
+            f"| `{FOREIGN_REGISTRATION_CSV_FILENAME}` | `evidence / candidate_observation` | 2026-2027 外籍球员官方注册快照结构化 UTF-8-SIG CSV（推荐 Python CSV 读取；`Statement != Fact. Evidence != Fact. Unknown != 0.`） |",
+            f"| `{DOMESTIC_REG_DIFF_CSV_FILENAME}` | `evidence / candidate_observation` | 跨季国内球员注册增量观测结构化 UTF-8-SIG CSV（含 `TRANSFERRED` / `CONTRACT_CHANGED` / `ADDED` / `REMOVED`，推荐 Python CSV 读取） |",
+        ])
     lines.extend([
         "| `研究卡_<中文姓名>_<球员ID>_<赛季>_CURRENT.md` | `research` | 已获授权并正式入列 `current` 的人物技术统计与多源证据研究卡（仅限已入列切片，未入列球员统计与精确薪资均属 `UNKNOWN`） |",
         "",
@@ -373,6 +439,11 @@ def render_consumer_field_dictionary_md(
     if include_digest:
         lines.append(
             f"3. `{COLLECTOR_DIGEST_FILENAME}` 属于 `evidence / candidate_observation` 证据观察层，引用时须显式区分官方公告/候选项与 `canonical` 主表事实（`Statement != Fact. Evidence != Fact. Unknown != 0.`）。"
+        )
+    if include_csvs:
+        step_no = 4 if include_digest else 3
+        lines.append(
+            f"{step_no}. 检索外籍球员注册明细与跨季国内注册增量时，优先使用 Python CSV 工具直接读取 `{FOREIGN_REGISTRATION_CSV_FILENAME}` 与 `{DOMESTIC_REG_DIFF_CSV_FILENAME}`，避免依赖大篇幅 Markdown 表格截断。"
         )
     lines.extend([
         "",
@@ -751,6 +822,467 @@ def _render_digest_reg_diff_section(reg_diff: Dict[str, Any]) -> list[str]:
     return lines
 
 
+def _normalize_date_prefix(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat") and callable(value.isoformat):
+        text = str(value.isoformat()).strip()
+    elif isinstance(value, str):
+        text = value.strip()
+    else:
+        return None
+    if not text:
+        return None
+    m = _ISO_DATE_PREFIX_RE.match(text)
+    return m.group(1) if m else None
+
+
+def _ensure_statement_notice(notice: Optional[str]) -> str:
+    text = str(notice or "").strip()
+    if not text:
+        return _DEFAULT_STATEMENT_NOTICE
+    required = ("Statement != Fact", "Evidence != Fact", "Unknown != 0")
+    if all(tok in text for tok in required):
+        return text
+    return f"{text} Statement != Fact. Evidence != Fact. Unknown != 0."
+
+
+def _parse_foreign_registration_rows(bundle: Dict[str, Any]) -> list[Dict[str, str]]:
+    """Extract structured foreign player registration rows from a markdown table body."""
+    body = str(bundle.get("body") or "")
+    rows: list[Dict[str, str]] = []
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("|") or not line.endswith("|"):
+            continue
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if not cells or all(not c or _MD_SEP_CELL_RE.match(c) for c in cells):
+            continue
+        first = cells[0]
+        if first == "俱乐部" or "外籍球员" in cells:
+            continue
+        if len(cells) >= 6:
+            club, player_en, player_zh, nationality, position, jersey_number = cells[:6]
+        elif len(cells) == 5:
+            club, player_en, nationality, position, jersey_number = cells[:5]
+            player_zh = ""
+        else:
+            continue
+        if not club and not player_en and not player_zh:
+            continue
+        rows.append({
+            "club": club,
+            "player_en": player_en,
+            "player_zh": player_zh,
+            "nationality": nationality,
+            "position": position,
+            "jersey_number": jersey_number,
+        })
+    return rows
+
+
+def export_foreign_players_registration_csv(
+    *,
+    bundles: Sequence[Dict[str, Any]],
+    known_drive_ids: Sequence[str] = (),
+) -> bytes:
+    """Deterministically export foreign player registration snapshots to UTF-8-SIG CSV."""
+    fieldnames = [
+        "layer",
+        "statement_notice",
+        "snapshot_title",
+        "published_at",
+        "club",
+        "player_en",
+        "player_zh",
+        "nationality",
+        "position",
+        "jersey_number",
+        "doc_id",
+        "source_tier",
+        "raw_sha256",
+    ]
+    prov_re = _compile_provenance_pattern(known_drive_ids)
+    sorted_bundles = sorted(
+        (dict(b) for b in (bundles or ()) if isinstance(b, dict)),
+        key=_bundle_sort_key,
+    )
+    out = io.StringIO(newline="")
+    writer = csv.DictWriter(out, fieldnames=fieldnames, lineterminator="\n")
+    writer.writeheader()
+    for b in sorted_bundles:
+        if _classify_digest_bundle(b) != "foreign_registration":
+            continue
+        parsed_rows = _parse_foreign_registration_rows(b)
+        snapshot_title = str(b.get("title") or b.get("doc_id") or "")
+        published_at = str(b.get("published_at") or "")
+        doc_id = str(b.get("doc_id") or "")
+        source_tier = str(b.get("source_tier") or "")
+        raw_sha256 = str(b.get("raw_sha256") or "")
+        for parsed in parsed_rows:
+            row = {
+                "layer": _EVIDENCE_LAYER_LABEL,
+                "statement_notice": _DEFAULT_STATEMENT_NOTICE,
+                "snapshot_title": _scrub_with_pattern(snapshot_title, prov_re),
+                "published_at": _scrub_with_pattern(published_at, prov_re),
+                "club": _scrub_with_pattern(parsed["club"], prov_re),
+                "player_en": _scrub_with_pattern(parsed["player_en"], prov_re),
+                "player_zh": _scrub_with_pattern(parsed["player_zh"], prov_re),
+                "nationality": _scrub_with_pattern(parsed["nationality"], prov_re),
+                "position": _scrub_with_pattern(parsed["position"], prov_re),
+                "jersey_number": _scrub_with_pattern(parsed["jersey_number"], prov_re),
+                "doc_id": _scrub_with_pattern(doc_id, prov_re),
+                "source_tier": _scrub_with_pattern(source_tier, prov_re),
+                "raw_sha256": _scrub_with_pattern(raw_sha256, prov_re),
+            }
+            writer.writerow(row)
+    return out.getvalue().encode("utf-8-sig")
+
+
+def export_domestic_registration_diff_csv(
+    *,
+    reg_diff: Optional[Dict[str, Any]],
+    known_drive_ids: Sequence[str] = (),
+) -> bytes:
+    """Deterministically export cross-season domestic registration diff to UTF-8-SIG CSV."""
+    fieldnames = [
+        "layer",
+        "statement_notice",
+        "change_type",
+        "player",
+        "old_club",
+        "new_club",
+        "old_contract_type",
+        "new_contract_type",
+        "change_details",
+        "old_snapshot_sha256",
+        "new_snapshot_sha256",
+    ]
+    prov_re = _compile_provenance_pattern(known_drive_ids)
+    diff = reg_diff if isinstance(reg_diff, dict) else {}
+    notice = _ensure_statement_notice(diff.get("statement_notice"))
+    old_sha = str((diff.get("old_bundle") or {}).get("raw_sha256") or "")
+    new_sha = str((diff.get("new_bundle") or {}).get("raw_sha256") or "")
+
+    rows: list[Dict[str, str]] = []
+
+    def _row_sort_key(r: Dict[str, str]) -> tuple[str, str, str, str]:
+        return (r["player"], r["old_club"], r["new_club"], r["change_details"])
+
+    transferred_rows: list[Dict[str, str]] = []
+    for item in diff.get("transferred_players") or ():
+        if not isinstance(item, dict):
+            continue
+        old_ct = str(item.get("old_contract_type") or "")
+        new_ct = str(item.get("new_contract_type") or "")
+        details = f"合同类别: {old_ct} → {new_ct}" if (old_ct or new_ct) else ""
+        transferred_rows.append({
+            "change_type": "TRANSFERRED",
+            "player": str(item.get("player") or ""),
+            "old_club": str(item.get("from_club") or ""),
+            "new_club": str(item.get("to_club") or ""),
+            "old_contract_type": old_ct,
+            "new_contract_type": new_ct,
+            "change_details": details,
+        })
+    rows.extend(sorted(transferred_rows, key=_row_sort_key))
+
+    changed_rows: list[Dict[str, str]] = []
+    for item in diff.get("contract_changed_players") or ():
+        if not isinstance(item, dict):
+            continue
+        changed_fields = item.get("changed_fields") or {}
+        ct_delta = changed_fields.get("合同类别") if isinstance(changed_fields, dict) else None
+        old_ct = str((ct_delta or {}).get("old") or "") if isinstance(ct_delta, dict) else ""
+        new_ct = str((ct_delta or {}).get("new") or "") if isinstance(ct_delta, dict) else ""
+        detail_parts = []
+        if isinstance(changed_fields, dict):
+            for fname in sorted(changed_fields):
+                delta = changed_fields[fname] or {}
+                if isinstance(delta, dict):
+                    detail_parts.append(f"{fname}: {delta.get('old', '—')} → {delta.get('new', '—')}")
+        club = str(item.get("club") or "")
+        changed_rows.append({
+            "change_type": "CONTRACT_CHANGED",
+            "player": str(item.get("player") or ""),
+            "old_club": club,
+            "new_club": club,
+            "old_contract_type": old_ct,
+            "new_contract_type": new_ct,
+            "change_details": "；".join(detail_parts),
+        })
+    rows.extend(sorted(changed_rows, key=_row_sort_key))
+
+    added_rows: list[Dict[str, str]] = []
+    for item in diff.get("added_players") or ():
+        if not isinstance(item, dict):
+            continue
+        fields = item.get("fields") if isinstance(item.get("fields"), dict) else {}
+        detail_parts = [f"{k}={fields[k]}" for k in sorted(fields) if fields[k]]
+        added_rows.append({
+            "change_type": "ADDED",
+            "player": str(item.get("player") or ""),
+            "old_club": "",
+            "new_club": str(item.get("club") or ""),
+            "old_contract_type": "",
+            "new_contract_type": str(fields.get("合同类别") or ""),
+            "change_details": "；".join(detail_parts),
+        })
+    rows.extend(sorted(added_rows, key=_row_sort_key))
+
+    removed_rows: list[Dict[str, str]] = []
+    for item in diff.get("removed_players") or ():
+        if not isinstance(item, dict):
+            continue
+        fields = item.get("fields") if isinstance(item.get("fields"), dict) else {}
+        detail_parts = [f"{k}={fields[k]}" for k in sorted(fields) if fields[k]]
+        removed_rows.append({
+            "change_type": "REMOVED",
+            "player": str(item.get("player") or ""),
+            "old_club": str(item.get("club") or ""),
+            "new_club": "",
+            "old_contract_type": str(fields.get("合同类别") or ""),
+            "new_contract_type": "",
+            "change_details": "；".join(detail_parts),
+        })
+    rows.extend(sorted(removed_rows, key=_row_sort_key))
+
+    out = io.StringIO(newline="")
+    writer = csv.DictWriter(out, fieldnames=fieldnames, lineterminator="\n")
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({
+            "layer": _EVIDENCE_LAYER_LABEL,
+            "statement_notice": _scrub_with_pattern(notice, prov_re),
+            "change_type": r["change_type"],
+            "player": _scrub_with_pattern(r["player"], prov_re),
+            "old_club": _scrub_with_pattern(r["old_club"], prov_re),
+            "new_club": _scrub_with_pattern(r["new_club"], prov_re),
+            "old_contract_type": _scrub_with_pattern(r["old_contract_type"], prov_re),
+            "new_contract_type": _scrub_with_pattern(r["new_contract_type"], prov_re),
+            "change_details": _scrub_with_pattern(r["change_details"], prov_re),
+            "old_snapshot_sha256": _scrub_with_pattern(old_sha, prov_re),
+            "new_snapshot_sha256": _scrub_with_pattern(new_sha, prov_re),
+        })
+    return out.getvalue().encode("utf-8-sig")
+
+
+def _denoising_filter_reason(
+    bundle: Dict[str, Any], *, active_window_start: str
+) -> Optional[str]:
+    """Return a non-empty filter reason if an announcement should be excluded from curated .md."""
+    kind = _classify_digest_bundle(bundle)
+    if kind in ("foreign_registration", "domestic_registration"):
+        return None
+
+    title = str(bundle.get("title") or "")
+    body = str(bundle.get("body") or "")
+    event_class = str(bundle.get("event_class") or "")
+    combined = f"{title}\n{body}"
+
+    if event_class == "社媒互动":
+        return "noise_social_interaction"
+    for kw in _CURATED_NOISE_KEYWORDS:
+        if kw in combined:
+            return f"noise_keyword:{kw}"
+    if "唁电" in combined and not any(kw in combined for kw in _CURATED_ACTIVE_COMPETITIVE_KEYWORDS):
+        return "noise_non_active_condolence"
+
+    pub_date = _normalize_date_prefix(bundle.get("published_at"))
+    if pub_date is not None:
+        if pub_date < active_window_start:
+            return f"out_of_window_published_at:{pub_date}<{active_window_start}"
+    else:
+        for kw in _CURATED_HISTORICAL_PINNED_KEYWORDS:
+            if kw in combined:
+                return f"out_of_window_historical_pinned:{kw}"
+
+    return None
+
+
+def filter_curated_operational_announcements(
+    bundles: Sequence[Dict[str, Any]],
+    *,
+    active_window_start: str = "2025-07-01",
+) -> Dict[str, Any]:
+    """Deterministically partition operational bundles into admitted and filtered sets."""
+    sorted_bundles = sorted(
+        (dict(b) for b in (bundles or ()) if isinstance(b, dict)),
+        key=_bundle_sort_key,
+    )
+    admitted: list[Dict[str, Any]] = []
+    filtered: list[Dict[str, Any]] = []
+    reasons_by_doc_id: Dict[str, str] = {}
+    for b in sorted_bundles:
+        reason = _denoising_filter_reason(b, active_window_start=active_window_start)
+        if reason is None:
+            admitted.append(b)
+        else:
+            filtered.append(b)
+            doc_id = str(b.get("doc_id") or "")
+            if doc_id:
+                reasons_by_doc_id[doc_id] = reason
+    return {
+        "admitted": admitted,
+        "filtered": filtered,
+        "total_count": len(sorted_bundles),
+        "admitted_count": len(admitted),
+        "filtered_count": len(filtered),
+        "reasons_by_doc_id": reasons_by_doc_id,
+    }
+
+
+def _render_compact_curated_digest_md(
+    *,
+    bundles: Sequence[Dict[str, Any]],
+    reg_diff: Optional[Dict[str, Any]],
+    release_id: str,
+    engine_sha: str,
+    known_drive_ids: Sequence[str],
+    max_bytes: int,
+    active_window_start: str,
+) -> bytes:
+    """Render <25KB curated collector digest with CSV routing & fail-closed size gate."""
+    filtered_res = filter_curated_operational_announcements(
+        bundles, active_window_start=active_window_start
+    )
+    admitted = filtered_res["admitted"]
+    total_count = filtered_res["total_count"]
+    admitted_count = filtered_res["admitted_count"]
+    filtered_count = filtered_res["filtered_count"]
+
+    foreign_bundles: list[Dict[str, Any]] = []
+    domestic_bundles: list[Dict[str, Any]] = []
+    announcement_bundles: list[Dict[str, Any]] = []
+    for b in admitted:
+        kind = _classify_digest_bundle(b)
+        if kind == "foreign_registration":
+            foreign_bundles.append(b)
+        elif kind == "domestic_registration":
+            domestic_bundles.append(b)
+        else:
+            announcement_bundles.append(b)
+
+    lines: list[str] = [
+        f"# CBA 官方采集动态与注册增量摘要（{release_id} / CURRENT）",
+        "",
+        f"- **发布版本**: `{release_id}`",
+        f"- **代码基线 Commit**: `{engine_sha or 'unknown'}`",
+        f"- **数据层级声明**: `{_EVIDENCE_LAYER_LABEL}`（来源自受控官方采集束 `acquisition_bundle_v1` 与跨季增量比对，**非**已晋升的 `canonical` 事实表）",
+        "- **核心原则**: `Statement != Fact. Evidence != Fact. Unknown != 0.`",
+        (
+            f"- **采集文档入池与降噪统计**: 总计 **{total_count}** 份，"
+            f"精华摘要准入 **{admitted_count}** 份"
+            f"（外籍注册快照 {len(foreign_bundles)} 份、国内注册快照 {len(domestic_bundles)} 份、精选官方公告 {len(announcement_bundles)} 份），"
+            f"降噪过滤 **{filtered_count}** 份"
+            f"（全量 {total_count} 份文档脱敏元数据均 100% 完整保留于 `{CONSUMER_DOC_INDEX_FILENAME}`）"
+        ),
+        "- **结构化大表直读路由（推荐 Python CSV 读取）**:",
+        f"  - 外籍球员官方注册快照明细：`{FOREIGN_REGISTRATION_CSV_FILENAME}`（UTF-8-SIG，`{_EVIDENCE_LAYER_LABEL}`）",
+        f"  - 跨季国内球员注册增量明细：`{DOMESTIC_REG_DIFF_CSV_FILENAME}`（UTF-8-SIG，`{_EVIDENCE_LAYER_LABEL}`）",
+        "",
+        "## 1. 2026-2027 外籍球员注册官方快照概览",
+        "",
+    ]
+
+    if foreign_bundles:
+        total_foreign_rows = 0
+        for b in foreign_bundles:
+            parsed_count = len(_parse_foreign_registration_rows(b))
+            total_foreign_rows += parsed_count
+            lines.append(
+                f"- **{_md_cell(b.get('title') or b.get('doc_id'))}**"
+                f"（`doc_id`: `{b.get('doc_id')}` | `published_at`: `{b.get('published_at') or '—'}`"
+                f" | 解析外籍球员条目：**{parsed_count}** 条 | `raw_sha256`: `{b.get('raw_sha256') or '—'}`）"
+            )
+        lines.extend([
+            f"- 完整结构化外籍球员明细（共 **{total_foreign_rows}** 条）已拆分至 `{FOREIGN_REGISTRATION_CSV_FILENAME}`，请优先使用 Python CSV 直接读取。",
+            "",
+        ])
+    else:
+        lines.extend(["- （本次采集未包含外籍球员注册快照）", ""])
+
+    lines.extend([
+        "## 2. 近三赛季国内球员注册快照索引与跨季增量概览",
+        "",
+        "### 2.1 国内球员注册官方快照元数据索引（正文大表已去重，完整事实以 MASTER 总表为准）",
+        "",
+    ])
+    if domestic_bundles:
+        lines.extend([
+            "| doc_id | 标题 | 来源等级 | 发布日期 | raw_sha256 |",
+            "| --- | --- | --- | --- | --- |",
+        ])
+        for b in domestic_bundles:
+            lines.append(
+                f"| `{_md_cell(b.get('doc_id'))}` | {_md_cell(b.get('title'))} | "
+                f"`{_md_cell(b.get('source_tier'))}` | {_md_cell(b.get('published_at'))} | "
+                f"`{_md_cell(b.get('raw_sha256'))}` |"
+            )
+        lines.append("")
+    else:
+        lines.extend(["- （本次采集未包含国内球员注册快照）", ""])
+
+    lines.append("### 2.2 跨季国内球员注册增量观察统计（2025-2026 → 2026-2027）")
+    lines.append("")
+    if isinstance(reg_diff, dict):
+        summary = reg_diff.get("summary") or {}
+        old_b = reg_diff.get("old_bundle") or {}
+        new_b = reg_diff.get("new_bundle") or {}
+        lines.extend([
+            f"- **旧赛季基线**: `{old_b.get('title') or '2025-2026'}`（俱乐部 {old_b.get('clubs_count', '—')} 家，球员 {old_b.get('players_count', '—')} 人）",
+            f"- **新赛季快照**: `{new_b.get('title') or '2026-2027'}`（俱乐部 {new_b.get('clubs_count', '—')} 家，球员 {new_b.get('players_count', '—')} 人）",
+            (
+                f"- **增量统计**: 新增 `{summary.get('added_count', 0)}` 人、"
+                f"移除 `{summary.get('removed_count', 0)}` 人、"
+                f"转会/俱乐部变更 `{summary.get('transferred_count', 0)}` 人、"
+                f"合同字段变更 `{summary.get('contract_changed_count', 0)}` 人"
+            ),
+            f"- 完整结构化跨季增量明细（`TRANSFERRED` / `CONTRACT_CHANGED` / `ADDED` / `REMOVED`）已拆分至 `{DOMESTIC_REG_DIFF_CSV_FILENAME}`，请优先使用 Python CSV 直接读取。",
+            "",
+        ])
+    else:
+        lines.extend(["- （本次采集未包含跨季国内球员注册增量比对）", ""])
+
+    lines.extend([
+        f"## 3. 精选官方公告与赛事动态（降噪后 {len(announcement_bundles)} 份）",
+        "",
+    ])
+    if announcement_bundles:
+        for b in announcement_bundles:
+            persons = b.get("matched_persons") or []
+            persons_str = ", ".join(str(p) for p in persons) if persons else "—"
+            raw_body = " ".join(str(b.get("body") or "").split())
+            excerpt = raw_body if len(raw_body) <= 280 else raw_body[:280].rstrip() + "…"
+            lines.extend([
+                f"### {_md_cell(b.get('title') or b.get('doc_id'))}",
+                (
+                    f"- `doc_id`: `{b.get('doc_id')}` | `source_tier`: `{b.get('source_tier')}` | "
+                    f"`event_class`: `{b.get('event_class')}` | `published_at`: `{b.get('published_at') or '—'}` | "
+                    f"`matched_persons`: {persons_str}"
+                ),
+                f"- `canonical_url`: {b.get('canonical_url') or '—'} | `raw_sha256`: `{b.get('raw_sha256') or '—'}`",
+                f"- 摘要：{excerpt or '—'}",
+                "",
+            ])
+    else:
+        lines.extend(["- （降噪后暂无精选官方公告）", ""])
+
+    rendered = scrub_raw_drive_ids_for_consumer(
+        "\n".join(lines).rstrip() + "\n",
+        known_drive_ids=known_drive_ids,
+    )
+    if not rendered.endswith("\n"):
+        rendered += "\n"
+    rendered += "\nend_marker: true\n"
+    rendered_bytes = rendered.encode("utf-8")
+    if len(rendered_bytes) >= max_bytes:
+        raise ValueError(
+            f"COLLECTOR_DIGEST_SIZE_LIMIT_EXCEEDED: {len(rendered_bytes)} >= {max_bytes}"
+        )
+    return rendered_bytes
+
+
 def render_collector_official_digest_md(
     *,
     bundles: Sequence[Dict[str, Any]],
@@ -758,8 +1290,21 @@ def render_collector_official_digest_md(
     release_id: str = "v2.2.0-1",
     engine_sha: str = "",
     known_drive_ids: Sequence[str] = (),
+    compact_curated: bool = False,
+    max_bytes: int = COLLECTOR_DIGEST_MAX_BYTES,
+    active_window_start: str = "2025-07-01",
 ) -> bytes:
     """Deterministically render governed collector official digest Markdown in evidence layer."""
+    if compact_curated:
+        return _render_compact_curated_digest_md(
+            bundles=bundles,
+            reg_diff=reg_diff,
+            release_id=release_id,
+            engine_sha=engine_sha,
+            known_drive_ids=known_drive_ids,
+            max_bytes=max_bytes,
+            active_window_start=active_window_start,
+        )
     sorted_bundles = sorted((dict(b) for b in (bundles or ()) if isinstance(b, dict)), key=_bundle_sort_key)
 
     foreign_bundles: list[Dict[str, Any]] = []
@@ -1093,6 +1638,9 @@ def build_consumer_surface_targets_spec(
     doc_index_bytes: Optional[bytes] = None,
     collector_official_digest_bytes: Optional[bytes] = None,
     include_collector_digest: Optional[bool] = None,
+    foreign_registration_csv_bytes: Optional[bytes] = None,
+    domestic_reg_diff_csv_bytes: Optional[bytes] = None,
+    include_curated_csvs: Optional[bool] = None,
     promoted_research_artifacts: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Build declared consumer-surface target contents keyed by logical_key for Stage 4."""
@@ -1115,6 +1663,7 @@ def build_consumer_surface_targets_spec(
                 engine_sha=engine_sha,
                 master_row_count=row_count,
                 include_collector_digest=include_collector_digest,
+                include_curated_csvs=include_curated_csvs,
             ),
         },
         "consumer/source_registry_index_current.csv": {
@@ -1140,6 +1689,22 @@ def build_consumer_surface_targets_spec(
             "mode": "binary",
             "parent_role": "data",
             "content": collector_official_digest_bytes,
+        }
+    if foreign_registration_csv_bytes is not None:
+        targets["consumer/foreign_players_registration_current.csv"] = {
+            "name": FOREIGN_REGISTRATION_CSV_FILENAME,
+            "mime": "text/csv",
+            "mode": "binary",
+            "parent_role": "data",
+            "content": foreign_registration_csv_bytes,
+        }
+    if domestic_reg_diff_csv_bytes is not None:
+        targets["consumer/domestic_registration_diff_current.csv"] = {
+            "name": DOMESTIC_REG_DIFF_CSV_FILENAME,
+            "mime": "text/csv",
+            "mode": "binary",
+            "parent_role": "data",
+            "content": domestic_reg_diff_csv_bytes,
         }
     if promoted_research_artifacts:
         for key, spec in sorted(promoted_research_artifacts.items()):

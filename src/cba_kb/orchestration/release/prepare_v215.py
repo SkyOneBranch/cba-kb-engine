@@ -30,6 +30,8 @@ from cba_kb.consumer_surface import (  # noqa: E402
     build_consumer_surface_targets_spec,
     build_promoted_research_slice_artifacts,
     compute_master_row_count,
+    export_domestic_registration_diff_csv,
+    export_foreign_players_registration_csv,
     merge_operational_docs_into_consumer_index,
     render_collector_official_digest_md,
     render_consumer_surface_guide_section,
@@ -96,6 +98,7 @@ build_live_qualification_fingerprints = _base.build_live_qualification_fingerpri
 V215_BASELINE_SHA = "3874ebb4b20fdfd5c1d1fd7f9ed9426d9f26036f"
 V220_1_BASELINE_SHA = "fa9793c6db76e15880610ced728a7b0d563da604"
 V221_1_BASELINE_SHA = "e58a2787a6176397a142abced682eed5d10f1289"
+V222_1_BASELINE_SHA = "29589e7d4d90a81a6507ecaa1ec73945a5eecfc1"
 
 V215_RELEASE_SPECS: dict[str, dict] = {
     "v2.1.5-1": {
@@ -111,6 +114,14 @@ V215_RELEASE_SPECS: dict[str, dict] = {
         "product_baseline_sha": V221_1_BASELINE_SHA,
         "enable_consumer_surface_v215": True,
         "enable_operational_kb_v220": True,
+        "incremental_delta_only": True,
+        "archive_format": "bundle_v1",
+    },
+    "v2.2.2-1": {
+        "product_baseline_sha": V222_1_BASELINE_SHA,
+        "enable_consumer_surface_v215": True,
+        "enable_operational_kb_v220": True,
+        "enable_curated_compact_surface_v222": True,
         "incremental_delta_only": True,
         "archive_format": "bundle_v1",
     },
@@ -1073,10 +1084,15 @@ def _content_preserving_candidate(
         f"- {key} -> {_readable_target_label(key, item_by_key)}"
         for key in sorted(id_by_key)
     )
+    release_spec = _release_spec(release_id)
     consumer_guide = render_consumer_surface_guide_section(
         release_id=release_id,
         master_row_count=master_row_count,
-        include_collector_digest=bool(_release_spec(release_id).get("enable_operational_kb_v220")),
+        include_collector_digest=bool(release_spec.get("enable_operational_kb_v220")),
+        include_curated_csvs=bool(release_spec.get("enable_curated_compact_surface_v222")),
+    )
+    master_count_stamp = (
+        f"权威国内注册主表规模：{master_row_count:,} 行（2017-2027 权威总表，精确行数 {master_row_count}）"
     )
     if logical_key == "entry/context":
         operations = (
@@ -1087,8 +1103,9 @@ def _content_preserving_candidate(
         ).read_text()
         body_text = (
             f"# {title}\n\n"
-            f"当前发布：{release_id}\n\n"
-            f"代码提交：{engine_sha}\n\n"
+            f"当前发布：{release_id}\n"
+            f"代码提交：{engine_sha}\n"
+            f"{master_count_stamp}\n\n"
             "读取前请校验 release_status；"
             "PUBLISHING/FAILED/ROLLING_BACK 时使用上一快照。\n\n"
             f"代码镜像：https://github.com/SkyOneBranch/cba-kb-engine/tree/{engine_sha}\n\n"
@@ -1127,8 +1144,9 @@ def _content_preserving_candidate(
         )
     return (
         f"# {title}\n\n"
-        f"当前发布：{release_id}\n\n"
-        f"代码提交：{engine_sha}\n\n"
+        f"当前发布：{release_id}\n"
+        f"代码提交：{engine_sha}\n"
+        f"{master_count_stamp}\n\n"
         "读取前请校验 release_status；"
         "PUBLISHING/FAILED/ROLLING_BACK 时使用上一快照。\n\n"
         f"代码镜像：https://github.com/SkyOneBranch/cba-kb-engine/tree/{engine_sha}\n\n"
@@ -1452,8 +1470,16 @@ def _build_instance_consumer_targets(
         doc_idx_bytes, _ = snapshot(drive, id_for["data/normalized_document_index.json"], "binary")
 
     include_collector_digest = bool(release_spec.get("enable_operational_kb_v220"))
+    compact_curated = bool(release_spec.get("enable_curated_compact_surface_v222"))
     collector_official_digest_bytes = None
-    ops_dir = instance.data_root / "ops_sync_v040_1"
+    foreign_registration_csv_bytes = None
+    domestic_reg_diff_csv_bytes = None
+    ops_dir_v041 = instance.data_root / "ops_sync_v041"
+    ops_dir_v040_1 = instance.data_root / "ops_sync_v040_1"
+    if (ops_dir_v041 / "operational_checkpoint.json").is_file():
+        ops_dir = ops_dir_v041
+    else:
+        ops_dir = ops_dir_v040_1
     ops_checkpoint_path = ops_dir / "operational_checkpoint.json"
     if include_collector_digest and ops_checkpoint_path.is_file():
         checkpoint = json.loads(ops_checkpoint_path.read_text(encoding="utf-8"))
@@ -1470,7 +1496,15 @@ def _build_instance_consumer_targets(
             reg_diff=reg_diff,
             release_id=release_id,
             engine_sha=engine_sha,
+            compact_curated=compact_curated,
         )
+        if compact_curated:
+            foreign_registration_csv_bytes = export_foreign_players_registration_csv(
+                bundles=bundle_records,
+            )
+            domestic_reg_diff_csv_bytes = export_domestic_registration_diff_csv(
+                reg_diff=reg_diff,
+            )
 
     promoted_research = {}
     slice_spec_path = instance.data_root / "promoted_research_slices.json"
@@ -1503,6 +1537,9 @@ def _build_instance_consumer_targets(
         doc_index_bytes=doc_idx_bytes,
         collector_official_digest_bytes=collector_official_digest_bytes,
         include_collector_digest=include_collector_digest,
+        foreign_registration_csv_bytes=foreign_registration_csv_bytes,
+        domestic_reg_diff_csv_bytes=domestic_reg_diff_csv_bytes,
+        include_curated_csvs=compact_curated,
         promoted_research_artifacts=promoted_research,
     )
     for spec in targets.values():
