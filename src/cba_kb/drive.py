@@ -1,13 +1,19 @@
 """Authenticated Drive transport. Credentials stay on this machine."""
+from concurrent.futures import ThreadPoolExecutor
 import io
 import json
 import os
 from pathlib import Path
+import re
+import threading
 from .common import atomic, digest
-from .transport import retry_read
+from .drive_http import build_requests_service
+from .transport import record_api_call, retry_read
 
 SCOPES = ['https://www.googleapis.com/auth/drive']
-FIELDS = 'id,name,mimeType,parents,version,modifiedTime,headRevisionId,md5Checksum,size,webViewLink'
+FIELDS = 'id,name,mimeType,parents,version,modifiedTime,headRevisionId,md5Checksum,sha256Checksum,size,webViewLink'
+MAX_READ_WORKERS = 8
+_HEX64_RE = re.compile(r'^[0-9a-f]{64}$')
 
 
 def credentials(root, interactive=False, credentials_store=None):
@@ -36,43 +42,146 @@ def credentials(root, interactive=False, credentials_store=None):
     return creds
 
 
+def _close_api_objects(clients):
+    for api in clients:
+        if api is None:
+            continue
+        http = getattr(api, '_http', None)
+        http = getattr(http, 'http', http)
+        if http is not None:
+            try:
+                http.close()
+            except Exception:
+                pass
+
+
+def _assert_main_thread_writer(obj, operation):
+    """Enforce 100% single-writer serial execution on the main thread."""
+    main_tid = getattr(obj, '_main_thread_id', None)
+    if main_tid is not None and threading.get_ident() != main_tid:
+        raise RuntimeError(f'WRITE_OFF_MAIN_THREAD_FORBIDDEN:{operation}')
+
+
+def _read_clients_for(obj):
+    getter = getattr(obj, '_get_read_clients', None)
+    if callable(getter):
+        return getter()
+    return getattr(obj, 'api', None), getattr(obj, 'docs', None)
+
+
+def _reset_hook_for(obj):
+    return getattr(obj, '_reset_read_connections', None)
+
+
+def _validate_max_workers(max_workers):
+    if isinstance(max_workers, bool) or not isinstance(max_workers, int) or not (1 <= max_workers <= MAX_READ_WORKERS):
+        raise ValueError(f'max_workers must be an integer between 1 and {MAX_READ_WORKERS}')
+    return max_workers
+
+
+def map_readonly(drive, fn, items, *, max_workers=MAX_READ_WORKERS):
+    """Order-preserving bounded read-only concurrency helper for Drive and fakes."""
+    workers = _validate_max_workers(max_workers)
+    if drive is not None and hasattr(drive, 'map_readonly'):
+        return drive.map_readonly(fn, items, max_workers=workers)
+    seq = list(items)
+    if len(seq) <= 1 or workers == 1:
+        return [fn(item) for item in seq]
+    sem = threading.BoundedSemaphore(workers)
+
+    def _run(item):
+        with sem:
+            return fn(item)
+
+    with ThreadPoolExecutor(max_workers=min(workers, len(seq))) as pool:
+        futures = [pool.submit(_run, item) for item in seq]
+        return [fut.result() for fut in futures]
+
+
 class Drive:
     def __init__(self, root, instance=None):
         self._credentials = credentials(
             root, credentials_store=instance.credentials_store if instance else None,
         )
+        self._main_thread_id = threading.get_ident()
+        self._read_local = threading.local()
+        self._read_semaphore = threading.BoundedSemaphore(MAX_READ_WORKERS)
+        self._worker_clients_lock = threading.Lock()
+        self._worker_clients = []
         self.docs = None
         self._build_clients()
 
-    def _build_clients(self):
-        """Build a fresh Drive/Docs transport pair from the same credentials."""
-        from googleapiclient.discovery import build
+    def _build_readonly_client_pair(self):
+        """Build an isolated (drive_api, NativeDocs) pair for a worker thread."""
         from .native import NativeDocs
-        docs_api = build('docs','v1',credentials=self._credentials,cache_discovery=False)
-        self.api = build('drive','v3',credentials=self._credentials,cache_discovery=False)
+        docs_api = build_requests_service('docs', 'v1', self._credentials)
+        drive_api = build_requests_service('drive', 'v3', self._credentials)
+        return drive_api, NativeDocs(docs_api)
+
+    def _build_clients(self):
+        """Build a fresh main-thread Drive/Docs transport pair from the same credentials."""
+        from .native import NativeDocs
+        docs_api = build_requests_service('docs', 'v1', self._credentials)
+        self.api = build_requests_service('drive', 'v3', self._credentials)
         if self.docs is None:
             self.docs = NativeDocs(docs_api)
         else:
             self.docs.api = docs_api
         self._read_clients = (self.api, docs_api)
 
+    def _is_worker_thread(self):
+        main_tid = getattr(self, '_main_thread_id', None)
+        return main_tid is not None and threading.get_ident() != main_tid
+
+    def _get_read_clients(self):
+        """Return main-thread clients on main thread, or thread-local clients on workers."""
+        if not self._is_worker_thread() or getattr(self, '_credentials', None) is None:
+            return getattr(self, 'api', None), getattr(self, 'docs', None)
+        read_local = getattr(self, '_read_local', None)
+        if read_local is None:
+            return getattr(self, 'api', None), getattr(self, 'docs', None)
+        pair = getattr(read_local, 'clients', None)
+        if pair is None:
+            pair = self._build_readonly_client_pair()
+            read_local.clients = pair
+            lock = getattr(self, '_worker_clients_lock', None)
+            if lock is not None:
+                with lock:
+                    self._worker_clients.append(pair)
+        return pair
+
+    def _assert_main_thread_writer(self, operation):
+        """Enforce 100% single-writer serial execution on the main thread."""
+        _assert_main_thread_writer(self, operation)
+
     def _reset_read_connections(self):
         """Recreate fresh read transports before a read retry, never a write.
 
-        Credentials are reused unchanged; only the pooled transport is rebuilt
-        so a stale or broken session cannot be reused across attempts.
+        On a worker thread, only that thread's local read client is closed and
+        rebuilt so the main thread and sibling workers are never disrupted.
         """
+        if self._is_worker_thread():
+            read_local = getattr(self, '_read_local', None)
+            pair = getattr(read_local, 'clients', None) if read_local is not None else None
+            if pair is not None:
+                drive_api, docs_adapter = pair
+                _close_api_objects((drive_api, getattr(docs_adapter, 'api', None)))
+                read_local.clients = None
+            if getattr(self, '_credentials', None) is None or read_local is None:
+                return
+            try:
+                new_pair = self._build_readonly_client_pair()
+                read_local.clients = new_pair
+                lock = getattr(self, '_worker_clients_lock', None)
+                if lock is not None:
+                    with lock:
+                        self._worker_clients.append(new_pair)
+            except Exception:
+                pass
+            return
+
         clients = getattr(self, '_read_clients', None) or (getattr(self, 'api', None),)
-        for api in clients:
-            if api is None:
-                continue
-            http = getattr(api, '_http', None)
-            http = getattr(http, 'http', http)
-            if http is not None:
-                try:
-                    http.close()
-                except Exception:
-                    pass
+        _close_api_objects(clients)
         if getattr(self, '_credentials', None) is None:
             return
         try:
@@ -82,20 +191,63 @@ class Drive:
             # of silently reusing a known-broken session.
             pass
 
+    def _close_worker_read_clients(self):
+        lock = getattr(self, '_worker_clients_lock', None)
+        if lock is None:
+            return
+        with lock:
+            pairs = list(self._worker_clients)
+            self._worker_clients.clear()
+        for drive_api, docs_adapter in pairs:
+            _close_api_objects((drive_api, getattr(docs_adapter, 'api', None)))
+
+    def map_readonly(self, fn, items, *, max_workers=MAX_READ_WORKERS):
+        """Execute a read-only callable across items in bounded concurrency, preserving order."""
+        workers = _validate_max_workers(max_workers)
+        seq = list(items)
+        if len(seq) <= 1 or workers == 1:
+            return [fn(item) for item in seq]
+        sem = getattr(self, '_read_semaphore', None) or threading.BoundedSemaphore(MAX_READ_WORKERS)
+        local_sem = threading.BoundedSemaphore(workers) if workers < MAX_READ_WORKERS else None
+
+        def _run(item):
+            with sem:
+                if local_sem is not None:
+                    with local_sem:
+                        return fn(item)
+                return fn(item)
+
+        try:
+            with ThreadPoolExecutor(max_workers=min(workers, len(seq))) as pool:
+                futures = [pool.submit(_run, item) for item in seq]
+                return [fut.result() for fut in futures]
+        finally:
+            self._close_worker_read_clients()
+
     def document_json(self, file_id):
         """Raw Docs readback under the bounded read-retry policy."""
-        return retry_read(lambda: self.docs.document(file_id), label='native document',
-                          reset=self._reset_read_connections)
+        def _call():
+            _, docs = _read_clients_for(self)
+            record_api_call('download_calls')
+            return docs.document(file_id)
+        return retry_read(_call, label='native document',
+                          reset=_reset_hook_for(self))
 
     def get_managed_doc(self,file_id):
         if self.meta(file_id)['mimeType']!='application/vnd.google-apps.document':
             raise ValueError('Not a native Doc')
-        return retry_read(lambda: self.docs.get(file_id), label='native doc',
-                          reset=self._reset_read_connections)
+        def _call():
+            _, docs = _read_clients_for(self)
+            record_api_call('download_calls')
+            return docs.get(file_id)
+        return retry_read(_call, label='native doc',
+                          reset=_reset_hook_for(self))
 
     def put_managed_doc(self,file_id,content):
+        _assert_main_thread_writer(self, 'put_managed_doc')
         if self.meta(file_id)['mimeType']!='application/vnd.google-apps.document':
             raise ValueError('Not a native Doc')
+        record_api_call('upload_calls')
         return self.docs.put(file_id,content)
 
     def index_cba_keys(self, parent):
@@ -111,6 +263,7 @@ class Drive:
         return index
 
     def ensure_copy(self,parent,key,file_id,name,*,index=None):
+        _assert_main_thread_writer(self, 'ensure_copy')
         index = self.index_cba_keys(parent) if index is None else index
         source_mime = self.meta(file_id)['mimeType']
         if key in index:
@@ -118,6 +271,7 @@ class Drive:
             if existing['mimeType'] != source_mime or parent not in existing.get('parents', []):
                 raise RuntimeError('Existing backup copy MIME/parent mismatch')
             return existing['id']
+        record_api_call('copy_calls')
         result = self.api.files().copy(fileId=file_id,body={'name':name,'parents':[parent],
             'appProperties':{'cba_key':key}},fields='id',supportsAllDrives=True).execute(num_retries=0)['id']
         index[key] = {'id': result, 'mimeType': source_mime, 'parents': [parent],
@@ -125,15 +279,36 @@ class Drive:
         return result
 
     def meta(self, file_id):
-        return retry_read(lambda: self.api.files().get(fileId=file_id,fields=FIELDS,
-            supportsAllDrives=True).execute(num_retries=0), label='meta',
-            reset=self._reset_read_connections)
+        def _call():
+            api, _ = _read_clients_for(self)
+            record_api_call('meta_calls')
+            return api.files().get(fileId=file_id,fields=FIELDS,
+                supportsAllDrives=True).execute(num_retries=0)
+        return retry_read(_call, label='meta',
+            reset=_reset_hook_for(self))
 
     def get(self, file_id):
         meta = self.meta(file_id)
         if meta['mimeType'].startswith('application/vnd.google-apps.'):
             raise ValueError('Native object requires native adapter; raw download rejected')
         return self._download(file_id)
+
+    def get_with_meta(self, file_id, *, known_meta=None):
+        """Download binary bytes once, reusing known_meta & server sha256Checksum when valid."""
+        before = known_meta if known_meta is not None else self.meta(file_id)
+        if before['mimeType'].startswith('application/vnd.google-apps.'):
+            raise ValueError('Native object requires native adapter; raw download rejected')
+        data = self._download(file_id)
+        server_sha = before.get('sha256Checksum')
+        if isinstance(server_sha, str) and _HEX64_RE.fullmatch(server_sha.lower()):
+            if digest(data) != server_sha.lower():
+                raise RuntimeError('Remote changed during download')
+            return data, before
+        after = self.meta(file_id)
+        fp_keys = ('id', 'version', 'modifiedTime', 'mimeType', 'parents')
+        if {k: before.get(k) for k in fp_keys} != {k: after.get(k) for k in fp_keys}:
+            raise RuntimeError('Remote changed during download')
+        return data, after
 
     def get_bounded(self, file_id, max_bytes):
         """Download with a hard byte bound enforced during transfer.
@@ -169,10 +344,12 @@ class Drive:
             # Fresh buffer + downloader per attempt: a retry after a
             # transport reset must not reuse a downloader bound to the
             # closed session (same structure as _download).
+            api, _ = _read_clients_for(self)
+            record_api_call('download_calls')
             buf = io.BytesIO()
             downloader = MediaIoBaseDownload(
-                buf, self.api.files().get_media(fileId=file_id,
-                                                supportsAllDrives=True),
+                buf, api.files().get_media(fileId=file_id,
+                                           supportsAllDrives=True),
                 chunksize=min(1024 * 1024, max_bytes))
             done = False
             while not done:
@@ -182,7 +359,7 @@ class Drive:
                         f'download exceeded max_bytes={max_bytes}')
             return buf.getvalue()
         data = retry_read(bounded, label='bounded download',
-                          reset=self._reset_read_connections)
+                          reset=_reset_hook_for(self))
         if len(data) > max_bytes:
             # Defense in depth: the transport must never return more than asked.
             raise DownloadTooLargeError(
@@ -193,38 +370,49 @@ class Drive:
         """Raw content read after MIME has been checked by get or the live index."""
         from googleapiclient.http import MediaIoBaseDownload
         def download():
+            api, _ = _read_clients_for(self)
+            record_api_call('download_calls')
             buf = io.BytesIO()
-            downloader = MediaIoBaseDownload(buf,self.api.files().get_media(fileId=file_id,supportsAllDrives=True))
+            downloader = MediaIoBaseDownload(buf,api.files().get_media(fileId=file_id,supportsAllDrives=True))
             done = False
             while not done:
                 _, done = downloader.next_chunk(num_retries=0)
             return buf.getvalue()
-        return retry_read(download, label='download', reset=self._reset_read_connections)
+        return retry_read(download, label='download', reset=_reset_hook_for(self))
 
     def put(self, file_id, content, mime):
+        _assert_main_thread_writer(self, 'put')
         from googleapiclient.http import MediaIoBaseUpload
         actual = self.meta(file_id)['mimeType']
         if actual != mime or actual.startswith('application/vnd.google-apps.'):
             raise ValueError('MIME mismatch/native byte update rejected')
+        record_api_call('upload_calls')
         return self.api.files().update(fileId=file_id,media_body=MediaIoBaseUpload(io.BytesIO(content),mimetype=mime),
                                       fields=FIELDS,supportsAllDrives=True).execute(num_retries=0)
 
     def move(self,file_id,destination,previous):
+        _assert_main_thread_writer(self, 'move')
+        record_api_call('move_calls')
         return self.api.files().update(fileId=file_id,addParents=destination,removeParents=previous,
             fields=FIELDS,supportsAllDrives=True).execute(num_retries=0)
 
     def list(self, parent):
         items, page = [], None
         while True:
-            result = retry_read(lambda: self.api.files().list(
-                q=f"'{parent}' in parents and trashed=false",pageToken=page,
-                pageSize=1000,fields=f'nextPageToken,files({FIELDS},appProperties)',supportsAllDrives=True,
-                includeItemsFromAllDrives=True).execute(num_retries=0), label='list',
-                reset=self._reset_read_connections)
+            def _page(token=page):
+                api, _ = _read_clients_for(self)
+                record_api_call('list_calls')
+                return api.files().list(
+                    q=f"'{parent}' in parents and trashed=false",pageToken=token,
+                    pageSize=1000,fields=f'nextPageToken,files({FIELDS},appProperties)',supportsAllDrives=True,
+                    includeItemsFromAllDrives=True).execute(num_retries=0)
+            result = retry_read(_page, label='list',
+                reset=_reset_hook_for(self))
             items.extend(result.get('files',[])); page=result.get('nextPageToken')
             if not page: return items
 
     def ensure(self, parent, key, name, mime, content=None, *, index=None):
+        _assert_main_thread_writer(self, 'ensure')
         # Recovery after a successful create with a lost response: same key, no blind duplicate.
         index = self.index_cba_keys(parent) if index is None else index
         if key in index:
@@ -241,6 +429,7 @@ class Drive:
         body={'name':name,'parents':[parent],'mimeType':mime,'appProperties':{'cba_key':key}}
         kwargs={'body':body,'fields':'id','supportsAllDrives':True}
         if content is not None: kwargs['media_body']=MediaIoBaseUpload(io.BytesIO(content),mimetype=mime)
+        record_api_call('upload_calls')
         result = self.api.files().create(**kwargs).execute(num_retries=0)['id']
         index[key] = {'id': result, 'mimeType': mime, 'parents': [parent],
                       'appProperties': {'cba_key': key}}
