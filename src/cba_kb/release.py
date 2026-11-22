@@ -3,12 +3,16 @@
 Cross-client exclusion still requires a human-maintained single-writer window.
 Native Docs require explicit managed_doc mode; Sheets byte writes are rejected.
 """
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import gzip
+import io
 import json
 import re
 import subprocess
+import tarfile
 import time
 from .common import atomic, child, digest, lock, read, save
+from .drive import map_readonly
 from .placement_facade import placement_enforced
 from .transport import stage
 from .current_state import clean
@@ -16,6 +20,15 @@ from .current_state import clean
 FOLDER = 'application/vnd.google-apps.folder'
 DOC = 'application/vnd.google-apps.document'
 JSON = 'application/json'
+
+ARCHIVE_FORMAT_LEGACY = 'legacy'
+ARCHIVE_FORMAT_BUNDLE_V1 = 'bundle_v1'
+BUNDLE_FILENAME = 'release_bundle.tar.gz'
+BUNDLE_MIME = 'application/gzip'
+BUNDLE_MANIFEST_MEMBER = 'bundle_manifest.json'
+MAX_BUNDLE_EXTRACT_BYTES = 128 * 1024 * 1024
+MAX_BUNDLE_MEMBERS = 4096
+_HEX64_RE = re.compile(r'^[0-9a-f]{64}$')
 
 V181_RELEASE_ID = 'v1.8.1-1'
 V181_READINESS_ID = '1sA2TxUYAOGtcLfr2AhTLR4moBGIu2hoF'
@@ -521,7 +534,9 @@ TOPOLOGY_LEAF_PARENT_ROLES = {
 }
 
 
-def validate_release_topology(nodes, *, release_id, planned_target_ids=None):
+def validate_release_topology(
+    nodes, *, release_id, planned_target_ids=None, carry_forward_target_ids=None,
+):
     """Validate semantic roles and ancestors without observed-ID whitelists."""
     if not isinstance(nodes, list) or not nodes:
         raise ReleaseContractError('RELEASE_TOPOLOGY_REQUIRED')
@@ -579,25 +594,38 @@ def validate_release_topology(nodes, *, release_id, planned_target_ids=None):
                     'RELEASE_TOPOLOGY_SUPERSEDED_GOVERNANCE_INVALID'
                 )
 
-    if planned_target_ids is not None:
-        if not isinstance(planned_target_ids, (list, tuple, set)):
-            raise ReleaseContractError('RELEASE_TOPOLOGY_TARGET_INVALID')
-        if len(planned_target_ids) != len(set(planned_target_ids)):
-            raise ReleaseContractError('RELEASE_TOPOLOGY_TARGET_DUPLICATE')
-        for pid in planned_target_ids:
+    if planned_target_ids is not None or carry_forward_target_ids is not None:
+        expected_ids = []
+        planned_set = set()
+        if planned_target_ids is not None:
+            if not isinstance(planned_target_ids, (list, tuple, set)):
+                raise ReleaseContractError('RELEASE_TOPOLOGY_TARGET_INVALID')
+            if len(planned_target_ids) != len(set(planned_target_ids)):
+                raise ReleaseContractError('RELEASE_TOPOLOGY_TARGET_DUPLICATE')
+            planned_set = set(planned_target_ids)
+            expected_ids.extend(planned_target_ids)
+        if carry_forward_target_ids is not None:
+            if not isinstance(carry_forward_target_ids, (list, tuple, set)):
+                raise ReleaseContractError('RELEASE_TOPOLOGY_TARGET_INVALID')
+            if len(carry_forward_target_ids) != len(set(carry_forward_target_ids)):
+                raise ReleaseContractError('RELEASE_TOPOLOGY_TARGET_DUPLICATE')
+            if planned_set & set(carry_forward_target_ids):
+                raise ReleaseContractError('RELEASE_TOPOLOGY_TARGET_DUPLICATE')
+            expected_ids.extend(carry_forward_target_ids)
+        for pid in expected_ids:
             if pid in by_id and by_id[pid]['role'] not in PLANNED_TARGET_ROLES:
                 raise ReleaseContractError('RELEASE_TOPOLOGY_ROLE_INVALID')
         target_nodes = [
             node for node in nodes
             if node['role'] in PLANNED_TARGET_ROLES
         ]
-        if planned_target_ids and not target_nodes:
+        if expected_ids and not target_nodes:
             raise ReleaseContractError('RELEASE_TOPOLOGY_CONTAINER_ONLY_FORBIDDEN')
         target_ids = {node['id'] for node in target_nodes}
-        missing = set(planned_target_ids) - target_ids
+        missing = set(expected_ids) - target_ids
         if missing:
             raise ReleaseContractError('RELEASE_TOPOLOGY_TARGET_MISSING')
-        unexpected = target_ids - set(planned_target_ids)
+        unexpected = target_ids - set(expected_ids)
         if unexpected:
             raise ReleaseContractError('RELEASE_TOPOLOGY_TARGET_UNEXPECTED')
 
@@ -856,13 +884,145 @@ def validate_release_infra_compatibility(
     }
 
 
-def snapshot(drive, file_id, mode='binary'):
-    before=drive.meta(file_id)
-    data=payload(drive,{'id':file_id,'mode':mode})
-    after=drive.meta(file_id)
-    if fingerprint(before)!=fingerprint(after):
+def _valid_server_sha256(meta, *, mode='binary'):
+    if not isinstance(meta, dict):
+        return None
+    mime = str(meta.get('mimeType') or '')
+    if mode == 'managed_doc' or mime.startswith('application/vnd.google-apps.'):
+        return None
+    sha = meta.get('sha256Checksum')
+    if isinstance(sha, str) and _HEX64_RE.fullmatch(sha.lower()):
+        return sha.lower()
+    return None
+
+
+def snapshot(drive, file_id, mode='binary', *, known_meta=None):
+    if mode == 'binary' and hasattr(drive, 'get_with_meta'):
+        return drive.get_with_meta(file_id, known_meta=known_meta)
+    before = known_meta if known_meta is not None else drive.meta(file_id)
+    data = payload(drive, {'id': file_id, 'mode': mode})
+    server_sha = _valid_server_sha256(before, mode=mode)
+    if server_sha is not None:
+        if digest(data) != server_sha:
+            raise RuntimeError('Remote changed during download')
+        return data, before
+    after = drive.meta(file_id)
+    if fingerprint(before) != fingerprint(after):
         raise RuntimeError('Remote changed during download')
     return data, after
+
+
+def index_folders_batch(drive, folder_ids):
+    """List each unique folder once via bounded read-only concurrency."""
+    unique = sorted({fid for fid in (folder_ids or []) if isinstance(fid, str) and fid})
+    if not unique:
+        return {}
+    lists = map_readonly(drive, drive.list, unique)
+    index = {}
+    for items in lists:
+        for item in items or []:
+            fid = item.get('id')
+            if fid:
+                index[fid] = item
+    return index
+
+
+def verify_remote_objects_batch(
+    drive,
+    expected_items,
+    *,
+    remote_index=None,
+    folders=None,
+    error_cls=RuntimeError,
+    error_code='REMOTE_HASH_MISMATCH',
+):
+    """Verify remote objects via server sha256Checksum with fail-closed content fallback.
+
+    For binary objects whose Drive metadata exposes a valid 64-hex ``sha256Checksum``,
+    verification completes with 0 content downloads. Native Docs or objects without
+    ``sha256Checksum`` automatically fall back to content download + ``clean()`` +
+    ``digest()``. Any mismatch fails closed.
+    """
+    index = dict(remote_index or {})
+    if folders:
+        index.update(index_folders_batch(drive, folders))
+
+    server_verified = 0
+    fallback_items = []
+    meta_by_id = {}
+
+    for item in expected_items:
+        fid = item.get('id') if isinstance(item, dict) else None
+        expected_sha = str((item or {}).get('sha256') or '').lower()
+        if not fid or not _HEX64_RE.fullmatch(expected_sha):
+            raise error_cls(f'{error_code}:{fid}')
+        meta = index.get(fid)
+        if meta is None:
+            try:
+                meta = drive.meta(fid)
+            except Exception as exc:
+                raise error_cls(f'{error_code}:{fid}') from exc
+        if not isinstance(meta, dict) or meta.get('id') != fid:
+            raise error_cls(f'{error_code}:{fid}')
+        expected_mime = item.get('mime')
+        if expected_mime and meta.get('mimeType') != expected_mime:
+            raise error_cls(f'{error_code}:{fid}')
+        allowed_parents = item.get('allowed_parents')
+        if allowed_parents:
+            actual_parents = set(meta.get('parents') or [])
+            if not (actual_parents & set(allowed_parents)):
+                raise error_cls(f'{error_code}:{fid}')
+        meta_by_id[fid] = meta
+        mode = item.get('mode', 'binary')
+        server_sha = _valid_server_sha256(meta, mode=mode)
+        if server_sha is not None:
+            if server_sha != expected_sha:
+                raise error_cls(f'{error_code}:{fid}')
+            server_verified += 1
+        else:
+            fallback_items.append((item, meta, expected_sha))
+
+    def _check_fallback(spec):
+        item, meta, expected_sha = spec
+        fid = item['id']
+        effective_mode = 'managed_doc' if meta.get('mimeType') == DOC else item.get('mode', 'binary')
+        data = payload(drive, {'id': fid, 'mode': effective_mode})
+        clean(data, item.get('name') or fid)
+        if digest(data) != expected_sha:
+            raise error_cls(f'{error_code}:{fid}')
+        return fid
+
+    if fallback_items:
+        map_readonly(drive, _check_fallback, fallback_items)
+
+    return {
+        'status': 'PASS',
+        'verified_count': server_verified + len(fallback_items),
+        'server_hash_verified': server_verified,
+        'content_fallback_verified': len(fallback_items),
+        'meta_by_id': meta_by_id,
+    }
+
+
+def _verify_carry_forward_if_incremental(drive, plan, *, remote_index=None):
+    if not plan.get('incremental_mode'):
+        return None
+    carried = plan.get('carry_forward_artifacts') or []
+    entry_ids = {entry['id'] for entry in plan.get('entries', [])}
+    unchanged = [item for item in carried if item.get('id') not in entry_ids]
+    if not unchanged:
+        return None
+    index = remote_index
+    if index is None and (plan.get('closure') or {}).get('zones'):
+        items, _ = _inventory(drive, plan['closure']['zones'])
+        index = {item['id']: item for item in items}
+    return verify_remote_objects_batch(
+        drive,
+        unchanged,
+        remote_index=index,
+        error_cls=RuntimeError,
+        error_code='CARRY_FORWARD_REMOTE_HASH_MISMATCH',
+    )
 
 
 def prepare(
@@ -878,10 +1038,14 @@ def prepare(
     closure=None,
     environment='sandbox',
     code_commit=None,
+    archive_format=ARCHIVE_FORMAT_LEGACY,
+    incremental_mode=False,
 ):
     root=Path(root)
     if root.exists(): raise ValueError('Release already exists; resume it instead')
     if not entries: raise ValueError('Empty release')
+    if archive_format not in (ARCHIVE_FORMAT_LEGACY, ARCHIVE_FORMAT_BUNDLE_V1):
+        raise ValueError('ARCHIVE_FORMAT_INVALID')
     ids=[e['id'] for e in entries]
     if len(ids)!=len(set(ids)) or status_id in ids:
         raise ValueError('Duplicate target or status overlaps payload')
@@ -899,6 +1063,10 @@ def prepare(
         plan['code_commit'] = code_commit
     if closure is not None:
         plan['closure'] = closure
+    if archive_format != ARCHIVE_FORMAT_LEGACY:
+        plan['archive_format'] = archive_format
+    if incremental_mode:
+        plan['incremental_mode'] = True
     clean(__import__('json').dumps(plan).encode(), 'plan.json')
     # Reject secrets before freezing before/candidate copies or remote writes.
     for entry in entries:
@@ -976,7 +1144,7 @@ def prepare(
                 from .native import BEGIN, END
                 text=new.decode()
                 if not text.startswith(BEGIN) or not text.endswith(END):raise ValueError('Managed Doc prefix required')
-            old,meta=snapshot(drive,entry['id'],mode)
+            old,meta=snapshot(drive,entry['id'],mode,known_meta=meta)
             clean(old, 'before/' + name)
             scan_native_document(drive, dict(entry, mode=mode))
             atomic(root/f'before/{i}',old); atomic(root/f'candidate/{i}',new)
@@ -989,6 +1157,8 @@ def prepare(
             freeze_closure(drive, root, plan)
             save(root/'plan.json', plan)
             validate_closure(drive, root, plan, candidate=True)
+        if incremental_mode:
+            _verify_carry_forward_if_incremental(drive, plan)
         save(root/'journal.json',{'state':'PREPARED','uploaded':{},'inflight':None})
     except BaseException:
         save(root/'prepare_failed.json',{'state':'PREPARE_FAILED'})
@@ -1072,10 +1242,267 @@ def validate_previous_snapshot(plan, previous):
         seen.add(fid)
 
 
+def _validate_bundle_member_path(name):
+    if (not isinstance(name, str) or not name or '\\' in name
+            or name.startswith('/') or ':' in name or '\x00' in name):
+        raise ReleaseContractError('BUNDLE_PATH_TRAVERSAL_FORBIDDEN')
+    parts = PurePosixPath(name).parts
+    if not parts or any(part in ('', '.', '..') for part in parts):
+        raise ReleaseContractError('BUNDLE_PATH_TRAVERSAL_FORBIDDEN')
+    return '/'.join(parts)
+
+
+def build_release_bundle(root, plan):
+    """Build a byte-deterministic, secret-scanned release_bundle.tar.gz in memory."""
+    root = Path(root)
+    namespace = archive_namespace(plan)
+    members = {}
+    entry_records = []
+
+    for i, e in enumerate(plan['entries']):
+        native = e.get('mode') == 'managed_doc'
+        before_path = _validate_bundle_member_path(e['before'])
+        candidate_path = _validate_bundle_member_path(e['candidate'])
+        before_data = verified_local(root, e, 'before')
+        candidate_data = verified_local(root, e, 'candidate')
+        clean(before_data, 'bundle/' + before_path)
+        clean(candidate_data, 'bundle/' + candidate_path)
+        members[before_path] = before_data
+        members[candidate_path] = candidate_data
+        entry_records.append({
+            'index': i,
+            'original_id': e['id'],
+            'logical_key': e.get('logical_key'),
+            'name': e['name'],
+            'mime': e['mime'],
+            'mode': e.get('mode', 'binary'),
+            'before_member': before_path,
+            'before_sha256': e['before_hash'],
+            'candidate_member': candidate_path,
+            'candidate_sha256': e['after_hash'],
+            'hash_scope': 'managed_prefix' if native else 'bytes',
+        })
+
+    status_before = (root / 'status.before.json').read_bytes()
+    if digest(status_before) != plan['status_before_hash']:
+        raise RuntimeError('Frozen status snapshot was altered')
+    clean(status_before, 'bundle/status.before.json')
+    members['status.before.json'] = status_before
+
+    plan_bytes = (root / 'plan.json').read_bytes()
+    clean(plan_bytes, 'bundle/plan.json')
+    members['plan.json'] = plan_bytes
+
+    protected_records = []
+    for item in (plan.get('closure') or {}).get('protected', []):
+        protected_records.append({
+            'original_id': item['id'],
+            'name': item['name'],
+            'sha256': item['sha256'],
+            'kind': item.get('kind'),
+            'hash_scope': 'managed_prefix' if item.get('mode') == 'managed_doc' else 'bytes',
+        })
+
+    manifest = {
+        'schema_version': ARCHIVE_FORMAT_BUNDLE_V1,
+        'release_id': plan['release_id'],
+        'archive_namespace': namespace,
+        'plan_sha256': digest(plan_bytes),
+        'status_before_hash': plan['status_before_hash'],
+        'entries': entry_records,
+        'protected': protected_records,
+        'members': [
+            {
+                'path': path,
+                'sha256': digest(members[path]),
+                'size': len(members[path]),
+            }
+            for path in sorted(members)
+        ],
+    }
+    manifest_bytes = json.dumps(
+        manifest, ensure_ascii=False, sort_keys=True, indent=2,
+    ).encode('utf-8')
+    clean(manifest_bytes, 'bundle/' + BUNDLE_MANIFEST_MEMBER)
+    members[BUNDLE_MANIFEST_MEMBER] = manifest_bytes
+
+    buf = io.BytesIO()
+    with gzip.GzipFile(filename='', mode='wb', fileobj=buf, mtime=0, compresslevel=6) as gz:
+        with tarfile.open(fileobj=gz, mode='w', format=tarfile.PAX_FORMAT) as tar:
+            for member_path in sorted(members):
+                raw = members[member_path]
+                info = tarfile.TarInfo(name=member_path)
+                info.size = len(raw)
+                info.mtime = 0
+                info.uid = 0
+                info.gid = 0
+                info.uname = ''
+                info.gname = ''
+                info.mode = 0o644
+                info.type = tarfile.REGTYPE
+                tar.addfile(info, io.BytesIO(raw))
+
+    bundle_bytes = buf.getvalue()
+    clean(bundle_bytes, BUNDLE_FILENAME)
+    return {
+        'bytes': bundle_bytes,
+        'sha256': digest(bundle_bytes),
+        'manifest': manifest,
+    }
+
+
+def extract_release_bundle(
+    bundle_bytes,
+    *,
+    max_bytes=MAX_BUNDLE_EXTRACT_BYTES,
+    max_members=MAX_BUNDLE_MEMBERS,
+):
+    """Safely extract and cryptographically verify a release_bundle.tar.gz payload."""
+    if not isinstance(bundle_bytes, (bytes, bytearray)):
+        raise ReleaseContractError('BUNDLE_INVALID')
+    raw_bytes = bytes(bundle_bytes)
+    if max_bytes <= 0 or max_members <= 0:
+        raise ValueError('Bundle extraction limits must be positive')
+    if len(raw_bytes) > max_bytes:
+        raise ReleaseContractError('BUNDLE_EXTRACT_LIMIT_EXCEEDED')
+
+    extracted = {}
+    total_bytes = 0
+    member_count = 0
+
+    try:
+        with tarfile.open(fileobj=io.BytesIO(raw_bytes), mode='r:gz') as tar:
+            for member in tar:
+                member_count += 1
+                if member_count > max_members:
+                    raise ReleaseContractError('BUNDLE_MEMBER_LIMIT_EXCEEDED')
+                clean_path = _validate_bundle_member_path(member.name)
+                if not member.isfile():
+                    raise ReleaseContractError('BUNDLE_UNSAFE_MEMBER_TYPE')
+                if clean_path in extracted:
+                    raise ReleaseContractError('BUNDLE_DUPLICATE_MEMBER')
+                if member.size < 0 or member.size > max_bytes or total_bytes + member.size > max_bytes:
+                    raise ReleaseContractError('BUNDLE_EXTRACT_LIMIT_EXCEEDED')
+                stream = tar.extractfile(member)
+                if stream is None:
+                    raise ReleaseContractError('BUNDLE_UNSAFE_MEMBER_TYPE')
+                chunks = []
+                while True:
+                    chunk = stream.read(65536)
+                    if not chunk:
+                        break
+                    total_bytes += len(chunk)
+                    if total_bytes > max_bytes:
+                        raise ReleaseContractError('BUNDLE_EXTRACT_LIMIT_EXCEEDED')
+                    chunks.append(chunk)
+                data = b''.join(chunks)
+                extracted[clean_path] = data
+    except ReleaseContractError:
+        raise
+    except (tarfile.TarError, gzip.BadGzipFile, OSError, EOFError, ValueError) as exc:
+        raise ReleaseContractError('BUNDLE_ARCHIVE_CORRUPT') from exc
+
+    if BUNDLE_MANIFEST_MEMBER not in extracted:
+        raise ReleaseContractError('BUNDLE_MANIFEST_MISSING')
+    try:
+        manifest = json.loads(extracted[BUNDLE_MANIFEST_MEMBER].decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseContractError('BUNDLE_MANIFEST_INVALID') from exc
+    if not isinstance(manifest, dict) or manifest.get('schema_version') != ARCHIVE_FORMAT_BUNDLE_V1:
+        raise ReleaseContractError('BUNDLE_MANIFEST_INVALID')
+
+    manifest_members = manifest.get('members')
+    if not isinstance(manifest_members, list) or not manifest_members:
+        raise ReleaseContractError('BUNDLE_MANIFEST_INVALID')
+
+    declared_paths = set()
+    for spec in manifest_members:
+        if not isinstance(spec, dict):
+            raise ReleaseContractError('BUNDLE_MANIFEST_INVALID')
+        mpath = _validate_bundle_member_path(spec.get('path'))
+        declared_paths.add(mpath)
+        if mpath not in extracted:
+            raise ReleaseContractError('BUNDLE_MEMBER_MISSING')
+        data = extracted[mpath]
+        if len(data) != spec.get('size') or digest(data) != spec.get('sha256'):
+            raise ReleaseContractError('BUNDLE_MEMBER_HASH_MISMATCH')
+        clean(data, 'bundle/' + mpath)
+
+    if set(extracted) - {BUNDLE_MANIFEST_MEMBER} != declared_paths:
+        raise ReleaseContractError('BUNDLE_UNDECLARED_MEMBER')
+
+    for entry in manifest.get('entries') or []:
+        if not isinstance(entry, dict):
+            raise ReleaseContractError('BUNDLE_MANIFEST_INVALID')
+        before_member = entry.get('before_member')
+        candidate_member = entry.get('candidate_member')
+        if (before_member not in extracted
+                or digest(extracted[before_member]) != entry.get('before_sha256')
+                or candidate_member not in extracted
+                or digest(extracted[candidate_member]) != entry.get('candidate_sha256')):
+            raise ReleaseContractError('BUNDLE_MEMBER_HASH_MISMATCH')
+
+    clean(extracted[BUNDLE_MANIFEST_MEMBER], 'bundle/' + BUNDLE_MANIFEST_MEMBER)
+    return {'manifest': manifest, 'members': extracted}
+
+
 def archive_snapshot(drive, root, plan):
+    root = Path(root)
     namespace = archive_namespace(plan)
     folder = drive.ensure(plan['archive_id'], plan['release_id'], plan['release_id'], FOLDER)
     index = drive.index_cba_keys(folder)
+    if plan.get('archive_format') == ARCHIVE_FORMAT_BUNDLE_V1:
+        bundle = build_release_bundle(root, plan)
+        bundle_fid = drive.ensure(
+            folder, f'{namespace}:bundle-v1', BUNDLE_FILENAME, BUNDLE_MIME,
+            bundle['bytes'], index=index,
+        )
+        previous = []
+        for i, e in enumerate(plan['entries']):
+            native = e.get('mode') == 'managed_doc'
+            native_backup = None
+            if native:
+                scan_native_document(drive, e)
+                native_backup = drive.ensure_copy(
+                    folder, f'{namespace}:native-before-{i}', e['id'], f'before_{e["name"]}',
+                    index=index,
+                )
+                if digest(drive.get_managed_doc(native_backup)) != e['before_hash']:
+                    raise RuntimeError('Immutable native backup differs')
+            previous.append({
+                'original_id': e['id'],
+                'snapshot_id': native_backup or bundle_fid,
+                'name': e['name'],
+                'sha256': e['before_hash'],
+                'hash_scope': 'managed_prefix' if native else 'bytes',
+                'archive_format': ARCHIVE_FORMAT_BUNDLE_V1,
+                'bundle_file_id': bundle_fid,
+                'bundle_sha256': bundle['sha256'],
+                'bundle_member': e['before'],
+            })
+        if plan.get('closure'):
+            snapshotted = {item['original_id'] for item in previous}
+            for item in plan['closure']['protected']:
+                if item['id'] in snapshotted:
+                    continue
+                if item.get('before') and child(root, item['before']).exists():
+                    data = child(root, item['before']).read_bytes()
+                    if digest(data) != item['sha256']:
+                        raise RuntimeError('Frozen protected snapshot was altered')
+                previous.append({
+                    'original_id': item['id'],
+                    'snapshot_id': bundle_fid,
+                    'name': item['name'],
+                    'sha256': item['sha256'],
+                    'hash_scope': 'managed_prefix' if item.get('mode') == 'managed_doc' else 'bytes',
+                    'archive_format': ARCHIVE_FORMAT_BUNDLE_V1,
+                    'bundle_file_id': bundle_fid,
+                    'bundle_sha256': bundle['sha256'],
+                    'protected_immutable': True,
+                })
+                snapshotted.add(item['id'])
+        return previous
+
     previous = []
     for i, e in enumerate(plan['entries']):
         native = e.get('mode') == 'managed_doc'
@@ -1237,9 +1664,21 @@ def publish(drive, root, single_writer=False, execution_authority=None):
                 raise RuntimeError('Publication status no longer refers to this complete release')
             verify(drive,root,execution_authority); return journal
         # Preflight every object before any production mutation.
+        preflight_index = None
+        if plan.get('closure') and (plan.get('incremental_mode') or plan.get('archive_format') == ARCHIVE_FORMAT_BUNDLE_V1):
+            inv_items, _ = _inventory(drive, plan['closure']['zones'])
+            preflight_index = {item['id']: item for item in inv_items}
+        _verify_carry_forward_if_incremental(drive, plan, remote_index=preflight_index)
         for e in plan['entries']:
-            data,meta=snapshot(drive,e['id'],e.get('mode','binary')); sha=digest(data)
-            clean(data, 'readback/' + e['name'])
+            mode = e.get('mode', 'binary')
+            meta = (preflight_index or {}).get(e['id'])
+            server_sha = _valid_server_sha256(meta, mode=mode) if meta is not None else None
+            if server_sha is not None:
+                sha = server_sha
+            else:
+                data, meta = snapshot(drive, e['id'], mode, known_meta=meta)
+                sha = digest(data)
+                clean(data, 'readback/' + e['name'])
             scan_native_document(drive, e)
             if e['id'] in journal.get('uploaded',{}) or journal.get('inflight')==e['id']:
                 if sha==e['after_hash']: continue
@@ -1345,8 +1784,9 @@ def publish(drive, root, single_writer=False, execution_authority=None):
                 if digest(latest)!=e['before_hash']:raise RuntimeError('Target changed immediately before write')
                 try:
                     write_payload(drive,e,verified_local(root,e,'candidate'))
-                    clean(payload(drive,e), 'readback/' + e['name'])
-                    if digest(payload(drive,e))!=e['after_hash']:
+                    readback = payload(drive,e)
+                    clean(readback, 'readback/' + e['name'])
+                    if digest(readback)!=e['after_hash']:
                         raise RuntimeError('Readback mismatch')
                 except Exception as exc:
                     if classify_remote_error(exc) != RETRYABLE:
@@ -1529,11 +1969,36 @@ def freeze_closure(drive, root, plan):
         raise ValueError('PROTECTED_BASELINE_COVERAGE')
     if len({item.get('id') for item in protected}) != len(protected):
         raise ValueError('PROTECTED_BASELINE_DUPLICATE')
+
+    bundle_mode = plan.get('archive_format') == ARCHIVE_FORMAT_BUNDLE_V1
+    remote_index = {}
+    if closure.get('zones'):
+        try:
+            inv_items, _ = _inventory(drive, closure['zones'])
+            remote_index = {item['id']: item for item in inv_items}
+        except Exception:
+            remote_index = {}
+
     for index, item in enumerate(protected):
         if (not item.get('id') or not item.get('name')
                 or not re.fullmatch('[0-9a-f]{64}', item.get('sha256', ''))):
             raise ValueError('PROTECTED_BASELINE_INVALID')
-        data, meta = snapshot(drive, item['id'], item.get('mode', 'binary'))
+        mode = item.get('mode', 'binary')
+        known_meta = remote_index.get(item['id'])
+        server_sha = _valid_server_sha256(known_meta, mode=mode)
+        needs_local_bytes = (
+            not bundle_mode
+            or item.get('kind') in {'master', 'six_table', 'source_registry'}
+            or item.get('name') == 'bayi_legacy_context.md'
+            or server_sha is None
+        )
+        if not needs_local_bytes:
+            if server_sha != item['sha256']:
+                raise ValueError('BASELINE_REFREEZE_REQUIRED')
+            item['meta'] = fingerprint(known_meta)
+            item['verification_mode'] = 'server_sha256'
+            continue
+        data, meta = snapshot(drive, item['id'], mode, known_meta=known_meta)
         clean(data, item['name'])
         if digest(data) != item['sha256']:
             raise ValueError('BASELINE_REFREEZE_REQUIRED')
@@ -1543,17 +2008,38 @@ def freeze_closure(drive, root, plan):
     security_preflight(root, plan)
 
 
-def verify_protected(drive, root, plan):
+def verify_protected(drive, root, plan, *, remote_index=None):
     """All business/source/evidence bytes remain identical throughout publication."""
     protected = plan['closure']['protected']
     candidate = {entry['id']: entry for entry in plan['entries']}
+    index = remote_index
+    if index is None and (plan.get('closure') or {}).get('zones'):
+        try:
+            inv_items, _ = _inventory(drive, plan['closure']['zones'])
+            index = {item['id']: item for item in inv_items}
+        except Exception:
+            index = None
     for item in protected:
-        before = child(root, item['before']).read_bytes()
-        clean(before, item['name'])
-        now = payload(drive, item)
-        clean(now, item['name'])
-        if digest(before) != item['sha256'] or digest(now) != item['sha256']:
-            raise ValueError('ZERO_BUSINESS_FACT_DELTA')
+        before_rel = item.get('before')
+        if before_rel:
+            before = child(root, before_rel).read_bytes()
+            clean(before, item['name'])
+            if digest(before) != item['sha256']:
+                raise ValueError('ZERO_BUSINESS_FACT_DELTA')
+        mode = item.get('mode', 'binary')
+        meta = (index or {}).get(item['id'])
+        server_sha = _valid_server_sha256(meta, mode=mode) if meta is not None else None
+        if server_sha is not None:
+            if server_sha != item['sha256']:
+                raise ValueError('ZERO_BUSINESS_FACT_DELTA')
+            frozen_parents = (item.get('meta') or {}).get('parents')
+            if frozen_parents and meta.get('parents') != frozen_parents:
+                raise ValueError('ZERO_BUSINESS_FACT_DELTA')
+        else:
+            now = payload(drive, item)
+            clean(now, item['name'])
+            if digest(now) != item['sha256']:
+                raise ValueError('ZERO_BUSINESS_FACT_DELTA')
         if item['id'] in candidate and candidate[item['id']]['after_hash'] != item['sha256']:
             raise ValueError('ZERO_BUSINESS_FACT_DELTA')
     return {'status': 'PASS', 'protected_artifacts': len(protected)}
@@ -2227,7 +2713,7 @@ def validate_post_freeze_release_evidence(
 
 def validate_closure(
         drive, root, plan, *, candidate, relocated=False, final=False,
-        execution_authority=None):
+        execution_authority=None, remote_inventory=None):
     import copy
     import csv
     import io
@@ -2238,11 +2724,25 @@ def validate_closure(
     from .current_state import audit_current_history, validate_current_state
     closure = plan['closure']
     entries = {entry['logical_key']: entry for entry in plan['entries']}
-    verify_protected(drive, root, plan)
+    if remote_inventory is not None:
+        items, zones = remote_inventory
+    else:
+        items, zones = _inventory(drive, closure['zones'])
+    remote_index = {item['id']: item for item in items}
+    verify_protected(drive, root, plan, remote_index=remote_index)
 
     def content(key):
         entry = entries[key]
-        data = verified_local(root, entry, 'candidate') if candidate else payload(drive, entry)
+        if candidate:
+            data = verified_local(root, entry, 'candidate')
+        else:
+            mode = entry.get('mode', 'binary')
+            meta = remote_index.get(entry['id'])
+            server_sha = _valid_server_sha256(meta, mode=mode) if meta is not None else None
+            if server_sha is not None and server_sha == entry['after_hash']:
+                data = verified_local(root, entry, 'candidate')
+            else:
+                data = payload(drive, entry)
         clean(data, entry['name'])
         return data
 
@@ -2250,6 +2750,10 @@ def validate_closure(
     manifest = content(closure['manifest_key'])
     by_key = manifest_index(manifest)
     protected = {item['id']: item for item in closure['protected']}
+    carry_forward_by_id = {
+        item['id']: item for item in plan.get('carry_forward_artifacts', [])
+        if isinstance(item, dict) and item.get('id')
+    }
     sources = [item for item in protected.values() if item['kind'] == 'source_registry']
     if len(sources) != 1:
         raise ValueError('SOURCE_REGISTRY_BASELINE_REQUIRED')
@@ -2279,10 +2783,18 @@ def validate_closure(
             if entries[key]['id'] != fid:
                 raise ValueError('MANIFEST_TARGET_MISMATCH')
             data = content(key)
+        elif fid in protected:
+            prot_item = protected[fid]
+            if prot_item.get('before') and child(root, prot_item['before']).exists():
+                data = child(root, prot_item['before']).read_bytes()
+            else:
+                data = payload(drive, prot_item)
+        elif plan.get('incremental_mode') and fid in carry_forward_by_id:
+            data = payload(drive, {'id': fid, 'mode': 'binary'})
+            if digest(data) != carry_forward_by_id[fid]['sha256']:
+                raise ValueError('MANIFEST_PRODUCT_HASH_MISMATCH')
         else:
-            if fid not in protected:
-                raise ValueError('PRODUCT_BASELINE_REQUIRED')
-            data = payload(drive, protected[fid])
+            raise ValueError('PRODUCT_BASELINE_REQUIRED')
         clean(data, key)
         if digest(data) != (row.get('content_hash') or row.get('sha256')):
             raise ValueError('MANIFEST_PRODUCT_HASH_MISMATCH')
@@ -2320,14 +2832,16 @@ def validate_closure(
             raise ValueError('MANIFEST_TARGET_MISMATCH')
         if key != closure['manifest_key'] and (row.get('content_hash') or row.get('sha256')) != entry['after_hash']:
             raise ValueError('MANIFEST_TARGET_HASH_MISMATCH')
-    items, zones = _inventory(drive, closure['zones'])
     # Before relocation, validate the intended current location as well as bytes.
     by_id = {item['id']: copy.deepcopy(item) for item in items}
     zone_roots = [
         *zones['current'], *zones['history'], *zones['staging'], *zones['evidence'],
     ]
     for entry in plan['entries']:
-        item = copy.deepcopy(drive.meta(entry['id']))
+        if entry['id'] in by_id:
+            item = copy.deepcopy(by_id[entry['id']])
+        else:
+            item = copy.deepcopy(drive.meta(entry['id']))
         target = entry.get('publish_parent')
         if target and _under([target], zone_roots, zones.get('folders', {})):
             if not relocated:
@@ -2377,38 +2891,130 @@ def verify(drive, root, execution_authority=None):
     plan=read(Path(root)/'plan.json')
     authority=read_execution_authority(drive, execution_authority)
     security_preflight(Path(root), plan, authority)
+    remote_inventory = None
+    remote_index = {}
+    if plan.get('closure') and (plan['closure'].get('zones')):
+        remote_inventory = _inventory(drive, plan['closure']['zones'])
+        remote_index = {item['id']: item for item in remote_inventory[0]}
     for e in plan['entries']:
+        mode = e.get('mode', 'binary')
+        meta = remote_index.get(e['id'])
+        server_sha = _valid_server_sha256(meta, mode=mode) if meta is not None else None
+        if server_sha is not None and meta.get('mimeType') == e['mime'] and server_sha == e['after_hash']:
+            scan_native_document(drive, e)
+            continue
         content = payload(drive,e)
         clean(content, 'readback/' + e['name'])
         scan_native_document(drive, e)
-        if drive.meta(e['id'])['mimeType']!=e['mime'] or digest(content)!=e['after_hash']:
+        actual_meta = meta if meta is not None else drive.meta(e['id'])
+        if actual_meta['mimeType']!=e['mime'] or digest(content)!=e['after_hash']:
             raise RuntimeError('Remote verification failed: '+e['name'])
     if plan.get('closure'):
         validate_closure(
             drive, Path(root), plan, candidate=False,
             execution_authority=authority,
+            remote_inventory=remote_inventory,
         )
+    _verify_carry_forward_if_incremental(drive, plan, remote_index=remote_index or None)
     return {'verified':len(plan['entries'])}
 
 
-def restore(drive, root, single_writer=False):
+def _resolve_restore_sources(
+    drive, root, plan, journal, status, *, bundle_file_id=None, max_bundle_bytes=MAX_BUNDLE_EXTRACT_BYTES
+):
+    """Load verified pre-release bytes from local files or cloud release_bundle.tar.gz."""
+    root = Path(root)
+    status_before_path = root / 'status.before.json'
+    local_complete = status_before_path.is_file() and all(
+        child(root, e['before']).is_file() for e in plan['entries']
+    )
+    if local_complete and bundle_file_id is None:
+        status_before_raw = status_before_path.read_bytes()
+        if digest(status_before_raw) != plan['status_before_hash']:
+            raise RuntimeError('Frozen previous status was altered')
+        before_by_id = {
+            e['id']: verified_local(root, e, 'before') for e in plan['entries']
+        }
+        return before_by_id, json.loads(status_before_raw)
+
+    # Fallback to cloud bundle_v1 archive when local before/ or status.before.json is missing
+    if bundle_file_id is None and plan.get('archive_format') != ARCHIVE_FORMAT_BUNDLE_V1:
+        # Preserve original local error path for non-bundle legacy releases
+        if not status_before_path.is_file():
+            raise FileNotFoundError(str(status_before_path))
+        status_before_raw = status_before_path.read_bytes()
+        if digest(status_before_raw) != plan['status_before_hash']:
+            raise RuntimeError('Frozen previous status was altered')
+        before_by_id = {
+            e['id']: verified_local(root, e, 'before') for e in plan['entries']
+        }
+        return before_by_id, json.loads(status_before_raw)
+
+    expected_bundle_sha = None
+    if bundle_file_id is None:
+        for snap_source in (journal.get('previous_snapshot'), status.get('previous_snapshot')):
+            if not isinstance(snap_source, list):
+                continue
+            for item in snap_source:
+                if isinstance(item, dict) and item.get('bundle_file_id'):
+                    bundle_file_id = item['bundle_file_id']
+                    expected_bundle_sha = item.get('bundle_sha256')
+                    break
+            if bundle_file_id:
+                break
+    if not bundle_file_id:
+        raise RuntimeError('RESTORE_BUNDLE_NOT_FOUND')
+
+    if hasattr(drive, 'get_bounded'):
+        bundle_bytes = drive.get_bounded(bundle_file_id, max_bundle_bytes)
+    else:
+        bundle_bytes = drive.get(bundle_file_id)
+        if len(bundle_bytes) > max_bundle_bytes:
+            raise ReleaseContractError('BUNDLE_EXTRACT_LIMIT_EXCEEDED')
+    if expected_bundle_sha and digest(bundle_bytes) != expected_bundle_sha:
+        raise ReleaseContractError('BUNDLE_ARCHIVE_HASH_MISMATCH')
+
+    extracted = extract_release_bundle(bundle_bytes, max_bytes=max_bundle_bytes)
+    manifest = extracted['manifest']
+    members = extracted['members']
+    if manifest.get('release_id') != plan['release_id']:
+        raise ReleaseContractError('BUNDLE_RELEASE_ID_MISMATCH')
+    status_before_raw = members.get('status.before.json')
+    if status_before_raw is None or digest(status_before_raw) != plan['status_before_hash']:
+        raise RuntimeError('Frozen previous status was altered')
+    before_by_id = {}
+    for e in plan['entries']:
+        b_data = members.get(e['before'])
+        if b_data is None or digest(b_data) != e['before_hash']:
+            raise RuntimeError('Frozen local artifact was altered')
+        before_by_id[e['id']] = b_data
+    return before_by_id, json.loads(status_before_raw)
+
+
+def restore(
+    drive, root, single_writer=False, *,
+    bundle_file_id=None, max_bundle_bytes=MAX_BUNDLE_EXTRACT_BYTES,
+):
     root=Path(root)
     if not single_writer: raise RuntimeError('Single-writer maintenance window required')
     with lock(root.parent/'publish.lock'):
         plan,journal=read(root/'plan.json'),read(root/'journal.json')
         security_preflight(root, plan)
         stage('restore',f'release {plan["release_id"]} from {journal["state"]}')
-        if digest((root/'status.before.json').read_bytes())!=plan['status_before_hash']:
-            raise RuntimeError('Frozen previous status was altered')
         import json
         status=json.loads(drive.get(plan['status_id']))
+        before_by_id, previous_status = _resolve_restore_sources(
+            drive, root, plan, journal, status,
+            bundle_file_id=bundle_file_id,
+            max_bundle_bytes=max_bundle_bytes,
+        )
         already=(status.get('state')=='ROLLED_BACK' and status.get('rolled_back_release_id')==plan['release_id'])
         if not already and status.get('pending_release_id')!=plan['release_id'] and status.get('current_release_id')!=plan['release_id']:
             raise RuntimeError('Cannot roll back another release')
         for e in plan['entries']:
-            verified_local(root,e,'before')
-            clean(payload(drive,e), 'restore/' + e['name'])
-            if digest(payload(drive,e)) not in (e['before_hash'],e['after_hash']):
+            now_data = payload(drive,e)
+            clean(now_data, 'restore/' + e['name'])
+            if digest(now_data) not in (e['before_hash'],e['after_hash']):
                 raise RuntimeError('Rollback would overwrite an external edit')
         if already:
             for e in plan['entries']:
@@ -2421,14 +3027,14 @@ def restore(drive, root, single_writer=False):
         stage('restore','ROLLING_BACK published; restoring original bytes')
         for index,e in enumerate(reversed(plan['entries']),1):
             stage('restore',f'{index}/{len(plan["entries"])} {e["name"]}')
-            old=verified_local(root,e,'before')
+            old=before_by_id[e['id']]
             now=payload(drive,e)
             if digest(now) not in (e['before_hash'],e['after_hash']):raise RuntimeError('Target changed during rollback')
             if digest(now)!=e['before_hash']: write_payload(drive,e,old)
-            if digest(payload(drive,e))!=e['before_hash']: raise RuntimeError('Rollback readback failed')
-            clean(payload(drive,e), 'restore/' + e['name'])
+            readback = payload(drive,e)
+            if digest(readback)!=e['before_hash']: raise RuntimeError('Rollback readback failed')
+            clean(readback, 'restore/' + e['name'])
             relocate(drive,e,e.get('staging_parent'))
-        previous_status=read(root/'status.before.json')
         if plan.get('closure'):
             verify_protected(drive, root, plan)
         previous_status['state']='ROLLED_BACK'

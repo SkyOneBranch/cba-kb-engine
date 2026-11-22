@@ -46,12 +46,16 @@ from cba_kb.drive import Drive  # noqa: E402
 from cba_kb.instance import load_instance  # noqa: E402
 from cba_kb.placement_facade import placement_enforced  # noqa: E402
 from cba_kb.release import (  # noqa: E402
+    ARCHIVE_FORMAT_LEGACY,
     PreMutationAbort,
     _inventory,
+    _valid_server_sha256,
     fingerprint,
+    index_folders_batch,
     prepare as prepare_release,
     snapshot,
     validate_release_topology,
+    verify_remote_objects_batch,
 )
 
 # Re-exported frozen constants & shared validators from scripts.prepare_production
@@ -91,6 +95,7 @@ build_live_qualification_fingerprints = _base.build_live_qualification_fingerpri
 
 V215_BASELINE_SHA = "3874ebb4b20fdfd5c1d1fd7f9ed9426d9f26036f"
 V220_1_BASELINE_SHA = "fa9793c6db76e15880610ced728a7b0d563da604"
+V221_1_BASELINE_SHA = "e58a2787a6176397a142abced682eed5d10f1289"
 
 V215_RELEASE_SPECS: dict[str, dict] = {
     "v2.1.5-1": {
@@ -101,6 +106,13 @@ V215_RELEASE_SPECS: dict[str, dict] = {
         "product_baseline_sha": V220_1_BASELINE_SHA,
         "enable_consumer_surface_v215": True,
         "enable_operational_kb_v220": True,
+    },
+    "v2.2.1-1": {
+        "product_baseline_sha": V221_1_BASELINE_SHA,
+        "enable_consumer_surface_v215": True,
+        "enable_operational_kb_v220": True,
+        "incremental_delta_only": True,
+        "archive_format": "bundle_v1",
     },
 }
 
@@ -598,6 +610,19 @@ def reserve_staging(
     return {"allocation": allocation, "validated": validated}
 
 
+def _is_delta_key(logical_key, item, *, new_by_key, carried_code_targets):
+    """Classify whether a logical key requires write mutation in O(Δ) incremental mode."""
+    if logical_key in new_by_key or logical_key in CONTROL_KEYS:
+        return True
+    if logical_key.startswith("code/"):
+        if logical_key in carried_code_targets:
+            return False
+        return item.get("disposition") == "modified"
+    if item.get("consumer_target_kind") == "consumer_surface":
+        return item.get("disposition") == "modified"
+    return False
+
+
 def _candidate_inputs(
     drive,
     engine_root,
@@ -605,6 +630,8 @@ def _candidate_inputs(
     allocation,
     output,
     consumer_target_contents=None,
+    *,
+    incremental=False,
 ):
     output.mkdir(parents=True, exist_ok=False)
     candidates = output / "candidate-inputs"
@@ -640,6 +667,51 @@ def _candidate_inputs(
     item_by_key = {
         key: existing_by_key.get(key) or new_by_key[key] for key in ordered
     }
+    carried_code_targets = set(projection.get("carried_forward_code_targets", []))
+
+    if incremental:
+        delta_keys = [
+            key for key in ordered
+            if _is_delta_key(
+                key,
+                item_by_key[key],
+                new_by_key=new_by_key,
+                carried_code_targets=carried_code_targets,
+            )
+        ]
+        carry_forward_keys = [key for key in ordered if key not in set(delta_keys)]
+        staging_id = allocation.get("staging_id")
+        cf_folders = set()
+        cf_verify_items = []
+        for cf_key in carry_forward_keys:
+            cf_item = item_by_key[cf_key]
+            parent = cf_item.get("publish_parent")
+            if parent:
+                cf_folders.add(parent)
+            for ap in cf_item.get("allowed_parents") or []:
+                if ap and ap != staging_id:
+                    cf_folders.add(ap)
+            cf_verify_items.append({
+                "id": cf_item["id"],
+                "name": cf_item["name"],
+                "sha256": cf_item.get("previous_sha256"),
+                "mime": cf_item.get("mime"),
+                "mode": cf_item.get("mode", "binary"),
+                "allowed_parents": cf_item.get("allowed_parents") or [],
+            })
+        if cf_verify_items:
+            cf_remote_index = index_folders_batch(drive, cf_folders)
+            verify_remote_objects_batch(
+                drive,
+                cf_verify_items,
+                remote_index=cf_remote_index,
+                error_cls=ProjectionError,
+                error_code="CARRY_FORWARD_REMOTE_DRIFT",
+            )
+    else:
+        delta_keys = list(ordered)
+
+    delta_key_set = set(delta_keys)
     registry = None
     registry_bytes = None
     manifest_previous = None
@@ -661,7 +733,6 @@ def _candidate_inputs(
         )
     data_by_key = {}
     previous_by_key = {}
-    carried_code_targets = set(projection.get("carried_forward_code_targets", []))
 
     # Preload MASTER row count fail-closed before rendering control documents regardless of key sort order.
     csv_count = None
@@ -694,7 +765,7 @@ def _candidate_inputs(
     if requires_master_count and master_row_count is None:
         raise ProjectionError("MASTER_INPUT_MISSING")
 
-    for logical_key in ordered:
+    for logical_key in delta_keys:
         if logical_key == "input/manifest.csv" or logical_key in data_by_key:
             continue
         item = item_by_key[logical_key]
@@ -751,7 +822,7 @@ def _candidate_inputs(
             manifest_previous, projection, allocation, id_by_key,
             data_by_key, item_by_key,
         )
-    for index, logical_key in enumerate(ordered):
+    for index, logical_key in enumerate(delta_keys):
         item = item_by_key[logical_key]
         candidate = candidates / str(index)
         data = data_by_key[logical_key]
@@ -851,6 +922,11 @@ def _manifest_candidate(
             row["content_hash"] = ""
         elif logical_key in data_by_key:
             row["content_hash"] = digest(data_by_key[logical_key])
+        else:
+            prev_sha = item_by_key[logical_key].get("previous_sha256")
+            if not isinstance(prev_sha, str) or not re.fullmatch("[0-9a-f]{64}", prev_sha):
+                raise ProjectionError(f"MANIFEST_CARRY_FORWARD_HASH_MISSING:{logical_key}")
+            row["content_hash"] = prev_sha
         output_rows.append({name: row.get(name, "") for name in columns})
     stream = io.StringIO(newline="")
     writer = csv.DictWriter(
@@ -1084,11 +1160,16 @@ def _evidence_baseline(drive, roots):
             "managed_doc"
             if item.get("mimeType") == NATIVE_DOCUMENT else "binary"
         )
-        data, _ = snapshot(drive, item["id"], mode)
+        server_sha = _valid_server_sha256(item, mode=mode)
+        if server_sha is not None:
+            sha = server_sha
+        else:
+            data, _ = snapshot(drive, item["id"], mode, known_meta=item)
+            sha = digest(data)
         protected.append({
             "id": item["id"],
             "name": item["name"],
-            "sha256": digest(data),
+            "sha256": sha,
             "mode": mode,
             "kind": "evidence",
         })
@@ -1100,6 +1181,13 @@ def _build_closure_contract(
 ):
     """Build the production closure from actual candidate targets and zones."""
     by_key = {entry["logical_key"]: entry for entry in entries}
+    existing_by_key = {
+        item["logical_key"]: item
+        for item in projection.get("existing_targets", [])
+        if isinstance(item, dict)
+        and item.get("logical_key")
+        and item.get("disposition") != "RETIRED_FROM_CURRENT"
+    }
     document_keys = {
         "readme": "entry/README",
         "index": "derived/INDEX.md",
@@ -1129,11 +1217,10 @@ def _build_closure_contract(
     )
     protected = []
     for logical_key, kind in protected_specs:
-        try:
-            entry = by_key[logical_key]
-        except KeyError:
-            raise ProjectionError("CLOSURE_PROTECTED_TARGET_MISSING") from None
-        before_hash = entry.get("before_hash")
+        entry = by_key.get(logical_key) or existing_by_key.get(logical_key)
+        if entry is None:
+            raise ProjectionError("CLOSURE_PROTECTED_TARGET_MISSING")
+        before_hash = entry.get("before_hash") or entry.get("previous_sha256")
         if (
             not isinstance(before_hash, str)
             or not re.fullmatch("[0-9a-f]{64}", before_hash)
@@ -1166,22 +1253,32 @@ def _build_closure_contract(
             raise ProjectionError(f"CLOSURE_TOPOLOGY_INVALID: {exc}") from exc
 
     if has_explicit_topology:
-        planned_target_ids = [
+        delta_target_ids = [
             e["id"] for e in entries
             if isinstance(e, dict) and e.get("id")
         ]
+        delta_id_set = set(delta_target_ids)
+        carry_forward_ids = [
+            item["id"] for item in projection.get("existing_targets", [])
+            if isinstance(item, dict)
+            and item.get("id")
+            and item["id"] not in delta_id_set
+            and item.get("disposition") != "RETIRED_FROM_CURRENT"
+        ]
+        all_target_ids = delta_target_ids + carry_forward_ids
         try:
             nodes = build_release_topology_from_production(
                 policy,
                 instance=instance,
                 release_id=projection.get("release_id"),
-                planned_target_ids=planned_target_ids,
+                planned_target_ids=all_target_ids,
                 allocation_staging_id=allocation.get("staging_id"),
             )
             validate_release_topology(
                 nodes,
                 release_id=projection.get("release_id"),
-                planned_target_ids=planned_target_ids,
+                planned_target_ids=delta_target_ids,
+                carry_forward_target_ids=carry_forward_ids or None,
             )
         except Exception as exc:
             raise ProjectionError(f"CLOSURE_TOPOLOGY_INVALID: {exc}") from exc
@@ -1214,14 +1311,15 @@ def _build_closure_contract(
         for logical_key in required | (
             {item[0] for item in protected_specs} - evidence_keys
         ):
-            parent = by_key[logical_key].get("publish_parent")
+            target_rec = by_key.get(logical_key) or existing_by_key.get(logical_key) or {}
+            parent = target_rec.get("publish_parent")
             if parent and parent != parents["archive"]:
                 current.add(parent)
         history = {parents["archive"]}
         evidence = {
-            by_key[logical_key].get("publish_parent")
+            (by_key.get(logical_key) or existing_by_key.get(logical_key) or {}).get("publish_parent")
             for logical_key in evidence_keys
-            if by_key[logical_key].get("publish_parent")
+            if (by_key.get(logical_key) or existing_by_key.get(logical_key) or {}).get("publish_parent")
         }
         if not evidence:
             raise ProjectionError("CLOSURE_EVIDENCE_ZONE_MISSING")
@@ -1422,9 +1520,19 @@ def freeze_plan(
     allocation,
     output,
     consumer_target_contents=None,
+    incremental=None,
+    archive_format=None,
 ):
     """Freeze all candidate bytes and a remote-read-only release plan."""
     release_spec = _require_release(release_id)
+    use_incremental = (
+        bool(release_spec.get("incremental_delta_only", False))
+        if incremental is None else bool(incremental)
+    )
+    effective_archive_format = (
+        release_spec.get("archive_format", ARCHIVE_FORMAT_LEGACY)
+        if archive_format is None else archive_format
+    )
     verify_execution_sha(
         engine_root,
         projection["engine_sha"],
@@ -1451,6 +1559,7 @@ def freeze_plan(
     entries = _candidate_inputs(
         drive, engine_root, projection, allocation, output,
         consumer_target_contents=consumer_target_contents,
+        incremental=use_incremental,
     )
     policy = instance.read_json("production.json")
     dependencies = load_production_dependencies(drive, policy)
@@ -1465,6 +1574,13 @@ def freeze_plan(
             entries=entries,
             state=state,
         )
+    prepare_kwargs = {}
+    if closure is not None:
+        prepare_kwargs["closure"] = closure
+    if effective_archive_format != ARCHIVE_FORMAT_LEGACY:
+        prepare_kwargs["archive_format"] = effective_archive_format
+    if use_incremental:
+        prepare_kwargs["incremental_mode"] = True
     plan = prepare_release(
         drive,
         outbox,
@@ -1475,7 +1591,7 @@ def freeze_plan(
         dependencies,
         carry_forward_artifacts=True,
         retired_artifacts=projection.get("retiring_targets", []),
-        **({"closure": closure} if closure is not None else {}),
+        **prepare_kwargs,
         environment="production",
         code_commit=projection["engine_sha"],
     )
@@ -1490,6 +1606,11 @@ def freeze_plan(
     classification = {
         entry["logical_key"]: entry["change_class"] for entry in entries
     }
+    if use_incremental:
+        for item in projection.get("existing_targets", []):
+            lk = item.get("logical_key")
+            if lk and lk not in classification and item.get("disposition") != "RETIRED_FROM_CURRENT":
+                classification[lk] = "CARRIED_FORWARD_INCREMENTAL"
     classification.update({
         item["logical_key"]: "RETIRED_FROM_CURRENT"
         for item in projection.get("retiring_targets", [])

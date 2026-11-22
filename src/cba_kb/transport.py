@@ -13,6 +13,7 @@ import re
 import socket
 import ssl
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -28,7 +29,9 @@ RETRY_MAX_DELAY = 8.0
 # errors stay status-classified so 401/403/404 can never become retryable.
 for _module, _name in (('httplib2', 'HttpLib2Error'),
                        ('google.auth.exceptions', 'TransportError'),
-                       ('requests.exceptions', 'ConnectionError')):
+                       ('requests.exceptions', 'ConnectionError'),
+                       ('requests.exceptions', 'Timeout'),
+                       ('requests.exceptions', 'SSLError')):
     try:
         _type = getattr(importlib.import_module(_module), _name)
     except Exception:
@@ -36,7 +39,16 @@ for _module, _name in (('httplib2', 'HttpLib2Error'),
     if _type not in TRANSIENT_TYPES:
         TRANSIENT_TYPES = TRANSIENT_TYPES + (_type,)
 
+_STATS_LOCK = threading.Lock()
 READ_RETRY_STATS = {'attempts': 0, 'retries': 0, 'resets': 0, 'failures': 0}
+API_CALL_STATS = {
+    'list_calls': 0,
+    'meta_calls': 0,
+    'download_calls': 0,
+    'upload_calls': 0,
+    'copy_calls': 0,
+    'move_calls': 0,
+}
 
 
 class DownloadTooLargeError(RuntimeError):
@@ -51,12 +63,37 @@ class DownloadTooLargeError(RuntimeError):
 
 def read_retry_stats():
     """Deterministic counters for release evidence; never contains payload data."""
-    return dict(READ_RETRY_STATS)
+    with _STATS_LOCK:
+        return dict(READ_RETRY_STATS)
 
 
 def reset_read_retry_stats():
-    for key in READ_RETRY_STATS:
-        READ_RETRY_STATS[key] = 0
+    with _STATS_LOCK:
+        for key in READ_RETRY_STATS:
+            READ_RETRY_STATS[key] = 0
+
+
+def record_api_call(kind, count=1):
+    """Increment a sanitized API call counter under lock (never records IDs/payloads)."""
+    if kind not in API_CALL_STATS:
+        raise ValueError(f'Unknown API call counter kind: {kind!r}')
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise ValueError('API call count must be a non-negative int')
+    with _STATS_LOCK:
+        API_CALL_STATS[kind] += count
+
+
+def api_call_stats():
+    """Return a sanitized snapshot of API call counters."""
+    with _STATS_LOCK:
+        return dict(API_CALL_STATS)
+
+
+def reset_api_call_stats():
+    """Reset sanitized API call counters."""
+    with _STATS_LOCK:
+        for key in API_CALL_STATS:
+            API_CALL_STATS[key] = 0
 
 
 def stage(name, message=''):
@@ -111,18 +148,22 @@ def retry_read(call, attempts=RETRY_ATTEMPTS, base=RETRY_BASE_SECONDS, label='dr
     failure is deterministic and non-transient.
     """
     for attempt in range(1, attempts + 1):
-        READ_RETRY_STATS['attempts'] += 1
+        with _STATS_LOCK:
+            READ_RETRY_STATS['attempts'] += 1
         try:
             return call()
         except Exception as exception:
             if attempt == attempts or not transient(exception):
-                READ_RETRY_STATS['failures'] += 1
+                with _STATS_LOCK:
+                    READ_RETRY_STATS['failures'] += 1
                 stage(f'{label} failed', reason(exception))
                 raise
-            READ_RETRY_STATS['retries'] += 1
+            with _STATS_LOCK:
+                READ_RETRY_STATS['retries'] += 1
             if reset is not None:
                 reset()
-                READ_RETRY_STATS['resets'] += 1
+                with _STATS_LOCK:
+                    READ_RETRY_STATS['resets'] += 1
             delay = min(base * 2 ** (attempt - 1), max_delay)
             stage(f'{label} retry', f'{reason(exception)}; attempt {attempt}/{attempts} in {delay:.1f}s')
             (sleep or time.sleep)(delay)
