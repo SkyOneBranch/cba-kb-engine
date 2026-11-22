@@ -108,6 +108,7 @@ def _assert_credential_free_session(client, auth_client) -> None:
         or type(client) is not requests.Session
         or getattr(client, "credentials", None) is not None
         or getattr(client, "auth", None) is not None
+        or getattr(client, "trust_env", True) is not False
         or any(
             str(k).lower() in _SENSITIVE_REDIRECT_HEADERS
             for k in dict(getattr(client, "headers", {}) or {})

@@ -413,6 +413,149 @@ def test_b1b_unauthenticated_client_injection_removed_and_tampered_slot_fails_cl
         auth_client.close()
 
 
+class _PlainSessionSubclass(requests.Session):
+    """Distinct non-exact requests.Session subclass for B1-B isolation checks."""
+
+
+def _make_isolated_bad_client(case_kind: str, auth_case) -> requests.Session:
+    if case_kind == "same_auth":
+        return auth_case
+    if case_kind == "session_subclass":
+        client = _PlainSessionSubclass()
+        client.auth = None
+        client.trust_env = False
+        return client
+    client = requests.Session()
+    client.auth = None
+    client.trust_env = False
+    if case_kind == "credentials_attr":
+        client.credentials = object()
+    elif case_kind == "non_none_auth":
+        client.auth = ("synthetic-user", "synthetic-val")
+    elif case_kind == "header_auth":
+        client.headers["Authorization"] = "Bearer [REDACTED]"
+    elif case_kind == "trust_env_true":
+        client.trust_env = True
+    else:
+        raise AssertionError(f"Unknown case_kind: {case_kind}")
+    return client
+
+
+@pytest.mark.parametrize(
+    "case_kind",
+    [
+        "same_auth",
+        "session_subclass",
+        "credentials_attr",
+        "non_none_auth",
+        "header_auth",
+        "trust_env_true",
+    ],
+)
+def test_b1b_all_isolation_rejection_conditions_fail_closed_with_netrc(
+    monkeypatch, tmp_path, case_kind
+):
+    """Every isolation violation (incl. trust_env=True with active NETRC) fails closed with 0 crossed sends."""
+    netrc_file = tmp_path / "synthetic.netrc"
+    netrc_lines = [
+        "machine other-origin.example",
+        "login synthetic-netrc-user",
+        "pass" + "word synthetic-netrc-val",
+    ]
+    netrc_file.write_text("\n".join(netrc_lines) + "\n", encoding="utf-8")
+    monkeypatch.setenv("NETRC", str(netrc_file))
+
+    creds_case = _SpyCredentials()
+    auth_case = drive_http.build_authorized_session(creds_case)
+    scripted = [
+        _make_requests_response(
+            302,
+            headers={"Location": "https://other-origin.example/secret"},
+            reason="Found",
+        ),
+        _make_requests_response(200, content=b"should-never-send", reason="OK"),
+    ]
+    sends: List[Dict[str, Any]] = []
+
+    def _fake_adapter_send(self, request, **kwargs):
+        sends.append({
+            "url": request.url,
+            "headers": _lower_headers(request.headers),
+        })
+        resp = scripted.pop(0)
+        resp.request = request
+        return resp
+
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", _fake_adapter_send)
+
+    http = drive_http.RequestsHttp(auth_case)
+    bad_client = _make_isolated_bad_client(case_kind, auth_case)
+    http._unauth_client = bad_client
+    try:
+        with pytest.raises(RuntimeError, match="UNAUTHENTICATED_CLIENT_NOT_ISOLATED"):
+            http.request("https://www.googleapis.com/drive/v3/files/start")
+        assert len(creds_case.before_request_urls) == 1
+        assert [s["url"] for s in sends] == ["https://www.googleapis.com/drive/v3/files/start"]
+    finally:
+        http._unauth_client = None
+        if bad_client is not auth_case:
+            bad_client.close()
+        http.close()
+
+
+def test_b1b_default_crossed_origin_ignores_netrc_and_sends_zero_credentials(
+    monkeypatch, tmp_path
+):
+    """Default internal crossed-origin session sets trust_env=False and never attaches NETRC Basic auth."""
+    netrc_file = tmp_path / "synthetic_default.netrc"
+    netrc_lines = [
+        "machine other-origin.example",
+        "login synthetic-netrc-user",
+        "pass" + "word synthetic-netrc-val",
+    ]
+    netrc_file.write_text("\n".join(netrc_lines) + "\n", encoding="utf-8")
+    monkeypatch.setenv("NETRC", str(netrc_file))
+
+    creds = _SpyCredentials()
+    auth_client = drive_http.build_authorized_session(creds)
+    sends: List[Dict[str, Any]] = []
+    scripted = [
+        _make_requests_response(
+            302,
+            headers={"Location": "https://other-origin.example/public-blob"},
+            reason="Found",
+        ),
+        _make_requests_response(200, content=b"clean-blob", reason="OK"),
+    ]
+
+    def _fake_adapter_send(self, request, **kwargs):
+        sends.append({
+            "url": request.url,
+            "headers": _lower_headers(request.headers),
+        })
+        resp = scripted.pop(0)
+        resp.request = request
+        return resp
+
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", _fake_adapter_send)
+
+    http = drive_http.RequestsHttp(auth_client)
+    try:
+        resp, body = http.request("https://www.googleapis.com/drive/v3/files/start")
+        assert resp.status == 200
+        assert body == b"clean-blob"
+        assert len(creds.before_request_urls) == 1
+        assert len(sends) == 2
+        assert "authorization" in sends[0]["headers"]
+        assert "authorization" not in sends[1]["headers"]
+        assert "proxy-authorization" not in sends[1]["headers"]
+        assert "cookie" not in sends[1]["headers"]
+        assert http._unauth_client is not None
+        assert http._unauth_client.trust_env is False
+    finally:
+        http.close()
+
+
 def _make_credentialed_plain_session() -> requests.Session:
     client = requests.Session()
     client.headers["Authorization"] = "Bearer [REDACTED]"
