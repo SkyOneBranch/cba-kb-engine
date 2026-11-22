@@ -1265,8 +1265,9 @@ def build_release_bundle(root, plan):
         candidate_path = _validate_bundle_member_path(e['candidate'])
         before_data = verified_local(root, e, 'before')
         candidate_data = verified_local(root, e, 'candidate')
-        clean(before_data, 'bundle/' + before_path)
-        clean(candidate_data, 'bundle/' + candidate_path)
+        scan_label = e.get('logical_key') or e.get('name')
+        clean(before_data, 'bundle/' + (scan_label or before_path))
+        clean(candidate_data, 'bundle/' + (scan_label or candidate_path))
         members[before_path] = before_data
         members[candidate_path] = candidate_data
         entry_records.append({
@@ -1415,6 +1416,16 @@ def extract_release_bundle(
     if not isinstance(manifest_members, list) or not manifest_members:
         raise ReleaseContractError('BUNDLE_MANIFEST_INVALID')
 
+    member_labels = {}
+    for entry in manifest.get('entries') or []:
+        if isinstance(entry, dict):
+            label = entry.get('logical_key') or entry.get('name')
+            if label:
+                if entry.get('before_member'):
+                    member_labels[entry['before_member']] = label
+                if entry.get('candidate_member'):
+                    member_labels[entry['candidate_member']] = label
+
     declared_paths = set()
     for spec in manifest_members:
         if not isinstance(spec, dict):
@@ -1426,7 +1437,7 @@ def extract_release_bundle(
         data = extracted[mpath]
         if len(data) != spec.get('size') or digest(data) != spec.get('sha256'):
             raise ReleaseContractError('BUNDLE_MEMBER_HASH_MISMATCH')
-        clean(data, 'bundle/' + mpath)
+        clean(data, 'bundle/' + member_labels.get(mpath, mpath))
 
     if set(extracted) - {BUNDLE_MANIFEST_MEMBER} != declared_paths:
         raise ReleaseContractError('BUNDLE_UNDECLARED_MEMBER')
