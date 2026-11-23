@@ -29,8 +29,14 @@ _DOCS_HOST = "docs" + ".google." + "com"
 _DRIVE_URL_RE = re.compile(
     r"https?://(?:" + re.escape(_DRIVE_HOST) + r"|" + re.escape(_DOCS_HOST) + r")/[^\s)\]<>\"']+"
 )
+_POSIX_LOCAL_ROOTS = (
+    "Users|home|tmp|var|etc|opt|srv|data|private|root|mnt|Volumes|Library|Applications"
+)
 _LOCAL_PATH_RE = re.compile(
-    r"(?:file://)?(?<![A-Za-z0-9_.:/])/(?:Users|home)/[^\s)\]<>\"',;]+"
+    r"(?:file:///(?:[A-Za-z]:[/\\])?[^\s)\]<>\"',;]+"
+    r"|(?<![A-Za-z0-9_.:/])/(?:" + _POSIX_LOCAL_ROOTS + r")/[^\s)\]<>\"',;]+"
+    r"|(?<![A-Za-z0-9_.:/\\])[A-Za-z]:\\[^\s)\]<>\"',;]+"
+    r"|(?<![A-Za-z0-9_.:/\\])\\\\[A-Za-z0-9_.-]+\\[^\s)\]<>\"',;]+)"
 )
 
 CONSUMER_MASTER_FILENAME = "CBA_国内球员注册权威总表_2017-2027_CURRENT.csv"
@@ -76,11 +82,14 @@ _CURATED_ACTIVE_COMPETITIVE_KEYWORDS = (
     "取消注册",
     "签约",
     "裁员",
+    "解约",
+    "解除合同",
     "试训",
     "伤情",
     "伤病",
     "大名单",
     "出征名单",
+    "出征",
     "集训名单",
     "国家队",
     "#判罚解析#",

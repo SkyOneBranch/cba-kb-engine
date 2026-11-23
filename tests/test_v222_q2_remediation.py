@@ -484,3 +484,155 @@ def test_q2_p0_4_no_proxy_cidr_ipv6_ports_and_credential_rejection(monkeypatch, 
             assert "cookie" not in hop1["headers"]
         finally:
             http.close()
+
+
+# ---------------------------------------------------------------------------
+# Q2 Round 2: P0-2 filter overreach (解约/解除合同/出征) & pinned masquerade
+# ---------------------------------------------------------------------------
+
+
+def test_q2_r2_p0_2_waiver_expedition_keywords_and_pinned_masquerade():
+    bundles = [
+        {
+            "doc_id": "doc_r2_waiver_jieyue",
+            "title": "俱乐部官方公告：与外援协商一致完成解约",
+            "source_tier": "T1.5",
+            "event_class": "官方公告",
+            "published_at": "2025-06-30",
+            "body": "经双方友好协商，俱乐部正式与该球员解约，感谢其本赛季贡献。",
+        },
+        {
+            "doc_id": "doc_r2_expedition_chuzheng",
+            "title": "俱乐部官方公告：球队启程出征客场系列赛",
+            "source_tier": "T1",
+            "event_class": "官方公告",
+            "published_at": "2025-06-30",
+            "body": "球队今日启程出征客场，备战即将到来的焦点对决。",
+        },
+        {
+            "doc_id": "doc_r2_terminate_contract_no_class",
+            "title": "关于与外籍球员正式解除合同的说明",
+            "source_tier": "T1.5",
+            "published_at": "2025-06-30",
+            "body": "双方经协商决定提前解除合同，后续安排另行通知。",
+        },
+        {
+            "doc_id": "doc_r2_pinned_masquerade",
+            "title": "置顶：2023年国际赛事出征历史总结",
+            "source_tier": "T1",
+            "event_class": "历史总结",
+            "published_at": "2025-06-30",
+            "is_pinned": True,
+            "body": "历史置顶回顾球队当年出征历程与历史总结。",
+        },
+    ]
+
+    result = consumer_surface.filter_curated_operational_announcements(
+        bundles, active_window_start="2025-07-01"
+    )
+    admitted_ids = {b["doc_id"] for b in result["admitted"]}
+    filtered_ids = {b["doc_id"] for b in result["filtered"]}
+
+    assert admitted_ids == {
+        "doc_r2_waiver_jieyue",
+        "doc_r2_expedition_chuzheng",
+        "doc_r2_terminate_contract_no_class",
+    }
+    assert filtered_ids == {"doc_r2_pinned_masquerade"}
+
+
+# ---------------------------------------------------------------------------
+# Q2 Round 2: P0-2 arbitrary local path redaction (POSIX/Windows/UNC/file://)
+# ---------------------------------------------------------------------------
+
+
+def test_q2_r2_p0_2_metadata_path_redaction_posix_windows_unc_and_controls():
+    tmp_path_val = "/tmp/collector/private/bundle.md"
+    var_path_val = "/var/log/cba_kb/private.log"
+    etc_path_val = "/etc/cba_kb/secrets.conf"
+    opt_path_val = "/opt/cba_kb/data/dump.json"
+    win_c_path = "C:\\" + "Users\\name\\file.txt"
+    win_d_path = "D:\\data\\bundle.md"
+    unc_path = "\\\\server\\share\\file.md"
+    file_uri_path = "file:///tmp/x.md"
+
+    rel_path_control = "docs/guide.md"
+    https_data_url = "https://example.com/data/report.html"
+    https_tmp_url = "https://example.com/tmp/status.json"
+    prose_control = "球队出征公告"
+
+    checkpoint = {
+        "schema_version": 1,
+        "consumed_bundles": {
+            "2026-11/r2_paths.md": {
+                "doc_id": "doc_r2_paths_001",
+                "title": prose_control,
+                "canonical_url": https_data_url,
+                "source_tier": "T1",
+                "completeness": "full",
+                "published_at": "2026-11-20",
+                "acquired_at": "2026-11-23T06:00:00Z",
+                "event_class": "官方公告",
+                "upstream_origin": "CBA官方公告",
+                "content_hash": "a" * 64,
+                "file_sha256": "b" * 64,
+                "matched_persons": [],
+                "disclosure_posture": "public_evidence",
+                "top_tmp_path": tmp_path_val,
+                "var_log_path": var_path_val,
+                "etc_conf_path": etc_path_val,
+                "opt_dump_path": opt_path_val,
+                "win_paths": [win_c_path, win_d_path],
+                "unc_share": unc_path,
+                "file_uri": file_uri_path,
+                "deep_nested": {
+                    "level2": [
+                        {
+                            "level3_path": f"captured from {tmp_path_val}",
+                            "level3_win": f"mirror {win_c_path} and {unc_path}",
+                        }
+                    ]
+                },
+                "relative_doc_ref": rel_path_control,
+                "secondary_url": https_tmp_url,
+                "editorial_note": f"正文说明：{prose_control}",
+            }
+        },
+    }
+
+    merged_bytes = consumer_surface.merge_operational_docs_into_consumer_index(
+        None, checkpoint
+    )
+    merged_text = merged_bytes.decode("utf-8")
+
+    # All 7 adversarial path shapes MUST be redacted (top-level and 3-level nested)
+    for forbidden in (
+        tmp_path_val,
+        var_path_val,
+        etc_path_val,
+        opt_path_val,
+        "Users\\name\\file.txt",
+        "D:\\data\\bundle.md",
+        "server\\share\\file.md",
+        file_uri_path,
+    ):
+        assert forbidden not in merged_text, f"Unredacted local path leaked: {forbidden!r}"
+
+    parsed = json.loads(merged_text)
+    doc = parsed["documents"][0]
+    assert doc["top_tmp_path"] == "<redacted-local-path>"
+    assert doc["var_log_path"] == "<redacted-local-path>"
+    assert doc["etc_conf_path"] == "<redacted-local-path>"
+    assert doc["opt_dump_path"] == "<redacted-local-path>"
+    assert doc["win_paths"] == ["<redacted-local-path>", "<redacted-local-path>"]
+    assert doc["unc_share"] == "<redacted-local-path>"
+    assert doc["file_uri"] == "<redacted-local-path>"
+    assert "<redacted-local-path>" in doc["deep_nested"]["level2"][0]["level3_path"]
+    assert "<redacted-local-path>" in doc["deep_nested"]["level2"][0]["level3_win"]
+
+    # Non-false-positive controls MUST be preserved verbatim
+    assert doc["relative_doc_ref"] == rel_path_control
+    assert doc["canonical_url"] == https_data_url
+    assert doc["secondary_url"] == https_tmp_url
+    assert doc["title"] == prose_control
+    assert doc["editorial_note"] == f"正文说明：{prose_control}"
