@@ -20,6 +20,8 @@ Security & correctness invariants:
 from __future__ import annotations
 
 import http.client
+import ipaddress
+import os
 import socket
 import ssl
 from urllib.parse import urljoin, urlsplit
@@ -31,6 +33,7 @@ DEFAULT_POOL_MAXSIZE = 16
 DEFAULT_MAX_REDIRECTS = 5
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307})
 _ALLOWED_REDIRECT_SCHEMES = frozenset({"http", "https"})
+_ALLOWED_PROXY_SCHEMES = frozenset({"http", "https"})
 _SENSITIVE_REDIRECT_HEADERS = frozenset({"authorization", "proxy-authorization", "cookie"})
 _BODY_HEADERS = frozenset({"content-length", "content-type", "content-encoding", "transfer-encoding"})
 
@@ -77,6 +80,141 @@ def _validate_redirect_url(url: str) -> None:
         raise ValueError(
             "UNSAFE_REDIRECT_URL: redirect target must use http or https with a valid host and no embedded credentials"
         )
+
+
+def _env_var_case_insensitive(name: str) -> str:
+    val = os.environ.get(name.lower())
+    if val is not None and val.strip():
+        return val.strip()
+    val = os.environ.get(name.upper())
+    if val is not None and val.strip():
+        return val.strip()
+    return ""
+
+
+def _parse_ip_address(value: str):
+    cleaned = value.strip()
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        cleaned = cleaned[1:-1]
+    if "%" in cleaned:
+        cleaned = cleaned.split("%", 1)[0]
+    try:
+        return ipaddress.ip_address(cleaned)
+    except ValueError:
+        return None
+
+
+def _should_bypass_proxy(hostname: str, port: int | None, no_proxy_raw: str) -> bool:
+    if not no_proxy_raw:
+        return False
+    host = hostname.strip().lower().rstrip(".")
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    target_ip = _parse_ip_address(host)
+
+    for raw_entry in no_proxy_raw.split(","):
+        entry = raw_entry.strip().lower()
+        if not entry:
+            continue
+        if entry == "*":
+            return True
+        entry_port: int | None = None
+        if entry.startswith("["):
+            bracket_end = entry.find("]")
+            if bracket_end == -1:
+                continue
+            entry_host = entry[1:bracket_end]
+            rest = entry[bracket_end + 1:]
+            if rest:
+                if rest.startswith(":") and rest[1:].isdigit():
+                    entry_port = int(rest[1:])
+                else:
+                    continue
+        elif "/" in entry:
+            entry_host = entry
+        elif entry.count(":") == 1:
+            entry_host, port_str = entry.split(":", 1)
+            if port_str.isdigit():
+                entry_port = int(port_str)
+            else:
+                continue
+        else:
+            entry_host = entry
+
+        if entry_port is not None and port != entry_port:
+            continue
+
+        if "/" in entry_host:
+            if target_ip is None:
+                continue
+            try:
+                network = ipaddress.ip_network(entry_host, strict=False)
+            except ValueError:
+                continue
+            if target_ip.version == network.version and target_ip in network:
+                return True
+            continue
+
+        entry_ip = _parse_ip_address(entry_host)
+        if entry_ip is not None:
+            if target_ip is not None and target_ip == entry_ip:
+                return True
+            continue
+
+        normalized = entry_host.lstrip(".").rstrip(".")
+        if not normalized:
+            continue
+        if host == normalized or host.endswith("." + normalized):
+            return True
+    return False
+
+
+def _validate_proxy_url(proxy_url: str) -> str:
+    if not proxy_url or any(ch in proxy_url for ch in ("\r", "\n", "\x00")):
+        raise ValueError(
+            "UNSAFE_PROXY_URL: proxy URL must use http or https with a valid host and no embedded credentials"
+        )
+    parsed = urlsplit(proxy_url)
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError(
+            "UNSAFE_PROXY_URL: proxy URL has an invalid port"
+        ) from exc
+    if (
+        parsed.scheme.lower() not in _ALLOWED_PROXY_SCHEMES
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or "@" in parsed.netloc
+    ):
+        raise ValueError(
+            "UNSAFE_PROXY_URL: proxy URL must use http or https with a valid host and no embedded credentials"
+        )
+    return proxy_url
+
+
+def _resolve_sanitized_env_proxies(target_url: str) -> dict[str, str]:
+    """Resolve credential-free HTTP(S) proxy settings from env vars while honoring NO_PROXY.
+
+    Keeps credential-free sessions isolated (``trust_env = False``, 0 ``.netrc`` reads,
+    0 ``Authorization`` / ``Proxy-Authorization`` / ``Cookie`` headers) while allowing
+    explicit sanitized proxy routing for crossed-origin redirects.
+    """
+    parsed_target = urlsplit(target_url)
+    scheme = parsed_target.scheme.lower()
+    hostname = parsed_target.hostname
+    if scheme not in _ALLOWED_REDIRECT_SCHEMES or not hostname:
+        return {}
+    port = parsed_target.port or (443 if scheme == "https" else 80)
+    no_proxy_raw = _env_var_case_insensitive("no_proxy")
+    if _should_bypass_proxy(hostname, port, no_proxy_raw):
+        return {}
+    proxy_url = _env_var_case_insensitive(f"{scheme}_proxy") or _env_var_case_insensitive("all_proxy")
+    if not proxy_url:
+        return {}
+    _validate_proxy_url(proxy_url)
+    return {scheme: proxy_url}
 
 
 def _strip_headers(headers: dict, names: frozenset[str]) -> dict:
@@ -206,6 +344,7 @@ class RequestsHttp:
             if use_unauth and isinstance(active_client, requests.Session):
                 active_client.cookies.clear()
                 req_kwargs["auth"] = None
+                req_kwargs["proxies"] = _resolve_sanitized_env_proxies(current_uri)
 
             try:
                 resp = active_client.request(

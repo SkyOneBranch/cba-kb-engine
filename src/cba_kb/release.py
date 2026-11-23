@@ -1130,35 +1130,69 @@ def prepare(
                 {'id':item['id'],'name':item['name'],'sha256':item['sha256']}
                 for item in carried if item['id'] not in retired_by_id
             ]
+        local_entries = []
         for i, entry in enumerate(entries):
-            name=entry['name']
-            if Path(name).name!=name: raise ValueError('Unsafe artifact name')
-            new=Path(entry['path']).read_bytes()
-            mode=entry.get('mode','binary')
-            meta=drive.meta(entry['id'])
-            if mode not in ('binary','managed_doc'):raise ValueError('Unknown publication mode')
-            allowed_native=mode=='managed_doc' and meta['mimeType']==DOC
-            if meta['mimeType']!=entry['mime'] or (meta['mimeType'].startswith('application/vnd.google-apps.') and not allowed_native):
+            name = entry['name']
+            if Path(name).name != name:
+                raise ValueError('Unsafe artifact name')
+            new = Path(entry['path']).read_bytes()
+            mode = entry.get('mode', 'binary')
+            if mode not in ('binary', 'managed_doc'):
+                raise ValueError('Unknown publication mode')
+            local_entries.append((i, entry, name, new, mode))
+
+        def _prefetch_entry(spec):
+            _i, entry, _name, new, mode = spec
+            meta = drive.meta(entry['id'])
+            allowed_native = mode == 'managed_doc' and meta['mimeType'] == DOC
+            if meta['mimeType'] != entry['mime'] or (
+                meta['mimeType'].startswith('application/vnd.google-apps.')
+                and not allowed_native
+            ):
                 raise ValueError('MIME mismatch or native object')
-            if mode=='managed_doc':
+            if mode == 'managed_doc':
                 from .native import BEGIN, END
-                text=new.decode()
-                if not text.startswith(BEGIN) or not text.endswith(END):raise ValueError('Managed Doc prefix required')
-            old,meta=snapshot(drive,entry['id'],mode,known_meta=meta)
+                text = new.decode()
+                if not text.startswith(BEGIN) or not text.endswith(END):
+                    raise ValueError('Managed Doc prefix required')
+            old, meta = snapshot(drive, entry['id'], mode, known_meta=meta)
+            native_doc = drive.document_json(entry['id']) if mode == 'managed_doc' else None
+            return old, meta, native_doc
+
+        prefetched = map_readonly(drive, _prefetch_entry, local_entries, max_workers=8)
+        for (i, entry, name, new, mode), (old, meta, native_doc) in zip(local_entries, prefetched):
             clean(old, 'before/' + name)
-            scan_native_document(drive, dict(entry, mode=mode))
-            atomic(root/f'before/{i}',old); atomic(root/f'candidate/{i}',new)
-            plan['entries'].append({'id':entry['id'],'name':name,'mime':entry['mime'],'mode':mode,
-                'before':f'before/{i}','candidate':f'candidate/{i}',
-                'before_hash':digest(old),'after_hash':digest(new),'meta':fingerprint(meta),
-                **{k:entry[k] for k in ('staging_parent','publish_parent','logical_key') if k in entry}})
+            if native_doc is not None:
+                clean(json.dumps(native_doc, ensure_ascii=False).encode(), 'native/' + name)
+            atomic(root/f'before/{i}', old)
+            atomic(root/f'candidate/{i}', new)
+            plan['entries'].append({
+                'id': entry['id'], 'name': name, 'mime': entry['mime'], 'mode': mode,
+                'before': f'before/{i}', 'candidate': f'candidate/{i}',
+                'before_hash': digest(old), 'after_hash': digest(new), 'meta': fingerprint(meta),
+                **{k: entry[k] for k in ('staging_parent', 'publish_parent', 'logical_key') if k in entry},
+            })
         save(root/'plan.json',plan)
+        prepared_inventory = None
+        prepared_index = None
         if closure is not None:
-            freeze_closure(drive, root, plan)
+            if closure.get('zones'):
+                try:
+                    prepared_inventory = _inventory(drive, closure['zones'])
+                    prepared_index = {item['id']: item for item in prepared_inventory[0]}
+                except Exception:
+                    prepared_inventory = None
+                    prepared_index = None
+            freeze_closure(drive, root, plan, remote_inventory=prepared_inventory)
             save(root/'plan.json', plan)
-            validate_closure(drive, root, plan, candidate=True)
+            validate_closure(
+                drive, root, plan, candidate=True,
+                remote_inventory=prepared_inventory,
+            )
         if incremental_mode:
-            _verify_carry_forward_if_incremental(drive, plan)
+            _verify_carry_forward_if_incremental(
+                drive, plan, remote_index=prepared_index,
+            )
         save(root/'journal.json',{'state':'PREPARED','uploaded':{},'inflight':None})
     except BaseException:
         save(root/'prepare_failed.json',{'state':'PREPARE_FAILED'})
@@ -1675,10 +1709,11 @@ def publish(drive, root, single_writer=False, execution_authority=None):
                 raise RuntimeError('Publication status no longer refers to this complete release')
             verify(drive,root,execution_authority); return journal
         # Preflight every object before any production mutation.
+        preflight_inventory = None
         preflight_index = None
-        if plan.get('closure') and (plan.get('incremental_mode') or plan.get('archive_format') == ARCHIVE_FORMAT_BUNDLE_V1):
-            inv_items, _ = _inventory(drive, plan['closure']['zones'])
-            preflight_index = {item['id']: item for item in inv_items}
+        if plan.get('closure') and plan['closure'].get('zones'):
+            preflight_inventory = _inventory(drive, plan['closure']['zones'])
+            preflight_index = {item['id']: item for item in preflight_inventory[0]}
         _verify_carry_forward_if_incremental(drive, plan, remote_index=preflight_index)
         for e in plan['entries']:
             mode = e.get('mode', 'binary')
@@ -1702,7 +1737,11 @@ def publish(drive, root, single_writer=False, execution_authority=None):
             validate_closure(
                 drive, root, plan, candidate=True,
                 execution_authority=authority,
+                remote_inventory=preflight_inventory,
             )
+        # Strictly invalidate pre-write inventory before any Drive write/move mutation.
+        preflight_inventory = None
+        preflight_index = None
         current_authority = read_execution_authority(drive, execution_authority)
         require_execution_authority_unchanged(authority, current_authority)
         security_preflight(root, plan, current_authority)
@@ -1948,7 +1987,7 @@ def verify_code_provenance(repo, product_candidate_sha, release_execution_sha=No
     }
 
 
-def freeze_closure(drive, root, plan):
+def freeze_closure(drive, root, plan, *, remote_inventory=None):
     """Freeze real protected bytes, not caller-supplied PASS flags or row counts."""
     import re
     closure = plan['closure']
@@ -2001,7 +2040,9 @@ def freeze_closure(drive, root, plan):
                         legacy_annotation_ids.add(fid)
 
     remote_index = {}
-    if closure.get('zones'):
+    if remote_inventory is not None:
+        remote_index = {item['id']: item for item in remote_inventory[0]}
+    elif closure.get('zones'):
         try:
             inv_items, _ = _inventory(drive, closure['zones'])
             remote_index = {item['id']: item for item in inv_items}
@@ -2103,23 +2144,29 @@ def _rows(data, product):
 
 
 def _inventory(drive, zones):
-    """Read only configured current/evidence trees; never crawl the archive."""
+    """Read only configured current/evidence trees via bounded BFS; never crawl the archive."""
     from .current_state import NON_CURRENT
     items, seen, parents = {}, set(), {}
     stopped = set(zones['history']) | set(zones['staging'])
-    queue = list(zones['current']) + list(zones['evidence'])
-    while queue:
-        folder = queue.pop()
-        if folder in seen or folder in stopped:
-            continue
-        seen.add(folder)
-        for item in drive.list(folder):
-            items[item['id']] = item
-            if item['mimeType'] == FOLDER:
-                parents[item['id']] = item.get('parents', [])
-                # Staging/history identities are boundaries even when nested under root.
-                if item['id'] not in stopped and item.get('artifact_role') not in NON_CURRENT:
-                    queue.append(item['id'])
+    frontier = sorted({
+        folder for folder in (list(zones['current']) + list(zones['evidence']))
+        if folder and folder not in stopped
+    })
+    while frontier:
+        seen.update(frontier)
+        level_results = map_readonly(drive, drive.list, frontier, max_workers=8)
+        next_frontier = set()
+        for listed in level_results:
+            for item in sorted(listed or [], key=lambda rec: rec.get('id', '')):
+                items[item['id']] = item
+                if item['mimeType'] == FOLDER:
+                    parents[item['id']] = item.get('parents', [])
+                    # Staging/history identities are boundaries even when nested under root.
+                    if (item['id'] not in stopped
+                            and item['id'] not in seen
+                            and item.get('artifact_role') not in NON_CURRENT):
+                        next_frontier.add(item['id'])
+        frontier = sorted(next_frontier)
     return list(items.values()), dict(zones, folders=parents)
 
 
@@ -2927,19 +2974,37 @@ def verify(drive, root, execution_authority=None):
     if plan.get('closure') and (plan['closure'].get('zones')):
         remote_inventory = _inventory(drive, plan['closure']['zones'])
         remote_index = {item['id']: item for item in remote_inventory[0]}
+    fallback_specs = []
     for e in plan['entries']:
         mode = e.get('mode', 'binary')
         meta = remote_index.get(e['id'])
         server_sha = _valid_server_sha256(meta, mode=mode) if meta is not None else None
         if server_sha is not None and meta.get('mimeType') == e['mime'] and server_sha == e['after_hash']:
-            scan_native_document(drive, e)
+            if mode == 'managed_doc':
+                fallback_specs.append((e, meta, True))
             continue
-        content = payload(drive,e)
-        clean(content, 'readback/' + e['name'])
-        scan_native_document(drive, e)
+        fallback_specs.append((e, meta, False))
+
+    def _prefetch_verify_entry(spec):
+        e, meta, native_only = spec
+        if native_only:
+            native_doc = drive.document_json(e['id']) if e.get('mode') == 'managed_doc' else None
+            return None, meta, native_doc
+        content = payload(drive, e)
+        native_doc = drive.document_json(e['id']) if e.get('mode') == 'managed_doc' else None
         actual_meta = meta if meta is not None else drive.meta(e['id'])
-        if actual_meta['mimeType']!=e['mime'] or digest(content)!=e['after_hash']:
-            raise RuntimeError('Remote verification failed: '+e['name'])
+        return content, actual_meta, native_doc
+
+    if fallback_specs:
+        prefetched = map_readonly(drive, _prefetch_verify_entry, fallback_specs, max_workers=8)
+        for (e, _meta, native_only), (content, actual_meta, native_doc) in zip(fallback_specs, prefetched):
+            if not native_only:
+                clean(content, 'readback/' + e['name'])
+            if native_doc is not None:
+                clean(json.dumps(native_doc, ensure_ascii=False).encode(), 'native/' + e['name'])
+            if not native_only:
+                if actual_meta['mimeType'] != e['mime'] or digest(content) != e['after_hash']:
+                    raise RuntimeError('Remote verification failed: ' + e['name'])
     if plan.get('closure'):
         validate_closure(
             drive, Path(root), plan, candidate=False,
