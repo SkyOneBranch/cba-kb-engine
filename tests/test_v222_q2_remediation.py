@@ -553,6 +553,8 @@ def test_q2_r2_p0_2_metadata_path_redaction_posix_windows_unc_and_controls():
     opt_path_val = "/opt/cba_kb/data/dump.json"
     win_c_path = "C:\\" + "Users\\name\\file.txt"
     win_d_path = "D:\\data\\bundle.md"
+    win_c_fwd_path = "C:/" + "Users/name/file.txt"
+    win_d_fwd_path = "D:/data/bundle.md"
     unc_path = "\\\\server\\share\\file.md"
     file_uri_path = "file:///tmp/x.md"
 
@@ -582,7 +584,8 @@ def test_q2_r2_p0_2_metadata_path_redaction_posix_windows_unc_and_controls():
                 "var_log_path": var_path_val,
                 "etc_conf_path": etc_path_val,
                 "opt_dump_path": opt_path_val,
-                "win_paths": [win_c_path, win_d_path],
+                "win_paths": [win_c_path, win_d_path, win_c_fwd_path, win_d_fwd_path],
+                "win_fwd_top": win_c_fwd_path,
                 "unc_share": unc_path,
                 "file_uri": file_uri_path,
                 "deep_nested": {
@@ -590,6 +593,7 @@ def test_q2_r2_p0_2_metadata_path_redaction_posix_windows_unc_and_controls():
                         {
                             "level3_path": f"captured from {tmp_path_val}",
                             "level3_win": f"mirror {win_c_path} and {unc_path}",
+                            "level3_win_fwd": f"mirror {win_c_fwd_path} and {win_d_fwd_path}",
                         }
                     ]
                 },
@@ -613,6 +617,8 @@ def test_q2_r2_p0_2_metadata_path_redaction_posix_windows_unc_and_controls():
         opt_path_val,
         "Users\\name\\file.txt",
         "D:\\data\\bundle.md",
+        "Users/name/file.txt",
+        "D:/data/bundle.md",
         "server\\share\\file.md",
         file_uri_path,
     ):
@@ -624,11 +630,20 @@ def test_q2_r2_p0_2_metadata_path_redaction_posix_windows_unc_and_controls():
     assert doc["var_log_path"] == "<redacted-local-path>"
     assert doc["etc_conf_path"] == "<redacted-local-path>"
     assert doc["opt_dump_path"] == "<redacted-local-path>"
-    assert doc["win_paths"] == ["<redacted-local-path>", "<redacted-local-path>"]
+    assert doc["win_paths"] == [
+        "<redacted-local-path>",
+        "<redacted-local-path>",
+        "<redacted-local-path>",
+        "<redacted-local-path>",
+    ]
+    assert doc["win_fwd_top"] == "<redacted-local-path>"
     assert doc["unc_share"] == "<redacted-local-path>"
     assert doc["file_uri"] == "<redacted-local-path>"
     assert "<redacted-local-path>" in doc["deep_nested"]["level2"][0]["level3_path"]
     assert "<redacted-local-path>" in doc["deep_nested"]["level2"][0]["level3_win"]
+    assert doc["deep_nested"]["level2"][0]["level3_win_fwd"] == (
+        "mirror <redacted-local-path> and <redacted-local-path>"
+    )
 
     # Non-false-positive controls MUST be preserved verbatim
     assert doc["relative_doc_ref"] == rel_path_control
