@@ -70,6 +70,7 @@ _CURATED_NOISE_KEYWORDS = (
 _CURATED_HISTORICAL_PINNED_KEYWORDS = (
     "杭州亚运会",
     "亚运会总结",
+    "亚运会",
 )
 _CURATED_PROTECTED_EVENT_CLASSES = frozenset({
     "注册与转会",
@@ -77,6 +78,23 @@ _CURATED_PROTECTED_EVENT_CLASSES = frozenset({
     "判罚与规则",
     "联赛政策",
 })
+_CURATED_CONDOLENCE_EXEMPT_KEYWORDS = (
+    "注册",
+    "取消注册",
+    "签约",
+    "裁员",
+    "解约",
+    "解除合同",
+    "试训",
+    "伤情",
+    "伤病",
+    "大名单",
+    "出征名单",
+    "集训名单",
+    "#判罚解析#",
+    "判罚解析",
+)
+_COMPACT_ANNOUNCEMENT_EXCERPT_CHARS = 140
 _CURATED_ACTIVE_COMPETITIVE_KEYWORDS = (
     "注册",
     "取消注册",
@@ -1133,7 +1151,7 @@ def _denoising_filter_reason(
     for kw in _CURATED_NOISE_KEYWORDS:
         if kw in combined:
             return f"noise_keyword:{kw}"
-    if "唁电" in combined and not any(kw in combined for kw in _CURATED_ACTIVE_COMPETITIVE_KEYWORDS):
+    if "唁电" in combined and not any(kw in combined for kw in _CURATED_CONDOLENCE_EXEMPT_KEYWORDS):
         return "noise_non_active_condolence"
 
     pinned_reason = _explicit_historical_pinned_reason(
@@ -1311,7 +1329,11 @@ def _render_compact_curated_digest_md(
             persons = b.get("matched_persons") or []
             persons_str = ", ".join(str(p) for p in persons) if persons else "—"
             raw_body = " ".join(str(b.get("body") or "").split())
-            excerpt = raw_body if len(raw_body) <= 280 else raw_body[:280].rstrip() + "…"
+            excerpt = (
+                raw_body
+                if len(raw_body) <= _COMPACT_ANNOUNCEMENT_EXCERPT_CHARS
+                else raw_body[:_COMPACT_ANNOUNCEMENT_EXCERPT_CHARS].rstrip() + "…"
+            )
             lines.extend([
                 f"### {_md_cell(b.get('title') or b.get('doc_id'))}",
                 (
