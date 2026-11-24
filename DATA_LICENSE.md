@@ -23,7 +23,7 @@ The following legacy identifiers were verified on 2026-10-08. Drive permission m
 | :--- | :--- | :--- |
 | `1sA2TxUYAOGtcLfr2AhTLR4moBGIu2hoF` | v1.8.1 release-readiness result JSON | `src/cba_kb/release.py` |
 | `1H25ty3673TbSBTPs4S_lliPmZgRecxzhXD8i2lrl_CM` | v1.8.1 production GO 授权记录 | `src/cba_kb/release.py` |
-| `1Nb4-4rrySjKW7GSA_PLh1SCkPgW9kJtc` | historical registration MASTER workbook | `src/cba_kb/master.py`, `scripts/accept_v1_5_1.py` |
+| `<REDACTED_HISTORICAL_MASTER_DRIVE_ID>` | historical registration MASTER workbook (removed from code in v2.2.3) | `src/cba_kb/master.py`, `scripts/accept_v1_5_1.py` |
 | `1ZebJR9YPKX37cMDdz0xznHDa45at_q65` | legacy/current-version pointer document | `src/cba_kb/current_state.py` |
 
 Historical requirement documents (requirements/), legacy scripts (scripts/accept_v*.py), and test fixtures may contain additional legacy Drive file IDs from prior releases (v1.5.x–v1.8.x era). These are non-secret operational references embedded in historical records, not credentials or access tokens. They are retained for traceability and do not convey access.

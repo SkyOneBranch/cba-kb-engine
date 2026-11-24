@@ -260,13 +260,144 @@ def render_research_card(
             if not isinstance(rev, dict):
                 continue
             posture_label = rev.get("disclosure_posture") or "LOUD_REVISION"
-            prior_id = rev.get("prior_doc_id") or "-"
-            new_id = rev.get("new_doc_id") or "-"
+            prior_id = rev.get("prior_doc_id") or rev.get("prior_record_id") or "-"
+            new_id = rev.get("new_doc_id") or rev.get("new_record_id") or "-"
             seq = rev.get("revision_seq") or "-"
             notice = rev.get("disclosure_notice") or (
                 f"Document revision {seq}: {new_id} supersedes {prior_id}"
             )
             lines.append(f"- [{posture_label}] {notice}")
+
+    # 6. Registration & Identity Profile Section (REQ-223 P0-3/P0-4: optional, lossless)
+    reg_profile = payload.get("registration_profile")
+    has_v223_extension = False
+    if isinstance(reg_profile, dict) and reg_profile:
+        has_v223_extension = True
+        lines.extend([
+            "",
+            "## Registration & Identity Profile",
+        ])
+        if reg_profile.get("player_name"):
+            lines.append(f"- Player Name: {reg_profile['player_name']}")
+        if reg_profile.get("player_name_en"):
+            lines.append(f"- English Name: {reg_profile['player_name_en']}")
+        if reg_profile.get("player_uid"):
+            lines.append(f"- Player UID: {reg_profile['player_uid']}")
+        if reg_profile.get("player_id"):
+            lines.append(f"- Official Player ID: {reg_profile['player_id']}")
+        if reg_profile.get("current_club"):
+            lines.append(f"- Current Club: {reg_profile['current_club']}")
+        clubs_hist = reg_profile.get("clubs_history")
+        if isinstance(clubs_hist, list) and clubs_hist:
+            lines.append(f"- Clubs History: {', '.join(str(c) for c in clubs_hist)}")
+        if reg_profile.get("registration_type"):
+            lines.append(f"- Registration Type: {reg_profile['registration_type']}")
+        if reg_profile.get("position"):
+            lines.append(f"- Position: {reg_profile['position']}")
+        if reg_profile.get("jersey_number"):
+            lines.append(f"- Jersey Number: {reg_profile['jersey_number']}")
+
+    # 7. Recent Single-Game Log Section (REQ-223 P0-4: PLAYER_GAME_STATS grain, lossless)
+    recent_games = payload.get("recent_games_summary")
+    if isinstance(recent_games, dict) and (
+        recent_games.get("games") or recent_games.get("played_games_in_window")
+    ):
+        has_v223_extension = True
+
+        def _fmt_num(v: Any) -> str:
+            if v is None:
+                return "UNKNOWN"
+            if isinstance(v, float):
+                return f"{v:.1f}" if not v.is_integer() else f"{v:.1f}"
+            return str(v)
+
+        def _fmt_pct(made: Any, att: Any, pct: Any) -> str:
+            if made is None or att is None:
+                return "UNKNOWN"
+            if pct is None:
+                return f"{made}/{att} (N/A)"
+            return f"{made}/{att} ({float(pct) * 100:.1f}%)"
+
+        avgs = recent_games.get("averages") or {}
+        st = recent_games.get("shooting_totals") or {}
+        win_n = recent_games.get("window", 5)
+        played_n = recent_games.get("played_games_in_window", len(recent_games.get("games") or []))
+        dnp_n = recent_games.get("dnp_games_count", 0)
+        lines.extend([
+            "",
+            "## Recent Single-Game Log (Player-Game Grain)",
+            "- Grain: PLAYER_GAME_STATS (separate from PLAYER_SEASON_STATS; never merged into season totals)",
+            f"- Window Summary (Last {win_n} Played Games): played={played_n}, dnp_excluded={dnp_n}",
+            (
+                f"- Averages: PTS={_fmt_num(avgs.get('points'))}, REB={_fmt_num(avgs.get('rebounds'))}, "
+                f"AST={_fmt_num(avgs.get('assists'))}, STL={_fmt_num(avgs.get('steals'))}, "
+                f"BLK={_fmt_num(avgs.get('blocks'))}, MIN={_fmt_num(avgs.get('minutes_played'))}"
+            ),
+            (
+                f"- Shooting Totals: FG={_fmt_pct(st.get('fg_made'), st.get('fg_attempted'), st.get('fg_pct'))}, "
+                f"3P={_fmt_pct(st.get('tp_made'), st.get('tp_attempted'), st.get('tp_pct'))}, "
+                f"FT={_fmt_pct(st.get('ft_made'), st.get('ft_attempted'), st.get('ft_pct'))}"
+            ),
+            (
+                f"- Latest Game Date: {recent_games.get('latest_game_date') or '-'} | "
+                f"Latest Captured At: {recent_games.get('latest_captured_at') or '-'}"
+            ),
+            "",
+            "| Date | Round | Opponent | MIN | PTS-REB-AST | FG / 3P / FT | Locator | Revision |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        ])
+        for g in recent_games.get("games") or []:
+            if not isinstance(g, dict):
+                continue
+            m = g.get("metrics") or {}
+            prov = g.get("provenance") or {}
+            g_date = g.get("game_date") or "-"
+            rnd = g.get("round_label") or "-"
+            opp = g.get("opponent_team_name") or g.get("opponent_team_id") or "-"
+            mins = _fmt_num(m.get("minutes_played"))
+            pts = "UNKNOWN" if m.get("points") is None else str(m.get("points"))
+            reb = "UNKNOWN" if m.get("rebounds") is None else str(m.get("rebounds"))
+            ast = "UNKNOWN" if m.get("assists") is None else str(m.get("assists"))
+            fg_s = (
+                f"{m.get('field_goals_made')}-{m.get('field_goals_attempted')}"
+                if m.get("field_goals_made") is not None and m.get("field_goals_attempted") is not None
+                else "UNKNOWN"
+            )
+            tp_s = (
+                f"{m.get('three_point_made')}-{m.get('three_point_attempted')}"
+                if m.get("three_point_made") is not None and m.get("three_point_attempted") is not None
+                else "UNKNOWN"
+            )
+            ft_s = (
+                f"{m.get('free_throws_made')}-{m.get('free_throws_attempted')}"
+                if m.get("free_throws_made") is not None and m.get("free_throws_attempted") is not None
+                else "UNKNOWN"
+            )
+            loc = prov.get("doc_id") or (
+                str(prov.get("raw_sha256") or "")[:12] if prov.get("raw_sha256") else "-"
+            )
+            rev_mark = "[LOUD_REVISION]" if g.get("is_revised") else "-"
+            lines.append(
+                f"| {g_date} | {rnd} | {opp} | {mins} | {pts}-{reb}-{ast} | {fg_s} / {tp_s} / {ft_s} | {loc} | {rev_mark} |"
+            )
+
+        game_revs = recent_games.get("revision_summaries") or []
+        if game_revs:
+            lines.append("")
+            for grev in game_revs:
+                if not isinstance(grev, dict):
+                    continue
+                g_posture = grev.get("disclosure_posture") or "LOUD_REVISION"
+                g_notice = grev.get("disclosure_notice") or (
+                    f"{grev.get('new_record_id')} supersedes {grev.get('prior_record_id')}"
+                )
+                lines.append(f"- [{g_posture}] {g_notice}")
+
+    if has_v223_extension:
+        from .consumer_surface import scrub_raw_drive_ids_for_consumer
+
+        body_text = scrub_raw_drive_ids_for_consumer("\n".join(lines))
+        return body_text + "\n\nend_marker: true\n"
 
     lines.extend([
         "",

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -21,10 +21,13 @@ from .common import atomic
 from .consumer_surface import DEFAULT_MAX_EXTERNAL_CITATIONS_PER_CARD
 from .document_lane import DocumentLane
 from .document_mentions import compute_dirty_set
+from .game_stats import reconcile_game_stat_revisions, validate_player_game_stat_record
 from .instance import Instance
 from .kc_local_producer import build_incremental_player_cards
 from .source_intake import parse_acquisition_bundle_markdown
 from .source_watcher import replay_registration_snapshots
+
+_VALID_COVERAGE_STATUSES = frozenset({"COMPLETE", "PARTIAL", "STALE", "UNKNOWN"})
 
 
 SCHEMA_VERSION = 1
@@ -63,6 +66,122 @@ def _discover_registration_snapshots(snapshots_dir: Optional[Path]) -> List[Path
         if p.is_file() and (p.name.endswith(".json") or p.name.endswith(".json.gz"))
     ]
     return sorted(files, key=lambda p: p.name)
+
+
+def _discover_game_log_files(game_logs_dir: Optional[Path]) -> List[Path]:
+    if game_logs_dir is None or not game_logs_dir.is_dir():
+        return []
+    return sorted(
+        (
+            p
+            for p in game_logs_dir.rglob("*")
+            if p.is_file() and p.suffix.lower() in (".jsonl", ".json")
+        ),
+        key=lambda p: p.relative_to(game_logs_dir).as_posix(),
+    )
+
+
+def _parse_json_or_jsonl_bytes(raw_bytes: bytes, *, is_jsonl: bool) -> List[Dict[str, Any]]:
+    text = raw_bytes.decode("utf-8").strip()
+    if not text:
+        return []
+    if is_jsonl:
+        items: List[Dict[str, Any]] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            if not isinstance(obj, dict):
+                raise ValueError("GAME_LOG_JSONL_OBJECT_REQUIRED")
+            items.append(obj)
+        return items
+    parsed = json.loads(text)
+    if isinstance(parsed, dict):
+        return [parsed]
+    if isinstance(parsed, list):
+        if not all(isinstance(x, dict) for x in parsed):
+            raise ValueError("GAME_LOG_JSON_OBJECT_REQUIRED")
+        return parsed
+    raise ValueError("GAME_LOG_JSON_OBJECT_REQUIRED")
+
+
+def _summarize_coverage_ledger(path: Optional[str | Path]) -> Optional[Dict[str, Any]]:
+    if path is None:
+        return None
+    p = Path(path)
+    if not p.is_file():
+        return None
+    data = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("sources"), list):
+        raise ValueError("COVERAGE_LEDGER_INVALID")
+    counts: Dict[str, int] = {st: 0 for st in ("COMPLETE", "PARTIAL", "STALE", "UNKNOWN")}
+    non_complete: List[Dict[str, Any]] = []
+    for entry in data["sources"]:
+        if not isinstance(entry, dict):
+            raise ValueError("COVERAGE_LEDGER_SOURCE_INVALID")
+        st = str(entry.get("status") or "").strip().upper()
+        if st not in _VALID_COVERAGE_STATUSES:
+            raise ValueError(f"COVERAGE_LEDGER_INVALID_STATUS:{st}")
+        counts[st] += 1
+        if st != "COMPLETE":
+            non_complete.append({
+                "source_id": entry.get("source_id"),
+                "status": st,
+                "missing": list(entry.get("missing") or []),
+            })
+    return {
+        "schema": data.get("schema"),
+        "generated_at_utc": data.get("generated_at_utc"),
+        "total_sources": len(data["sources"]),
+        "status_counts": counts,
+        "non_complete_sources": non_complete,
+    }
+
+
+def _summarize_negative_receipts(
+    path: Optional[str | Path],
+    *,
+    now_utc: datetime,
+) -> Optional[Dict[str, Any]]:
+    if path is None:
+        return None
+    p = Path(path)
+    if not p.is_file():
+        return None
+    raw = p.read_bytes()
+    records = _parse_json_or_jsonl_bytes(raw, is_jsonl=(p.suffix.lower() == ".jsonl"))
+    active_queries: List[str] = []
+    expired_count = 0
+    for rec in records:
+        if rec.get("schema") != "cba-kb.negative-receipt.v1":
+            raise ValueError(f"NEGATIVE_RECEIPT_INVALID_SCHEMA:{rec.get('schema')!r}")
+        q = rec.get("query_person")
+        checked_raw = rec.get("checked_at_utc")
+        ttl_hours = rec.get("ttl_hours")
+        if (
+            not isinstance(q, str)
+            or not q.strip()
+            or not isinstance(checked_raw, str)
+            or not checked_raw.strip()
+            or isinstance(ttl_hours, bool)
+            or not isinstance(ttl_hours, (int, float))
+            or ttl_hours < 0
+        ):
+            raise ValueError("NEGATIVE_RECEIPT_INVALID_RECORD")
+        dt = datetime.fromisoformat(checked_raw.strip().replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if dt + timedelta(hours=float(ttl_hours)) >= now_utc:
+            active_queries.append(q.strip())
+        else:
+            expired_count += 1
+    return {
+        "total_count": len(records),
+        "active_count": len(active_queries),
+        "expired_count": expired_count,
+        "active_queries": sorted(set(active_queries)),
+    }
 
 
 def _extract_published_world(
@@ -159,6 +278,9 @@ def run_operational_sync(
     approved_mentions_path: Optional[str | Path] = None,
     max_external_citations_per_card: int = DEFAULT_MAX_EXTERNAL_CITATIONS_PER_CARD,
     dry_run: bool = False,
+    game_logs_dir: Optional[str | Path] = None,
+    coverage_ledger_path: Optional[str | Path] = None,
+    negative_receipts_path: Optional[str | Path] = None,
 ) -> Dict[str, Any]:
     """Run local-first incremental operational sync and emit freshness_report.json.
 
@@ -168,6 +290,7 @@ def run_operational_sync(
     bundles_path = Path(bundles_dir)
     out_path = Path(output_dir)
     reg_snaps_path = Path(registration_snapshots_dir) if registration_snapshots_dir is not None else None
+    game_logs_path = Path(game_logs_dir) if game_logs_dir is not None else None
 
     checkpoint_path = out_path / CHECKPOINT_FILENAME
     prev_checkpoint = _load_json_if_exists(checkpoint_path, {})
@@ -184,6 +307,9 @@ def run_operational_sync(
         prev_checkpoint.get("registration_candidate_diffs") or []
     )
     player_cards: Dict[str, Dict[str, Any]] = dict(prev_checkpoint.get("player_cards") or {})
+    consumed_game_logs: Dict[str, Dict[str, Any]] = dict(
+        prev_checkpoint.get("consumed_game_logs") or {}
+    )
 
     # 1. Incremental bundle intake
     bundle_files = _discover_bundles(bundles_path)
@@ -294,6 +420,42 @@ def run_operational_sync(
                 ]
                 consumed_reg_snaps = current_snap_hashes
 
+    # 2b. Incremental single-game stats sidecar intake (REQ-223 P0-5, optional)
+    game_logs_ingested_count = 0
+    game_logs_skipped_count = 0
+    dirty_player_uids_from_games: set[str] = set()
+    game_log_files = _discover_game_log_files(game_logs_path)
+    for gl_file in game_log_files:
+        assert game_logs_path is not None
+        rel_key = gl_file.relative_to(game_logs_path).as_posix()
+        raw_bytes = gl_file.read_bytes()
+        file_sha = _sha256_bytes(raw_bytes)
+        prev_gl = consumed_game_logs.get(rel_key)
+        if isinstance(prev_gl, dict) and prev_gl.get("file_sha256") == file_sha:
+            game_logs_skipped_count += 1
+            continue
+        records = _parse_json_or_jsonl_bytes(
+            raw_bytes, is_jsonl=(gl_file.suffix.lower() == ".jsonl")
+        )
+        for rec in records:
+            validate_player_game_stat_record(rec)
+        reconciled = reconcile_game_stat_revisions(records)
+        if reconciled["revision_summaries"]:
+            revision_summaries.extend(reconciled["revision_summaries"])
+        file_uids = sorted({
+            str(r["player_uid"]).strip()
+            for r in records
+            if isinstance(r.get("player_uid"), str) and r["player_uid"].strip()
+        })
+        dirty_player_uids_from_games.update(file_uids)
+        game_logs_ingested_count += 1
+        consumed_game_logs[rel_key] = {
+            "file_sha256": file_sha,
+            "record_count": len(records),
+            "player_uids": file_uids,
+            "revision_count": len(reconciled["revision_summaries"]),
+        }
+
     # 3. Dirty-set computation
     identity_registry = _load_json_if_exists(
         identity_registry_path,
@@ -309,7 +471,9 @@ def run_operational_sync(
         approved_mentions=approved_mentions,
         existing_doc_hashes=prev_doc_hashes,
     )
-    dirty_player_uids: List[str] = list(dirty_result["dirty_player_uids"])
+    dirty_player_uids: List[str] = sorted(
+        set(dirty_result["dirty_player_uids"]) | dirty_player_uids_from_games
+    )
     undecided_mentions: List[Dict[str, Any]] = list(dirty_result["verification_queue"])
 
     # 4. Incremental player card recompute
@@ -385,19 +549,32 @@ def run_operational_sync(
         except (OSError, ValueError):
             revision_index_summary = {}
 
+    now_utc = datetime.now(timezone.utc)
+    coverage_ledger_summary = _summarize_coverage_ledger(coverage_ledger_path)
+    negative_receipts_summary = _summarize_negative_receipts(
+        negative_receipts_path, now_utc=now_utc
+    )
+
     freshness_report: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "dry_run": bool(dry_run),
         "drive_api_called": False,
         "ingested_count": ingested_count,
         "skipped_bundles_count": skipped_bundles_count,
+        "dirty_player_uids": dirty_player_uids,
         "recomputed_player_uids": recomputed_player_uids,
         "pending_player_cards": pending_player_cards,
         "lagged_docs": lagged_docs,
         "undecided_mentions": undecided_mentions,
         "registration_candidate_diffs": registration_candidate_diffs,
         "revision_summaries": revision_summaries,
+        "game_logs_ingested_count": game_logs_ingested_count,
+        "game_logs_skipped_count": game_logs_skipped_count,
     }
+    if coverage_ledger_summary is not None:
+        freshness_report["coverage_ledger_summary"] = coverage_ledger_summary
+    if negative_receipts_summary is not None:
+        freshness_report["negative_receipts_summary"] = negative_receipts_summary
 
     if not dry_run:
         out_path.mkdir(parents=True, exist_ok=True)
@@ -409,8 +586,10 @@ def run_operational_sync(
             "registration_candidate_diffs": registration_candidate_diffs,
             "player_cards": player_cards,
             "revision_index_summary": revision_index_summary,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": now_utc.isoformat(),
         }
+        if consumed_game_logs:
+            checkpoint_payload["consumed_game_logs"] = consumed_game_logs
         atomic(
             checkpoint_path,
             (json.dumps(checkpoint_payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"),
