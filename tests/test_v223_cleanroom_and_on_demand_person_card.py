@@ -15,6 +15,7 @@ from __future__ import annotations
 import csv
 import importlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -918,7 +919,13 @@ def test_p0_4_cli_build_person_card_local_fast_and_offline(tmp_path: Path):
         "--format",
         "json",
     ]
-    proc = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True, check=False)
+    subproc_env = dict(os.environ)
+    src_dir = str(REPO_ROOT / "src")
+    existing_pp = subproc_env.get("PYTHONPATH", "")
+    subproc_env["PYTHONPATH"] = f"{src_dir}{os.pathsep}{existing_pp}" if existing_pp else src_dir
+    proc = subprocess.run(
+        cmd, cwd=str(REPO_ROOT), env=subproc_env, capture_output=True, text=True, check=False
+    )
     assert proc.returncode == 0, f"CLI failed: {proc.stderr}"
     payload = json.loads(proc.stdout)
     assert payload["status"] == "BUILT"
