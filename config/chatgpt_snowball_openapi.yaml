@@ -1,0 +1,227 @@
+openapi: "3.1.0"
+info:
+  title: CBA-KB On-Demand Snowball Gateway
+  version: "2.3.0"
+  description: >
+    Clean-room OpenAPI 3.1.0 contract for the CBA-KB v2.3.0 pure-cloud
+    on-demand snowball gateway. Returns full person research cards with
+    Observation Horizon metadata (observed_until, coverage_status) directly
+    in the HTTP response body and handles bounded async polling without
+    hitting 45s client timeouts.
+servers:
+  - url: https://snowball-gateway.example.invalid
+    description: Replace with your deployed Cloudflare Worker HTTPS endpoint.
+security:
+  - gatewayHttpAuth: []
+paths:
+  /v1/person:
+    post:
+      operationId: getOrAcquirePerson
+      summary: Query or acquire a CBA person research card on demand
+      description: >
+        Fast path returns cached card_markdown in under 0.5s. Slow path
+        dispatches cloud acquisition and polls for up to 28s, returning HTTP 200
+        with status ACQUIRING_IN_CLOUD and a job_id if still running.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PersonQueryRequest"
+      responses:
+        "200":
+          description: Person card hit, undecided candidates, negative cache hit, or async job handle
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonQueryResponse"
+        "400":
+          description: Invalid request payload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid authorization header
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/coverage:
+    get:
+      operationId: getLeagueCoverage
+      summary: Get league-wide Observation Horizon coverage status
+      description: >
+        Evaluates coverage across the 5 CBA proposition domains
+        (domestic_registration, foreign_registration, club_announcements,
+        league_rules, game_stats).
+      responses:
+        "200":
+          description: Current league coverage evaluation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LeagueCoverageResponse"
+        "401":
+          description: Missing or invalid authorization header
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/jobs/{job_id}:
+    get:
+      operationId: checkAcquisitionJob
+      summary: Check status of an asynchronous cloud acquisition job
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          description: Job identifier returned by getOrAcquirePerson
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Job state and completed card_markdown when available
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AcquisitionJobResponse"
+        "401":
+          description: Missing or invalid authorization header
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Job not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+components:
+  securitySchemes:
+    gatewayHttpAuth:
+      type: http
+      scheme: "bearer"
+  schemas:
+    PersonQueryRequest:
+      type: object
+      required:
+        - person
+      properties:
+        person:
+          type: string
+          description: Person name or player identifier
+        season:
+          type: string
+          default: "2026-2027"
+          description: Target CBA season
+        force_refresh:
+          type: boolean
+          default: false
+          description: Bypass fresh cache and negative receipt TTL
+        freshness_ttl_hours:
+          type: number
+          default: 24.0
+          description: Freshness TTL in hours
+    PersonQueryResponse:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum:
+            - HIT_FRESH
+            - ACQUIRED_AND_BUILT
+            - ACQUIRING_IN_CLOUD
+            - UNDECIDED
+            - UNKNOWN_NEGATIVE_CACHED
+            - UNKNOWN_AFTER_WHITELIST_CHECK
+        card_markdown:
+          type: string
+          description: Full person research card markdown when available
+        card_sha256:
+          type: string
+          description: SHA-256 hex digest of card_markdown
+        observed_until:
+          type: string
+          description: ISO-8601 UTC observation horizon timestamp
+        coverage_status:
+          type: string
+          enum:
+            - COMPLETE
+            - PARTIAL
+            - STALE
+            - UNKNOWN
+        job_id:
+          type: string
+          description: Cloud acquisition job identifier when asynchronous
+        next_action:
+          type: string
+          description: Recommended follow-up action when status is ACQUIRING_IN_CLOUD
+        candidates:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        network_called:
+          type: boolean
+    LeagueCoverageResponse:
+      type: object
+      required:
+        - overall_status
+        - observed_until
+        - domains
+      properties:
+        overall_status:
+          type: string
+          enum:
+            - COMPLETE
+            - PARTIAL
+            - STALE
+            - UNKNOWN
+        observed_until:
+          type: string
+        missing_items:
+          type: array
+          items:
+            type: string
+        honest_disclosure:
+          type: string
+        domains:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties: true
+    AcquisitionJobResponse:
+      type: object
+      required:
+        - job_id
+        - status
+      properties:
+        job_id:
+          type: string
+        status:
+          type: string
+        person:
+          type: string
+        season:
+          type: string
+        card_markdown:
+          type: string
+        card_sha256:
+          type: string
+        observed_until:
+          type: string
+        coverage_status:
+          type: string
+        next_action:
+          type: string
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string

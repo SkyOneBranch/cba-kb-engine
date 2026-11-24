@@ -30,6 +30,7 @@ from cba_kb.consumer_surface import (  # noqa: E402
     build_consumer_surface_targets_spec,
     build_promoted_research_slice_artifacts,
     compute_master_row_count,
+    evaluate_league_coverage,
     export_domestic_registration_diff_csv,
     export_foreign_players_registration_csv,
     merge_operational_docs_into_consumer_index,
@@ -99,6 +100,7 @@ V215_BASELINE_SHA = "3874ebb4b20fdfd5c1d1fd7f9ed9426d9f26036f"
 V220_1_BASELINE_SHA = "fa9793c6db76e15880610ced728a7b0d563da604"
 V221_1_BASELINE_SHA = "e58a2787a6176397a142abced682eed5d10f1289"
 V222_1_BASELINE_SHA = "29589e7d4d90a81a6507ecaa1ec73945a5eecfc1"
+V230_1_BASELINE_SHA = "3a7239361b2b81f763dce3477b3c3ad81f357b90"
 
 V215_RELEASE_SPECS: dict[str, dict] = {
     "v2.1.5-1": {
@@ -122,6 +124,16 @@ V215_RELEASE_SPECS: dict[str, dict] = {
         "enable_consumer_surface_v215": True,
         "enable_operational_kb_v220": True,
         "enable_curated_compact_surface_v222": True,
+        "incremental_delta_only": True,
+        "archive_format": "bundle_v1",
+    },
+    "v2.3.0-1": {
+        "product_baseline_sha": V230_1_BASELINE_SHA,
+        "enable_consumer_surface_v215": True,
+        "enable_operational_kb_v220": True,
+        "enable_curated_compact_surface_v222": True,
+        "enable_observation_horizon_v230": True,
+        "enable_on_demand_cards_v230": True,
         "incremental_delta_only": True,
         "archive_format": "bundle_v1",
     },
@@ -643,6 +655,7 @@ def _candidate_inputs(
     consumer_target_contents=None,
     *,
     incremental=False,
+    observation_horizon=None,
 ):
     output.mkdir(parents=True, exist_ok=False)
     candidates = output / "candidate-inputs"
@@ -816,6 +829,7 @@ def _candidate_inputs(
                 code_hashes, engine_root, registry, registry_bytes,
                 manifest_previous, item_by_key=item_by_key,
                 master_row_count=master_row_count,
+                observation_horizon=observation_horizon,
             )
             generated = generated_data is not None
             data = generated_data if generated else previous
@@ -962,6 +976,7 @@ def _control_candidate(
     *,
     item_by_key=None,
     master_row_count=None,
+    observation_horizon=None,
 ):
     release_id = projection["release_id"]
     engine_sha = projection["engine_sha"]
@@ -1016,6 +1031,7 @@ def _control_candidate(
             logical_key, previous, projection, allocation, id_by_key,
             engine_root, registry, item_by_key=item_by_key,
             master_row_count=master_row_count,
+            observation_horizon=observation_horizon,
         )
     return None
 
@@ -1058,6 +1074,7 @@ def _content_preserving_candidate(
     *,
     item_by_key=None,
     master_row_count=None,
+    observation_horizon=None,
 ):
     if (
         isinstance(master_row_count, bool)
@@ -1093,20 +1110,40 @@ def _content_preserving_candidate(
             ver_match
             and (int(ver_match.group(1)), int(ver_match.group(2)), int(ver_match.group(3))) >= (2, 2, 2)
         )
+    enable_obs_v230 = bool(release_spec.get("enable_observation_horizon_v230"))
+    effective_obs = (
+        observation_horizon
+        if (enable_obs_v230 and isinstance(observation_horizon, dict))
+        else None
+    )
     consumer_guide = render_consumer_surface_guide_section(
         release_id=release_id,
         master_row_count=master_row_count,
         include_collector_digest=bool(release_spec.get("enable_operational_kb_v220")),
         include_curated_csvs=include_curated_v222,
+        observation_horizon=effective_obs,
     )
     if include_curated_v222:
         master_count_stamp = (
             f"权威国内注册主表规模：{master_row_count:,} 行（2017-2027 权威总表，精确行数 {master_row_count}）"
         )
+        obs_stamp = ""
+        if effective_obs is not None:
+            obs_until = effective_obs.get("observed_until") or "UNKNOWN"
+            cov_status = (
+                effective_obs.get("overall_status")
+                or effective_obs.get("coverage_status")
+                or "UNKNOWN"
+            )
+            obs_stamp = (
+                f"观测截止（observed_until）：{obs_until} | "
+                f"覆盖状态（coverage_status）：{cov_status}\n"
+            )
         header_stamp = (
             f"当前发布：{release_id}\n"
             f"代码提交：{engine_sha}\n"
-            f"{master_count_stamp}\n\n"
+            f"{master_count_stamp}\n"
+            f"{obs_stamp}\n"
         )
     else:
         header_stamp = (
@@ -1467,15 +1504,44 @@ def _load_operational_bundle_records(instance, checkpoint: dict) -> list[dict]:
     return records
 
 
+def _load_instance_observation_horizon(instance, release_spec: dict):
+    """Load and evaluate coverage_ledger.json when v2.3.0 observation horizon is enabled."""
+    if not release_spec.get("enable_observation_horizon_v230"):
+        return None
+    if instance is None or not hasattr(instance, "data_root"):
+        return evaluate_league_coverage(None)
+    ledger_path = Path(instance.data_root) / "coverage_ledger.json"
+    if not ledger_path.is_file():
+        return evaluate_league_coverage(None)
+    try:
+        ledger_data = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ProjectionError(f"COVERAGE_LEDGER_INVALID:{exc}") from exc
+    if not isinstance(ledger_data, dict):
+        raise ProjectionError("COVERAGE_LEDGER_INVALID:expected_dict")
+    return evaluate_league_coverage(ledger_data)
+
+
 def _build_instance_consumer_targets(
     drive, instance, *, release_id, engine_sha, manifest_rows, data_parent
 ):
     """Build declared consumer-surface targets from existing Drive inputs & instance fixtures."""
     release_spec = _release_spec(release_id)
-    by_key = _manifest_rows(manifest_rows)
+    normalized_manifest_rows = [
+        (
+            {**row, "uid": row["logical_key"]}
+            if isinstance(row, dict)
+            and not row.get("uid")
+            and not row.get("local_path")
+            and row.get("logical_key")
+            else row
+        )
+        for row in (manifest_rows or ())
+    ]
+    by_key = _manifest_rows(normalized_manifest_rows)
     id_for = {logical_key: fid for fid, logical_key in by_key.items()}
     master_csv_id = id_for.get("derived/MASTER.csv")
-    sr_id = id_for.get("input/source_registry.csv")
+    sr_id = id_for.get("input/source_registry.csv") or id_for.get("derived/source_registry.csv")
     if not master_csv_id or not sr_id:
         raise ProjectionError("CONSUMER_SURFACE_BASE_INPUTS_MISSING")
     master_bytes, _ = snapshot(drive, master_csv_id, "binary")
@@ -1486,6 +1552,7 @@ def _build_instance_consumer_targets(
 
     include_collector_digest = bool(release_spec.get("enable_operational_kb_v220"))
     compact_curated = bool(release_spec.get("enable_curated_compact_surface_v222"))
+    observation_horizon = _load_instance_observation_horizon(instance, release_spec)
     collector_official_digest_bytes = None
     foreign_registration_csv_bytes = None
     domestic_reg_diff_csv_bytes = None
@@ -1512,13 +1579,16 @@ def _build_instance_consumer_targets(
             release_id=release_id,
             engine_sha=engine_sha,
             compact_curated=compact_curated,
+            observation_horizon=observation_horizon,
         )
         if compact_curated:
             foreign_registration_csv_bytes = export_foreign_players_registration_csv(
                 bundles=bundle_records,
+                observation_horizon=observation_horizon,
             )
             domestic_reg_diff_csv_bytes = export_domestic_registration_diff_csv(
                 reg_diff=reg_diff,
+                observation_horizon=observation_horizon,
             )
 
     promoted_research = {}
@@ -1544,6 +1614,57 @@ def _build_instance_consumer_targets(
                 v["publish_parent"] = data_parent
                 promoted_research[k] = v
 
+    if release_spec.get("enable_on_demand_cards_v230"):
+        on_demand_dir = instance.data_root / "on_demand_cards"
+        od_manifest_path = on_demand_dir / "on_demand_cards_manifest.json"
+        if od_manifest_path.is_file():
+            try:
+                od_manifest = json.loads(od_manifest_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise ProjectionError(f"ON_DEMAND_CARDS_MANIFEST_INVALID:{exc}") from exc
+            if not isinstance(od_manifest, dict) or not isinstance(od_manifest.get("cards"), dict):
+                raise ProjectionError("ON_DEMAND_CARDS_MANIFEST_INVALID")
+            for card_key, card_entry in sorted(od_manifest["cards"].items()):
+                if not isinstance(card_entry, dict):
+                    raise ProjectionError(f"ON_DEMAND_CARD_ENTRY_INVALID:{card_key}")
+                filename = card_entry.get("filename")
+                if (
+                    not isinstance(filename, str)
+                    or not filename.strip()
+                    or "/" in filename
+                    or "\\" in filename
+                    or ".." in filename
+                ):
+                    raise ProjectionError(f"ON_DEMAND_CARD_FILENAME_INVALID:{card_key}")
+                filename = filename.strip()
+                card_path = on_demand_dir / filename
+                if (
+                    card_path.is_symlink()
+                    or not card_path.resolve().is_relative_to(on_demand_dir.resolve())
+                ):
+                    raise ProjectionError(f"ON_DEMAND_CARD_FILENAME_INVALID:{card_key}")
+                if not card_path.is_file():
+                    raise ProjectionError(f"ON_DEMAND_CARD_FILE_MISSING:{card_key}")
+                raw_card_bytes = card_path.read_bytes()
+                expected_sha = card_entry.get("card_sha256")
+                actual_sha = digest(raw_card_bytes)
+                if not isinstance(expected_sha, str) or actual_sha != expected_sha:
+                    raise ProjectionError(f"ON_DEMAND_CARD_SHA256_MISMATCH:{card_key}")
+                scrubbed_card_bytes = scrub_raw_drive_ids_for_consumer(
+                    raw_card_bytes.decode("utf-8")
+                ).encode("utf-8")
+                slug_src = f"{card_key}_{card_entry.get('season') or ''}"
+                slug = re.sub(r"[^A-Za-z0-9_]+", "_", slug_src).strip("_").lower() or "card"
+                logical_key = f"research/on_demand_{slug}"
+                promoted_research[logical_key] = {
+                    "name": filename,
+                    "mime": "text/markdown",
+                    "mode": "binary",
+                    "parent_role": "data",
+                    "publish_parent": data_parent,
+                    "content": scrubbed_card_bytes,
+                }
+
     targets = build_consumer_surface_targets_spec(
         release_id=release_id,
         engine_sha=engine_sha,
@@ -1556,6 +1677,7 @@ def _build_instance_consumer_targets(
         domestic_reg_diff_csv_bytes=domestic_reg_diff_csv_bytes,
         include_curated_csvs=compact_curated,
         promoted_research_artifacts=promoted_research,
+        observation_horizon=observation_horizon,
     )
     for spec in targets.values():
         spec["publish_parent"] = data_parent
@@ -1608,10 +1730,12 @@ def freeze_plan(
             data_parent=data_parent,
         )
         consumer_target_contents = {k: v["content"] for k, v in built_targets.items()}
+    observation_horizon = _load_instance_observation_horizon(instance, release_spec)
     entries = _candidate_inputs(
         drive, engine_root, projection, allocation, output,
         consumer_target_contents=consumer_target_contents,
         incremental=use_incremental,
+        observation_horizon=observation_horizon,
     )
     policy = instance.read_json("production.json")
     dependencies = load_production_dependencies(drive, policy)

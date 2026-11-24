@@ -417,6 +417,21 @@ def main():
     q.add_argument('--game-logs-dir',type=Path,default=None)
     q.add_argument('--ops-checkpoint',type=Path,default=None)
     q.add_argument('--negative-receipts',type=Path,default=None)
+    q=sub.add_parser('snowball-query')
+    q.add_argument('--person',required=True)
+    q.add_argument('--season',default='2026-2027')
+    q.add_argument('--force-refresh',action='store_true',default=False)
+    q.add_argument('--freshness-ttl-hours',type=float,default=24.0)
+    q.add_argument('--snowball-folder-id',default=None)
+    q.add_argument('--format',choices=('json','markdown'),default='json')
+    q=sub.add_parser('cloud-state-push')
+    q.add_argument('--source-dir',type=Path,required=True)
+    q.add_argument('--prefix',default='cloud_instance/')
+    q=sub.add_parser('cloud-state-pull')
+    q.add_argument('--output-dir',type=Path,required=True)
+    q.add_argument('--prefix',default='cloud_instance/')
+    q=sub.add_parser('mcp-serve')
+    q.add_argument('--season',default='2026-2027')
     q=sub.add_parser('plan'); q.add_argument('--entries',type=Path,required=True); q.add_argument('--release-id',required=True)
     q.add_argument('--status-id',required=True); q.add_argument('--archive-id',required=True)
     q.add_argument('--dependencies',type=Path);q.add_argument('--environment',choices=['sandbox','production'],default='sandbox')
@@ -1860,6 +1875,57 @@ def main():
                 else:
                     print(json.dumps(result, ensure_ascii=False, indent=2))
                 return
+        elif a.command == 'snowball-query':
+            from .cloud_state import R2CloudStateStore, R2Config
+            from .drive import upsert_snowball_card_to_drive
+            from .snowball_orchestrator import SnowballOrchestrator
+            store = R2CloudStateStore(R2Config.from_env())
+            snowball_folder_id = a.snowball_folder_id or os.environ.get('CBA_KB_DRIVE_SNOWBALL_FOLDER_ID')
+            drive_upserter = None
+            production_policy = None
+            if snowball_folder_id:
+                configured = a.instance_root is not None or bool(os.environ.get('CBA_KB_INSTANCE_ROOT'))
+                instance = private_instance() if configured else None
+                if instance is not None:
+                    production_policy = instance.read_json('production.json')
+                    drive = Drive(root, instance)
+                    drive_upserter = lambda **kw: upsert_snowball_card_to_drive(drive, **kw)
+            orch = SnowballOrchestrator(
+                state_store=store,
+                drive_upserter=drive_upserter,
+                snowball_folder_id=snowball_folder_id,
+                production_policy=production_policy,
+            )
+            result = orch.get_or_acquire_person(
+                a.person,
+                season=a.season,
+                force_refresh=a.force_refresh,
+                freshness_ttl_hours=a.freshness_ttl_hours,
+            )
+            if a.format == 'markdown':
+                stage(a.command, 'done')
+                if result.get('card_markdown'):
+                    print(result['card_markdown'], end='')
+                else:
+                    print(json.dumps(result, ensure_ascii=False, indent=2))
+                return
+        elif a.command == 'cloud-state-push':
+            from .cloud_state import R2CloudStateStore, R2Config
+            store = R2CloudStateStore(R2Config.from_env())
+            result = store.push_instance_snapshot(a.source_dir, prefix=a.prefix)
+        elif a.command == 'cloud-state-pull':
+            from .cloud_state import R2CloudStateStore, R2Config
+            store = R2CloudStateStore(R2Config.from_env())
+            result = store.pull_instance_snapshot(a.output_dir, prefix=a.prefix)
+        elif a.command == 'mcp-serve':
+            from .cloud_state import R2CloudStateStore, R2Config
+            from .mcp_server import SnowballMCPServer
+            from .snowball_orchestrator import SnowballOrchestrator
+            store = R2CloudStateStore(R2Config.from_env())
+            orch = SnowballOrchestrator(state_store=store)
+            SnowballMCPServer(orch).serve_stdio()
+            stage(a.command, 'done')
+            return
         elif a.command=='plan':
             from .current_state import clean
             def read_plan_input(path):

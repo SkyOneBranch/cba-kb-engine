@@ -1,0 +1,760 @@
+"""On-demand Snowball Core Orchestrator (REQ-230 P0-3).
+
+Coordinates pure-cloud serverless person card serving and on-demand acquisition:
+- Fast path (<0.5s):
+  1. Fail-closed homonym / multi-candidate disambiguation -> UNDECIDED (0 network)
+  2. Fresh cached card in R2 -> HIT_FRESH with direct card_markdown (0 network)
+  3. Active cba-kb.negative-receipt.v1 within TTL -> UNKNOWN_NEGATIVE_CACHED (0 network)
+  4. Active in-flight concurrency lock -> ACQUIRING_IN_CLOUD reusing job_id (deduplicated=True)
+- Slow path (cache miss or force_refresh=True):
+  - Delegates to AcquisitionBackend (LocalCliAcquisitionBackend or AsyncDispatchAcquisitionBackend)
+  - ACQUIRED_AND_BUILT: verifies SHA-256, persists to R2 cards/, optionally upserts to
+    isolated Drive snowball folder, marks job COMPLETED, clears lock, returns full card_markdown
+  - UNKNOWN_AFTER_WHITELIST_CHECK: persists cba-kb.negative-receipt.v1 to R2, marks job
+    COMPLETED_UNKNOWN, clears lock
+  - ACQUIRING_IN_CLOUD: keeps RUNNING job & lock in R2, returns job_id + next_action
+"""
+from __future__ import annotations
+
+import abc
+import hashlib
+import json
+import subprocess
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+
+import requests
+
+from .person_card_builder import (
+    _find_active_negative_receipt,
+    build_person_card,
+    resolve_person_query,
+)
+
+NEGATIVE_RECEIPT_SCHEMA = "cba-kb.negative-receipt.v1"
+_ACTIVE_LOCK_STATUSES = frozenset({"RUNNING", "PENDING", "ACQUIRING_IN_CLOUD"})
+
+
+def _utc_now(now_fn: Optional[Callable[[], datetime]] = None) -> datetime:
+    dt = now_fn() if now_fn is not None else datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _iso_utc(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_utc(raw: Any) -> Optional[datetime]:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+class AcquisitionBackend(abc.ABC):
+    """Abstract interface for on-demand person acquisition backends."""
+
+    @abc.abstractmethod
+    def acquire_person(
+        self,
+        person: str,
+        *,
+        season: str,
+        job_id: str,
+        force_refresh: bool = False,
+    ) -> Dict[str, Any]:
+        """Acquire or dispatch acquisition for a person and return a structured result dict."""
+
+
+class LocalCliAcquisitionBackend(AcquisitionBackend):
+    """Synchronous acquisition backend using either a local CLI command or build_person_card()."""
+
+    def __init__(
+        self,
+        *,
+        collector_cmd: Optional[Sequence[str]] = None,
+        instance: Optional[Any] = None,
+        local_resolver_inputs: Optional[Mapping[str, Any]] = None,
+        whitelist_sources: Sequence[str] = ("local_kb",),
+        timeout_seconds: float = 300.0,
+    ) -> None:
+        self.collector_cmd = tuple(collector_cmd) if collector_cmd else None
+        self.instance = instance
+        self.local_resolver_inputs = dict(local_resolver_inputs or {})
+        self.whitelist_sources = tuple(whitelist_sources)
+        self.timeout_seconds = float(timeout_seconds)
+
+    def acquire_person(
+        self,
+        person: str,
+        *,
+        season: str,
+        job_id: str,
+        force_refresh: bool = False,
+    ) -> Dict[str, Any]:
+        if self.collector_cmd:
+            cmd = [
+                *self.collector_cmd,
+                "--person",
+                person,
+                "--season",
+                season,
+                "--job-id",
+                job_id,
+            ]
+            if force_refresh:
+                cmd.append("--force-refresh")
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=self.timeout_seconds,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"LOCAL_CLI_ACQUISITION_FAILED(rc={proc.returncode}): {proc.stderr.strip()}"
+                )
+            parsed = json.loads(proc.stdout.strip() or "{}")
+            if not isinstance(parsed, dict):
+                raise ValueError("LOCAL_CLI_ACQUISITION_INVALID_JSON")
+            return parsed
+
+        res = build_person_card(
+            person,
+            season=season,
+            instance=self.instance,
+            **self.local_resolver_inputs,
+        )
+        status = str(res.get("status") or "").upper()
+        if status == "BUILT":
+            md = str(res.get("markdown") or "")
+            obs = res.get("observation_horizon") if isinstance(res.get("observation_horizon"), dict) else {}
+            return {
+                "status": "ACQUIRED_AND_BUILT",
+                "person": res.get("person"),
+                "filename": res.get("filename"),
+                "card_markdown": md,
+                "card_sha256": _sha256_text(md),
+                "observed_until": obs.get("observed_until"),
+                "coverage_status": obs.get("overall_status"),
+            }
+        if status == "UNDECIDED":
+            return {
+                "status": "UNDECIDED",
+                "candidates": list(res.get("candidates") or []),
+            }
+        return {
+            "status": "UNKNOWN_AFTER_WHITELIST_CHECK",
+            "whitelist_sources_checked": list(self.whitelist_sources),
+        }
+
+
+class AsyncDispatchAcquisitionBackend(AcquisitionBackend):
+    """Asynchronous acquisition backend dispatching cloud runner jobs (e.g. GitHub Actions)."""
+
+    def __init__(
+        self,
+        *,
+        dispatcher: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        github_repo: Optional[str] = None,
+        workflow_id: Optional[str] = None,
+        github_token: Optional[str] = None,
+        ref: str = "main",
+        timeout_seconds: float = 15.0,
+        session: Optional[requests.Session] = None,
+    ) -> None:
+        self.dispatcher = dispatcher
+        self.github_repo = github_repo
+        self.workflow_id = workflow_id
+        self.github_token = str(github_token) if github_token else None
+        self.ref = ref
+        self.timeout_seconds = float(timeout_seconds)
+        self._http_client = session
+
+    def acquire_person(
+        self,
+        person: str,
+        *,
+        season: str,
+        job_id: str,
+        force_refresh: bool = False,
+    ) -> Dict[str, Any]:
+        payload = {
+            "job_id": job_id,
+            "person": person,
+            "season": season,
+            "force_refresh": bool(force_refresh),
+        }
+        if self.dispatcher is not None:
+            dispatch_res = self.dispatcher(payload)
+            if isinstance(dispatch_res, dict):
+                out = dict(dispatch_res)
+                out.setdefault("status", "ACQUIRING_IN_CLOUD")
+                out.setdefault("job_id", job_id)
+                out.setdefault("next_action", "call check_acquisition_job")
+                return out
+            return {
+                "status": "ACQUIRING_IN_CLOUD",
+                "job_id": job_id,
+                "dispatched": True,
+                "next_action": "call check_acquisition_job",
+            }
+
+        if not (self.github_repo and self.workflow_id and self.github_token):
+            raise RuntimeError("ASYNC_DISPATCH_BACKEND_UNCONFIGURED")
+
+        url = (
+            f"https://api.github.com/repos/{self.github_repo}/actions/"
+            f"workflows/{self.workflow_id}/dispatches"
+        )
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": " ".join(("token", self.github_token)),
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        body = {
+            "ref": self.ref,
+            "inputs": {
+                "job_id": job_id,
+                "person": person,
+                "season": season,
+                "force_refresh": "true" if force_refresh else "false",
+            },
+        }
+        client = self._http_client or requests
+        resp = client.post(url, headers=headers, json=body, timeout=self.timeout_seconds)
+        if resp.status_code not in (200, 201, 202, 204):
+            raise RuntimeError(
+                f"ASYNC_DISPATCH_FAILED(status={resp.status_code}): {resp.text[:256]}"
+            )
+        return {
+            "status": "ACQUIRING_IN_CLOUD",
+            "job_id": job_id,
+            "dispatched": True,
+            "next_action": "call check_acquisition_job",
+        }
+
+
+def _normalize_master_rows(
+    master_rows: Optional[Sequence[Mapping[str, Any]]],
+) -> Optional[List[Dict[str, Any]]]:
+    if master_rows is None:
+        return None
+    normalized: List[Dict[str, Any]] = []
+    for row in master_rows:
+        if not isinstance(row, Mapping):
+            continue
+        item = dict(row)
+        if not item.get("player") and item.get("player_name"):
+            item["player"] = item["player_name"]
+        if not item.get("club_official") and item.get("club"):
+            item["club_official"] = item["club"]
+        normalized.append(item)
+    return normalized
+
+
+class SnowballOrchestrator:
+    """Core state machine for Pure-Cloud On-Demand Snowball serving and acquisition."""
+
+    def __init__(
+        self,
+        state_store: Any,
+        *,
+        acquisition_backend: Optional[Any] = None,
+        drive_upserter: Optional[Callable[..., Dict[str, Any]]] = None,
+        snowball_folder_id: Optional[str] = None,
+        forbidden_folder_ids: Sequence[str] = (),
+        production_policy: Optional[Mapping[str, Any]] = None,
+        local_resolver_inputs: Optional[Mapping[str, Any]] = None,
+        instance: Optional[Any] = None,
+        default_negative_ttl_hours: float = 24.0,
+        stale_after_hours: float = 48.0,
+        now_fn: Optional[Callable[[], datetime]] = None,
+    ) -> None:
+        self.state_store = state_store
+        self.acquisition_backend = acquisition_backend
+        self.drive_upserter = drive_upserter
+        self.snowball_folder_id = snowball_folder_id
+        self.forbidden_folder_ids = tuple(forbidden_folder_ids or ())
+        self.production_policy = dict(production_policy) if production_policy is not None else None
+        self.local_resolver_inputs = (
+            dict(local_resolver_inputs) if local_resolver_inputs is not None else None
+        )
+        self.instance = instance
+        self.default_negative_ttl_hours = float(default_negative_ttl_hours)
+        self.stale_after_hours = float(stale_after_hours)
+        self.now_fn = now_fn
+
+    def _now_utc(self) -> datetime:
+        return _utc_now(self.now_fn)
+
+    def _resolve_local_candidates(
+        self,
+        query: str,
+        *,
+        now_utc: datetime,
+    ) -> Optional[Dict[str, Any]]:
+        if self.local_resolver_inputs is None and self.instance is None:
+            return None
+        kwargs = dict(self.local_resolver_inputs or {})
+        return resolve_person_query(
+            query,
+            instance=self.instance,
+            master_rows=_normalize_master_rows(kwargs.get("master_rows")),
+            foreign_rows=kwargs.get("foreign_rows"),
+            identity_registry=kwargs.get("identity_registry"),
+            negative_receipts=kwargs.get("negative_receipts"),
+            data_cutoff=kwargs.get("data_cutoff"),
+            now_utc=now_utc,
+        )
+
+    def _lookup_cached_card(
+        self,
+        season: str,
+        query: str,
+        *,
+        resolved_person: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        keys: List[str] = [query]
+        if isinstance(resolved_person, dict):
+            for field in ("player_name", "player_id", "player_uid"):
+                val = str(resolved_person.get(field) or "").strip()
+                if val and val not in keys:
+                    keys.append(val)
+        for key in keys:
+            card = self.state_store.get_card(season, key)
+            if isinstance(card, dict) and (card.get("markdown") or card.get("card_markdown")):
+                return card
+        return None
+
+    @staticmethod
+    def _is_card_fresh(
+        card: Mapping[str, Any],
+        *,
+        now_utc: datetime,
+        freshness_ttl_hours: float,
+    ) -> bool:
+        ts_raw = (
+            card.get("updated_at_utc")
+            or card.get("generated_at_utc")
+            or card.get("observed_until")
+        )
+        ts = _parse_utc(ts_raw)
+        if ts is None:
+            return False
+        age = now_utc - ts
+        return age <= timedelta(hours=float(freshness_ttl_hours))
+
+    def _find_negative_receipt_for_season(
+        self,
+        query: str,
+        *,
+        season: str,
+        now_utc: datetime,
+    ) -> Optional[Dict[str, Any]]:
+        receipts = self.state_store.get_negative_receipts() or []
+        filtered = [
+            rec
+            for rec in receipts
+            if isinstance(rec, dict)
+            and (not rec.get("season") or str(rec.get("season")) == season)
+        ]
+        return _find_active_negative_receipt(query, filtered, now_utc=now_utc)
+
+    def get_league_coverage(self) -> Dict[str, Any]:
+        """Evaluate league-wide observation horizon from R2 coverage_ledger.json."""
+        from .consumer_surface import evaluate_league_coverage
+
+        ledger = self.state_store.get_coverage_ledger()
+        return evaluate_league_coverage(
+            ledger,
+            now_utc=self._now_utc(),
+            stale_after_hours=self.stale_after_hours,
+        )
+
+    def check_acquisition_job(self, job_id: str) -> Dict[str, Any]:
+        """Check status of an async acquisition job and attach completed card_markdown."""
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise ValueError("JOB_ID_REQUIRED")
+        jid = job_id.strip()
+        job = self.state_store.get_job(jid)
+        if not isinstance(job, dict):
+            return {
+                "job_id": jid,
+                "status": "NOT_FOUND",
+            }
+
+        resp = dict(job)
+        status_upper = str(resp.get("status") or "").upper()
+        if status_upper in ("COMPLETED", "ACQUIRED_AND_BUILT"):
+            if not resp.get("card_markdown"):
+                person = str(resp.get("person") or "").strip()
+                season = str(resp.get("season") or "").strip()
+                if person and season:
+                    card = self.state_store.get_card(season, person)
+                    if isinstance(card, dict):
+                        md = str(card.get("markdown") or card.get("card_markdown") or "")
+                        if md:
+                            md_sha = _sha256_text(md)
+                            expected_sha = resp.get("card_sha256")
+                            if expected_sha and expected_sha != md_sha:
+                                raise ValueError("JOB_CARD_SHA256_MISMATCH")
+                            resp["card_markdown"] = md
+                            resp.setdefault("card_sha256", md_sha)
+                            resp.setdefault("filename", card.get("filename"))
+                            resp.setdefault("observed_until", card.get("observed_until"))
+                            resp.setdefault("coverage_status", card.get("coverage_status"))
+                            if card.get("drive_sync") is not None:
+                                resp.setdefault("drive_sync", card.get("drive_sync"))
+        elif status_upper in _ACTIVE_LOCK_STATUSES:
+            resp.setdefault("next_action", "call check_acquisition_job")
+        return resp
+
+    def get_or_acquire_person(
+        self,
+        person: str,
+        *,
+        season: str = "2026-2027",
+        force_refresh: bool = False,
+        freshness_ttl_hours: float = 24.0,
+    ) -> Dict[str, Any]:
+        """Serve fresh person card from R2 or orchestrate on-demand acquisition."""
+        if not isinstance(person, str) or not person.strip():
+            raise ValueError("PERSON_QUERY_REQUIRED")
+
+        q_clean = person.strip()
+        now = self._now_utc()
+
+        # 1. Fail-closed homonym / multi-candidate disambiguation (0 network)
+        resolved_person: Optional[Dict[str, Any]] = None
+        local_res = self._resolve_local_candidates(q_clean, now_utc=now)
+        if local_res is not None:
+            if local_res.get("status") == "UNDECIDED":
+                return {
+                    "status": "UNDECIDED",
+                    "person": q_clean,
+                    "season": season,
+                    "candidates": list(local_res.get("candidates") or []),
+                    "network_called": False,
+                    "next_action": "disambiguate_candidate",
+                }
+            if local_res.get("status") == "RESOLVED":
+                resolved_person = local_res.get("person")
+
+        # 2. Fast path: fresh cached card in R2 (0 network)
+        if not force_refresh:
+            card = self._lookup_cached_card(season, q_clean, resolved_person=resolved_person)
+            if card is not None and self._is_card_fresh(
+                card, now_utc=now, freshness_ttl_hours=freshness_ttl_hours
+            ):
+                md = str(card.get("markdown") or card.get("card_markdown") or "")
+                md_sha = _sha256_text(md)
+                stored_sha = card.get("card_sha256")
+                if stored_sha and stored_sha != md_sha:
+                    raise ValueError("CACHED_CARD_SHA256_MISMATCH")
+                return {
+                    "status": "HIT_FRESH",
+                    "person": q_clean,
+                    "season": season,
+                    "filename": card.get("filename"),
+                    "card_markdown": md,
+                    "card_sha256": md_sha,
+                    "observed_until": card.get("observed_until"),
+                    "coverage_status": card.get("coverage_status"),
+                    "updated_at_utc": card.get("updated_at_utc"),
+                    "drive_sync": card.get("drive_sync"),
+                    "network_called": False,
+                }
+
+            # 3. Active Negative-Receipt within TTL -> UNKNOWN_NEGATIVE_CACHED (0 network)
+            active_nr = self._find_negative_receipt_for_season(
+                q_clean, season=season, now_utc=now
+            )
+            if active_nr is not None:
+                return {
+                    "status": "UNKNOWN_NEGATIVE_CACHED",
+                    "person": q_clean,
+                    "season": season,
+                    "negative_receipt": active_nr,
+                    "whitelist_sources_checked": list(
+                        active_nr.get("whitelist_sources_checked") or []
+                    ),
+                    "network_called": False,
+                }
+
+        # 4. Concurrency dedup lock: reuse existing in-flight job_id
+        active_lock = self.state_store.find_active_job_for_person(q_clean, season)
+        if isinstance(active_lock, dict):
+            lock_status = str(active_lock.get("status") or "").upper()
+            lock_job_id = str(active_lock.get("job_id") or "").strip()
+            if lock_status in _ACTIVE_LOCK_STATUSES and lock_job_id:
+                return {
+                    "status": "ACQUIRING_IN_CLOUD",
+                    "job_id": lock_job_id,
+                    "person": q_clean,
+                    "season": season,
+                    "deduplicated": True,
+                    "network_called": False,
+                    "next_action": "call check_acquisition_job",
+                }
+
+        # 5. Slow path: dispatch or run acquisition backend
+        if self.acquisition_backend is None:
+            return {
+                "status": "UNKNOWN_NO_BACKEND",
+                "person": q_clean,
+                "season": season,
+                "network_called": False,
+            }
+
+        job_id = f"job_{uuid.uuid4().hex[:12]}"
+        now_iso = _iso_utc(now)
+        job_doc: Dict[str, Any] = {
+            "job_id": job_id,
+            "status": "RUNNING",
+            "person": q_clean,
+            "season": season,
+            "force_refresh": bool(force_refresh),
+            "created_at_utc": now_iso,
+            "updated_at_utc": now_iso,
+        }
+        self.state_store.put_job(job_id, job_doc)
+        self.state_store.set_active_job_lock(q_clean, season, job_doc)
+
+        try:
+            backend_result = self.acquisition_backend.acquire_person(
+                q_clean,
+                season=season,
+                job_id=job_id,
+                force_refresh=force_refresh,
+            )
+        except Exception as exc:
+            self.state_store.put_job(
+                job_id,
+                {
+                    **job_doc,
+                    "status": "FAILED",
+                    "error": str(exc),
+                    "updated_at_utc": _iso_utc(self._now_utc()),
+                },
+            )
+            self.state_store.clear_active_job_lock(q_clean, season)
+            raise
+
+        if not isinstance(backend_result, dict):
+            self.state_store.clear_active_job_lock(q_clean, season)
+            raise ValueError("ACQUISITION_BACKEND_INVALID_RESULT")
+
+        backend_status = str(backend_result.get("status") or "").upper()
+        done_iso = _iso_utc(self._now_utc())
+
+        if backend_status in ("ACQUIRED_AND_BUILT", "BUILT"):
+            md = str(
+                backend_result.get("card_markdown")
+                or backend_result.get("markdown")
+                or ""
+            )
+            if not md:
+                self.state_store.clear_active_job_lock(q_clean, season)
+                raise ValueError("ACQUIRED_CARD_MARKDOWN_EMPTY")
+            md_sha = _sha256_text(md)
+            provided_sha = backend_result.get("card_sha256")
+            if provided_sha and provided_sha != md_sha:
+                self.state_store.clear_active_job_lock(q_clean, season)
+                raise ValueError("ACQUIRED_CARD_SHA256_MISMATCH")
+
+            person_meta = (
+                backend_result.get("person")
+                if isinstance(backend_result.get("person"), dict)
+                else {}
+            )
+            filename = str(
+                backend_result.get("filename")
+                or f"研究卡_{q_clean}_{season}_CURRENT.md"
+            )
+            observed_until = backend_result.get("observed_until")
+            coverage_status = backend_result.get("coverage_status")
+            if not observed_until or not coverage_status:
+                try:
+                    cov = self.get_league_coverage()
+                    observed_until = observed_until or cov.get("observed_until")
+                    coverage_status = coverage_status or cov.get("overall_status")
+                except Exception:
+                    pass
+
+            drive_receipt: Optional[Dict[str, Any]] = None
+            if self.drive_upserter is not None and self.snowball_folder_id:
+                upsert_kwargs: Dict[str, Any] = {
+                    "folder_id": self.snowball_folder_id,
+                    "filename": filename,
+                    "content_bytes": md.encode("utf-8"),
+                    "forbidden_folder_ids": list(self.forbidden_folder_ids),
+                }
+                if self.production_policy is not None:
+                    upsert_kwargs["production_policy"] = self.production_policy
+                drive_receipt = self.drive_upserter(**upsert_kwargs)
+
+            card_record: Dict[str, Any] = {
+                "player_name": person_meta.get("player_name") or q_clean,
+                "player_id": person_meta.get("player_id"),
+                "player_uid": person_meta.get("player_uid"),
+                "season": season,
+                "filename": filename,
+                "markdown": md,
+                "card_sha256": md_sha,
+                "updated_at_utc": done_iso,
+                "observed_until": observed_until,
+                "coverage_status": coverage_status,
+                "drive_sync": drive_receipt,
+            }
+            self.state_store.put_card(season, q_clean, card_record)
+
+            self.state_store.put_job(
+                job_id,
+                {
+                    **job_doc,
+                    "status": "COMPLETED",
+                    "updated_at_utc": done_iso,
+                    "filename": filename,
+                    "card_sha256": md_sha,
+                    "drive_sync": drive_receipt,
+                },
+            )
+            self.state_store.clear_active_job_lock(q_clean, season)
+            return {
+                "status": "ACQUIRED_AND_BUILT",
+                "job_id": job_id,
+                "person": q_clean,
+                "season": season,
+                "filename": filename,
+                "card_markdown": md,
+                "card_sha256": md_sha,
+                "observed_until": observed_until,
+                "coverage_status": coverage_status,
+                "drive_sync": drive_receipt,
+                "network_called": True,
+            }
+
+        if backend_status == "UNKNOWN_AFTER_WHITELIST_CHECK":
+            ttl_raw = backend_result.get("ttl_hours")
+            ttl_hours = (
+                float(ttl_raw)
+                if isinstance(ttl_raw, (int, float)) and not isinstance(ttl_raw, bool)
+                else self.default_negative_ttl_hours
+            )
+            whitelist_checked = list(backend_result.get("whitelist_sources_checked") or [])
+            receipt: Dict[str, Any] = {
+                "schema": NEGATIVE_RECEIPT_SCHEMA,
+                "query_person": q_clean,
+                "season": season,
+                "checked_at_utc": done_iso,
+                "ttl_hours": ttl_hours,
+                "whitelist_sources_checked": whitelist_checked,
+                "job_id": job_id,
+            }
+            self.state_store.append_negative_receipt(receipt)
+            self.state_store.put_job(
+                job_id,
+                {
+                    **job_doc,
+                    "status": "COMPLETED_UNKNOWN",
+                    "updated_at_utc": done_iso,
+                    "negative_receipt": receipt,
+                },
+            )
+            self.state_store.clear_active_job_lock(q_clean, season)
+            return {
+                "status": "UNKNOWN_AFTER_WHITELIST_CHECK",
+                "job_id": job_id,
+                "person": q_clean,
+                "season": season,
+                "negative_receipt": receipt,
+                "whitelist_sources_checked": whitelist_checked,
+                "network_called": True,
+            }
+
+        if backend_status == "UNDECIDED":
+            candidates = list(backend_result.get("candidates") or [])
+            self.state_store.put_job(
+                job_id,
+                {
+                    **job_doc,
+                    "status": "UNDECIDED",
+                    "updated_at_utc": done_iso,
+                    "candidates": candidates,
+                },
+            )
+            self.state_store.clear_active_job_lock(q_clean, season)
+            return {
+                "status": "UNDECIDED",
+                "job_id": job_id,
+                "person": q_clean,
+                "season": season,
+                "candidates": candidates,
+                "network_called": True,
+                "next_action": "disambiguate_candidate",
+            }
+
+        if backend_status == "ACQUIRING_IN_CLOUD":
+            returned_job_id = str(backend_result.get("job_id") or job_id).strip() or job_id
+            if returned_job_id != job_id:
+                async_doc = {
+                    **job_doc,
+                    "job_id": returned_job_id,
+                    "updated_at_utc": done_iso,
+                }
+                self.state_store.put_job(returned_job_id, async_doc)
+                self.state_store.set_active_job_lock(q_clean, season, async_doc)
+            return {
+                "status": "ACQUIRING_IN_CLOUD",
+                "job_id": returned_job_id,
+                "person": q_clean,
+                "season": season,
+                "deduplicated": False,
+                "network_called": True,
+                "next_action": str(
+                    backend_result.get("next_action") or "call check_acquisition_job"
+                ),
+            }
+
+        # Fallback for unexpected backend status
+        self.state_store.put_job(
+            job_id,
+            {
+                **job_doc,
+                "status": backend_status or "FAILED",
+                "updated_at_utc": done_iso,
+            },
+        )
+        self.state_store.clear_active_job_lock(q_clean, season)
+        return {
+            **backend_result,
+            "job_id": job_id,
+            "person": q_clean,
+            "season": season,
+            "network_called": True,
+        }
+
+
+__all__ = [
+    "AcquisitionBackend",
+    "AsyncDispatchAcquisitionBackend",
+    "LocalCliAcquisitionBackend",
+    "NEGATIVE_RECEIPT_SCHEMA",
+    "SnowballOrchestrator",
+]
