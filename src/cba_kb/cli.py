@@ -399,7 +399,24 @@ def main():
     q.add_argument('--approved-mentions',type=Path,default=None)
     q.add_argument('--max-external-citations-per-card','--max-external-citations',
                    dest='max_external_citations_per_card',type=int,default=10)
+    q.add_argument('--game-logs-dir',type=Path,default=None)
+    q.add_argument('--coverage-ledger',type=Path,default=None)
+    q.add_argument('--negative-receipts',type=Path,default=None)
     q.add_argument('--dry-run',action='store_true',default=False)
+    q=sub.add_parser('build-person-card')
+    q.add_argument('--person',required=True)
+    q.add_argument('--season',default='2026-2027')
+    q.add_argument('--recent-games-window',type=int,default=5)
+    q.add_argument('--output-dir',type=Path,default=None)
+    q.add_argument('--register-for-sync',action='store_true',default=False)
+    q.add_argument('--format',choices=('json','markdown'),default='json')
+    q.add_argument('--master-csv',type=Path,default=None)
+    q.add_argument('--foreign-csv',type=Path,default=None)
+    q.add_argument('--identity-registry',type=Path,default=None)
+    q.add_argument('--season-stats',type=Path,default=None)
+    q.add_argument('--game-logs-dir',type=Path,default=None)
+    q.add_argument('--ops-checkpoint',type=Path,default=None)
+    q.add_argument('--negative-receipts',type=Path,default=None)
     q=sub.add_parser('plan'); q.add_argument('--entries',type=Path,required=True); q.add_argument('--release-id',required=True)
     q.add_argument('--status-id',required=True); q.add_argument('--archive-id',required=True)
     q.add_argument('--dependencies',type=Path);q.add_argument('--environment',choices=['sandbox','production'],default='sandbox')
@@ -1786,7 +1803,63 @@ def main():
                 approved_mentions_path=a.approved_mentions,
                 max_external_citations_per_card=a.max_external_citations_per_card,
                 dry_run=a.dry_run,
+                game_logs_dir=a.game_logs_dir,
+                coverage_ledger_path=a.coverage_ledger,
+                negative_receipts_path=a.negative_receipts,
             )
+        elif a.command == 'build-person-card':
+            from .person_card_builder import (
+                _load_game_logs_from_dir,
+                _read_csv_rows,
+                _read_json_or_jsonl,
+                build_person_card,
+            )
+            configured = a.instance_root is not None or bool(os.environ.get('CBA_KB_INSTANCE_ROOT'))
+            instance = private_instance() if configured else None
+            master_rows = _read_csv_rows(a.master_csv) if a.master_csv is not None else None
+            foreign_rows = _read_csv_rows(a.foreign_csv) if a.foreign_csv is not None else None
+            id_reg = (
+                json.loads(a.identity_registry.read_text(encoding='utf-8'))
+                if a.identity_registry is not None
+                else None
+            )
+            season_stats = _read_json_or_jsonl(a.season_stats) if a.season_stats is not None else None
+            game_stats = _load_game_logs_from_dir(a.game_logs_dir) if a.game_logs_dir is not None else None
+            doc_bundles = None
+            if a.ops_checkpoint is not None and a.ops_checkpoint.is_file():
+                ckpt_obj = json.loads(a.ops_checkpoint.read_text(encoding='utf-8'))
+                raw_b = ckpt_obj.get('consumed_bundles') if isinstance(ckpt_obj, dict) else None
+                if isinstance(raw_b, dict):
+                    doc_bundles = [dict(v) for _, v in sorted(raw_b.items()) if isinstance(v, dict)]
+                elif isinstance(raw_b, list):
+                    doc_bundles = [dict(v) for v in raw_b if isinstance(v, dict)]
+            neg_recs = (
+                _read_json_or_jsonl(a.negative_receipts)
+                if a.negative_receipts is not None
+                else None
+            )
+            result = build_person_card(
+                a.person,
+                season=a.season,
+                recent_games_window=a.recent_games_window,
+                instance=instance,
+                master_rows=master_rows,
+                foreign_rows=foreign_rows,
+                identity_registry=id_reg,
+                season_stats_records=season_stats,
+                game_stats_records=game_stats,
+                document_bundles=doc_bundles,
+                negative_receipts=neg_recs,
+                output_dir=a.output_dir,
+                register_for_sync=a.register_for_sync,
+            )
+            if a.format == 'markdown':
+                stage(a.command, 'done')
+                if result.get('markdown'):
+                    print(result['markdown'], end='')
+                else:
+                    print(json.dumps(result, ensure_ascii=False, indent=2))
+                return
         elif a.command=='plan':
             from .current_state import clean
             def read_plan_input(path):

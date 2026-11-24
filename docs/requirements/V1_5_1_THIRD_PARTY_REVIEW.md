@@ -54,7 +54,7 @@ GitHub 私有仓库代码（无凭据通道，见 V1_5_REVIEW §A1）
 | §12 A1 observed registrations | 132 | 73 + 59 = 132 | PASS |
 | §12 A2 parsed records | 14 | 14 | PASS（但基准失效，见 E） |
 | §R11 fact products | 3 | 3 | PASS |
-| §9 MASTER file ID 稳定 | 不变 | `1Nb4-4rr…` 未变 | PASS |
+| §9 MASTER file ID 稳定 | 不变 | `<REDACTED_HISTORICAL_MASTER_DRIVE_ID>` 未变 | PASS |
 
 EVENTS 总行数 = 14 domestic + 59 foreign = **73**。
 

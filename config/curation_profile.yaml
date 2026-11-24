@@ -1,0 +1,75 @@
+# Default CBA operational announcement curation profile (REQ-223 P0-1).
+# Runtime prefers <instance.config_root>/curation_profile.yaml when present,
+# falling back to this declarative repo default.
+schema_version: 1
+compact_announcement_excerpt_chars: 140
+
+noise_event_classes:
+  - "社媒互动"
+
+noise_keywords:
+  - "每日预言家"
+  - "每日名场面"
+  - "图文征集"
+  - "我和我的篮球"
+  - "有奖互动"
+  - "抽奖"
+  - "投票评选"
+  - "最佳高光"
+
+historical_pinned_event_classes:
+  - "历史总结"
+
+historical_pinned_keywords:
+  - "杭州亚运会"
+  - "亚运会总结"
+  - "亚运会"
+
+pinned_marker_keywords:
+  - "置顶"
+
+protected_event_classes:
+  - "注册与转会"
+  - "伤病与名单"
+  - "判罚与规则"
+  - "联赛政策"
+
+active_competitive_keywords:
+  - "注册"
+  - "取消注册"
+  - "签约"
+  - "裁员"
+  - "解约"
+  - "解除合同"
+  - "试训"
+  - "伤情"
+  - "伤病"
+  - "大名单"
+  - "出征名单"
+  - "出征"
+  - "集训名单"
+  - "国家队"
+  - "#判罚解析#"
+  - "判罚解析"
+  - "NBL-CBA"
+  - "工作会议"
+  - "规则对接"
+
+condolence_keywords:
+  - "唁电"
+
+condolence_exempt_keywords:
+  - "注册"
+  - "取消注册"
+  - "签约"
+  - "裁员"
+  - "解约"
+  - "解除合同"
+  - "试训"
+  - "伤情"
+  - "伤病"
+  - "大名单"
+  - "出征名单"
+  - "集训名单"
+  - "#判罚解析#"
+  - "判罚解析"

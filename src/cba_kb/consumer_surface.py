@@ -8,6 +8,7 @@ import json
 import re
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
+import yaml
 
 from .kc_consume import ConsumeSession, _content_digest
 from .kc_passages import evidence_chain
@@ -57,65 +58,91 @@ _RELEASE_SEMVER_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)")
 _ISO_DATE_PREFIX_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
 _MD_SEP_CELL_RE = re.compile(r"^:?-{2,}:?$")
 
-_CURATED_NOISE_KEYWORDS = (
-    "每日预言家",
-    "每日名场面",
-    "图文征集",
-    "我和我的篮球",
-    "有奖互动",
-    "抽奖",
-    "投票评选",
-    "最佳高光",
+_DEFAULT_CURATION_PROFILE_PATH = (
+    Path(__file__).resolve().parents[2] / "config" / "curation_profile.yaml"
 )
-_CURATED_HISTORICAL_PINNED_KEYWORDS = (
-    "杭州亚运会",
-    "亚运会总结",
-    "亚运会",
+_CURATION_PROFILE_LIST_KEYS = (
+    "noise_event_classes",
+    "noise_keywords",
+    "historical_pinned_event_classes",
+    "historical_pinned_keywords",
+    "pinned_marker_keywords",
+    "protected_event_classes",
+    "active_competitive_keywords",
+    "condolence_keywords",
+    "condolence_exempt_keywords",
 )
-_CURATED_PROTECTED_EVENT_CLASSES = frozenset({
-    "注册与转会",
-    "伤病与名单",
-    "判罚与规则",
-    "联赛政策",
-})
-_CURATED_CONDOLENCE_EXEMPT_KEYWORDS = (
-    "注册",
-    "取消注册",
-    "签约",
-    "裁员",
-    "解约",
-    "解除合同",
-    "试训",
-    "伤情",
-    "伤病",
-    "大名单",
-    "出征名单",
-    "集训名单",
-    "#判罚解析#",
-    "判罚解析",
+_CURATION_PROFILE_REQUIRED_KEYS = frozenset(
+    {"schema_version", "compact_announcement_excerpt_chars", *_CURATION_PROFILE_LIST_KEYS}
 )
-_COMPACT_ANNOUNCEMENT_EXCERPT_CHARS = 140
-_CURATED_ACTIVE_COMPETITIVE_KEYWORDS = (
-    "注册",
-    "取消注册",
-    "签约",
-    "裁员",
-    "解约",
-    "解除合同",
-    "试训",
-    "伤情",
-    "伤病",
-    "大名单",
-    "出征名单",
-    "出征",
-    "集训名单",
-    "国家队",
-    "#判罚解析#",
-    "判罚解析",
-    "NBL-CBA",
-    "工作会议",
-    "规则对接",
-)
+
+
+def _validate_curation_profile(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError("CURATION_PROFILE_INVALID: expected YAML mapping")
+    missing = sorted(_CURATION_PROFILE_REQUIRED_KEYS - set(raw.keys()))
+    if missing:
+        raise ValueError(f"CURATION_PROFILE_INVALID: missing keys {','.join(missing)}")
+    schema_version = raw.get("schema_version")
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != 1:
+        raise ValueError("CURATION_PROFILE_INVALID: schema_version must be integer 1")
+    excerpt_chars = raw.get("compact_announcement_excerpt_chars")
+    if isinstance(excerpt_chars, bool) or not isinstance(excerpt_chars, int) or excerpt_chars <= 0:
+        raise ValueError("CURATION_PROFILE_INVALID: compact_announcement_excerpt_chars must be positive int")
+    validated: Dict[str, Any] = {
+        "schema_version": 1,
+        "compact_announcement_excerpt_chars": excerpt_chars,
+    }
+    for key in _CURATION_PROFILE_LIST_KEYS:
+        val = raw.get(key)
+        if not isinstance(val, list) or not all(isinstance(item, str) and item.strip() for item in val):
+            raise ValueError(f"CURATION_PROFILE_INVALID: {key} must be list of non-empty strings")
+        validated[key] = list(val)
+    return validated
+
+
+def load_curation_profile(path_or_instance: Any = None) -> Dict[str, Any]:
+    """Load and strictly validate declarative curation profile YAML.
+
+    Resolution order:
+    - Explicit str/Path: must exist (else ValueError("CURATION_PROFILE_MISSING")).
+    - Instance (object with .config_root): prefers <config_root>/curation_profile.yaml
+      when present, falling back to repo default config/curation_profile.yaml.
+    - None: repo default config/curation_profile.yaml.
+    """
+    target_path: Path
+    if path_or_instance is None:
+        target_path = _DEFAULT_CURATION_PROFILE_PATH
+    elif isinstance(path_or_instance, (str, Path)):
+        target_path = Path(path_or_instance)
+        if not target_path.is_file():
+            raise ValueError(f"CURATION_PROFILE_MISSING: {target_path}")
+    elif hasattr(path_or_instance, "config_root"):
+        candidate = Path(path_or_instance.config_root) / "curation_profile.yaml"
+        target_path = candidate if candidate.is_file() else _DEFAULT_CURATION_PROFILE_PATH
+    else:
+        raise ValueError("CURATION_PROFILE_INVALID: unsupported path_or_instance type")
+
+    if not target_path.is_file():
+        raise ValueError(f"CURATION_PROFILE_MISSING: {target_path}")
+    try:
+        parsed = yaml.safe_load(target_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"CURATION_PROFILE_INVALID: {exc}") from exc
+    return _validate_curation_profile(parsed)
+
+
+def _resolve_curation_profile(
+    *,
+    curation_profile: Optional[Dict[str, Any]] = None,
+    curation_profile_path: Optional[str | Path] = None,
+    instance: Any = None,
+) -> Dict[str, Any]:
+    if curation_profile is not None:
+        return _validate_curation_profile(curation_profile)
+    if curation_profile_path is not None:
+        return load_curation_profile(curation_profile_path)
+    return load_curation_profile(instance)
 
 DEFAULT_MAX_EXTERNAL_CITATIONS_PER_CARD = 10
 
@@ -1111,30 +1138,31 @@ def export_domestic_registration_diff_csv(
 
 
 def _is_protected_operational_announcement(
-    bundle: Dict[str, Any], *, event_class: str, combined: str
+    bundle: Dict[str, Any], *, event_class: str, combined: str, profile: Dict[str, Any]
 ) -> bool:
-    if event_class in _CURATED_PROTECTED_EVENT_CLASSES:
+    if event_class in profile["protected_event_classes"]:
         return True
-    return any(kw in combined for kw in _CURATED_ACTIVE_COMPETITIVE_KEYWORDS)
+    return any(kw in combined for kw in profile["active_competitive_keywords"])
 
 
 def _explicit_historical_pinned_reason(
-    bundle: Dict[str, Any], *, event_class: str, combined: str
+    bundle: Dict[str, Any], *, event_class: str, combined: str, profile: Dict[str, Any]
 ) -> Optional[str]:
     if bundle.get("is_pinned") is True or bundle.get("pinned") is True:
         return "out_of_window_historical_pinned:pinned_flag"
-    if event_class == "历史总结":
+    if event_class in profile["historical_pinned_event_classes"]:
         return "out_of_window_historical_pinned:historical_summary"
-    for kw in _CURATED_HISTORICAL_PINNED_KEYWORDS:
+    for kw in profile["historical_pinned_keywords"]:
         if kw in combined:
             return f"out_of_window_historical_pinned:{kw}"
-    if "置顶" in combined:
-        return "out_of_window_historical_pinned:置顶"
+    for kw in profile["pinned_marker_keywords"]:
+        if kw in combined:
+            return f"out_of_window_historical_pinned:{kw}"
     return None
 
 
 def _denoising_filter_reason(
-    bundle: Dict[str, Any], *, active_window_start: str
+    bundle: Dict[str, Any], *, active_window_start: str, profile: Dict[str, Any]
 ) -> Optional[str]:
     """Return a non-empty filter reason if an announcement should be excluded from curated .md."""
     kind = _classify_digest_bundle(bundle)
@@ -1146,16 +1174,18 @@ def _denoising_filter_reason(
     event_class = str(bundle.get("event_class") or "")
     combined = f"{title}\n{body}"
 
-    if event_class == "社媒互动":
+    if event_class in profile["noise_event_classes"]:
         return "noise_social_interaction"
-    for kw in _CURATED_NOISE_KEYWORDS:
+    for kw in profile["noise_keywords"]:
         if kw in combined:
             return f"noise_keyword:{kw}"
-    if "唁电" in combined and not any(kw in combined for kw in _CURATED_CONDOLENCE_EXEMPT_KEYWORDS):
+    if any(kw in combined for kw in profile["condolence_keywords"]) and not any(
+        kw in combined for kw in profile["condolence_exempt_keywords"]
+    ):
         return "noise_non_active_condolence"
 
     pinned_reason = _explicit_historical_pinned_reason(
-        bundle, event_class=event_class, combined=combined
+        bundle, event_class=event_class, combined=combined, profile=profile
     )
     pub_date = _normalize_date_prefix(bundle.get("published_at"))
     if pub_date is not None:
@@ -1163,11 +1193,11 @@ def _denoising_filter_reason(
             if pinned_reason is not None:
                 return pinned_reason
             if _is_protected_operational_announcement(
-                bundle, event_class=event_class, combined=combined
+                bundle, event_class=event_class, combined=combined, profile=profile
             ):
                 return None
             return f"out_of_window_published_at:{pub_date}<{active_window_start}"
-        for kw in _CURATED_HISTORICAL_PINNED_KEYWORDS:
+        for kw in profile["historical_pinned_keywords"]:
             if kw in combined:
                 return f"out_of_window_historical_pinned:{kw}"
     elif pinned_reason is not None:
@@ -1180,8 +1210,16 @@ def filter_curated_operational_announcements(
     bundles: Sequence[Dict[str, Any]],
     *,
     active_window_start: str = "2025-07-01",
+    curation_profile: Optional[Dict[str, Any]] = None,
+    curation_profile_path: Optional[str | Path] = None,
+    instance: Any = None,
 ) -> Dict[str, Any]:
     """Deterministically partition operational bundles into admitted and filtered sets."""
+    profile = _resolve_curation_profile(
+        curation_profile=curation_profile,
+        curation_profile_path=curation_profile_path,
+        instance=instance,
+    )
     sorted_bundles = sorted(
         (dict(b) for b in (bundles or ()) if isinstance(b, dict)),
         key=_bundle_sort_key,
@@ -1190,7 +1228,9 @@ def filter_curated_operational_announcements(
     filtered: list[Dict[str, Any]] = []
     reasons_by_doc_id: Dict[str, str] = {}
     for b in sorted_bundles:
-        reason = _denoising_filter_reason(b, active_window_start=active_window_start)
+        reason = _denoising_filter_reason(
+            b, active_window_start=active_window_start, profile=profile
+        )
         if reason is None:
             admitted.append(b)
         else:
@@ -1217,11 +1257,13 @@ def _render_compact_curated_digest_md(
     known_drive_ids: Sequence[str],
     max_bytes: int,
     active_window_start: str,
+    profile: Dict[str, Any],
 ) -> bytes:
     """Render <25KB curated collector digest with CSV routing & fail-closed size gate."""
     filtered_res = filter_curated_operational_announcements(
-        bundles, active_window_start=active_window_start
+        bundles, active_window_start=active_window_start, curation_profile=profile
     )
+    excerpt_cap = int(profile["compact_announcement_excerpt_chars"])
     admitted = filtered_res["admitted"]
     total_count = filtered_res["total_count"]
     admitted_count = filtered_res["admitted_count"]
@@ -1331,8 +1373,8 @@ def _render_compact_curated_digest_md(
             raw_body = " ".join(str(b.get("body") or "").split())
             excerpt = (
                 raw_body
-                if len(raw_body) <= _COMPACT_ANNOUNCEMENT_EXCERPT_CHARS
-                else raw_body[:_COMPACT_ANNOUNCEMENT_EXCERPT_CHARS].rstrip() + "…"
+                if len(raw_body) <= excerpt_cap
+                else raw_body[:excerpt_cap].rstrip() + "…"
             )
             lines.extend([
                 f"### {_md_cell(b.get('title') or b.get('doc_id'))}",
@@ -1373,9 +1415,17 @@ def render_collector_official_digest_md(
     compact_curated: bool = False,
     max_bytes: int = COLLECTOR_DIGEST_MAX_BYTES,
     active_window_start: str = "2025-07-01",
+    curation_profile: Optional[Dict[str, Any]] = None,
+    curation_profile_path: Optional[str | Path] = None,
+    instance: Any = None,
 ) -> bytes:
     """Deterministically render governed collector official digest Markdown in evidence layer."""
     if compact_curated:
+        profile = _resolve_curation_profile(
+            curation_profile=curation_profile,
+            curation_profile_path=curation_profile_path,
+            instance=instance,
+        )
         return _render_compact_curated_digest_md(
             bundles=bundles,
             reg_diff=reg_diff,
@@ -1384,6 +1434,7 @@ def render_collector_official_digest_md(
             known_drive_ids=known_drive_ids,
             max_bytes=max_bytes,
             active_window_start=active_window_start,
+            profile=profile,
         )
     sorted_bundles = sorted((dict(b) for b in (bundles or ()) if isinstance(b, dict)), key=_bundle_sort_key)
 

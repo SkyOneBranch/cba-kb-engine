@@ -1,0 +1,38 @@
+# Neutral synthetic example curation profile (REQ-223 P0-1).
+# Copy to <instance.config_root>/curation_profile.yaml and customize for your instance.
+schema_version: 1
+compact_announcement_excerpt_chars: 140
+
+noise_event_classes:
+  - "SOCIAL_ENGAGEMENT"
+
+noise_keywords:
+  - "SYNTH_GIVEAWAY"
+  - "SYNTH_FAN_VOTE"
+
+historical_pinned_event_classes:
+  - "HISTORICAL_SUMMARY"
+
+historical_pinned_keywords:
+  - "SYNTH_PAST_TOURNAMENT"
+
+pinned_marker_keywords:
+  - "PINNED"
+
+protected_event_classes:
+  - "ROSTER_TRANSACTIONS"
+  - "INJURY_AND_ROSTER"
+  - "OFFICIATING_AND_RULES"
+  - "LEAGUE_POLICY"
+
+active_competitive_keywords:
+  - "ROSTER_SIGNING"
+  - "WAIVER_NOTICE"
+  - "INJURY_REPORT"
+
+condolence_keywords:
+  - "CONDOLENCE_NOTICE"
+
+condolence_exempt_keywords:
+  - "ROSTER_SIGNING"
+  - "INJURY_REPORT"
