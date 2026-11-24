@@ -84,7 +84,7 @@ def _validate_curation_profile(raw: Any) -> Dict[str, Any]:
     if missing:
         raise ValueError(f"CURATION_PROFILE_INVALID: missing keys {','.join(missing)}")
     schema_version = raw.get("schema_version")
-    if isinstance(schema_version, bool) or schema_version != 1:
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != 1:
         raise ValueError("CURATION_PROFILE_INVALID: schema_version must be integer 1")
     excerpt_chars = raw.get("compact_announcement_excerpt_chars")
     if isinstance(excerpt_chars, bool) or not isinstance(excerpt_chars, int) or excerpt_chars <= 0:

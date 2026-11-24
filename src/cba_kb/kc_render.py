@@ -299,9 +299,7 @@ def render_research_card(
 
     # 7. Recent Single-Game Log Section (REQ-223 P0-4: PLAYER_GAME_STATS grain, lossless)
     recent_games = payload.get("recent_games_summary")
-    if isinstance(recent_games, dict) and (
-        recent_games.get("games") or recent_games.get("played_games_in_window")
-    ):
+    if isinstance(recent_games, dict):
         has_v223_extension = True
 
         def _fmt_num(v: Any) -> str:
@@ -321,7 +319,8 @@ def render_research_card(
         avgs = recent_games.get("averages") or {}
         st = recent_games.get("shooting_totals") or {}
         win_n = recent_games.get("window", 5)
-        played_n = recent_games.get("played_games_in_window", len(recent_games.get("games") or []))
+        games_list = recent_games.get("games") or []
+        played_n = recent_games.get("played_games_in_window", len(games_list))
         dnp_n = recent_games.get("dnp_games_count", 0)
         lines.extend([
             "",
@@ -342,43 +341,50 @@ def render_research_card(
                 f"- Latest Game Date: {recent_games.get('latest_game_date') or '-'} | "
                 f"Latest Captured At: {recent_games.get('latest_captured_at') or '-'}"
             ),
-            "",
-            "| Date | Round | Opponent | MIN | PTS-REB-AST | FG / 3P / FT | Locator | Revision |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- |",
         ])
-        for g in recent_games.get("games") or []:
-            if not isinstance(g, dict):
-                continue
-            m = g.get("metrics") or {}
-            prov = g.get("provenance") or {}
-            g_date = g.get("game_date") or "-"
-            rnd = g.get("round_label") or "-"
-            opp = g.get("opponent_team_name") or g.get("opponent_team_id") or "-"
-            mins = _fmt_num(m.get("minutes_played"))
-            pts = "UNKNOWN" if m.get("points") is None else str(m.get("points"))
-            reb = "UNKNOWN" if m.get("rebounds") is None else str(m.get("rebounds"))
-            ast = "UNKNOWN" if m.get("assists") is None else str(m.get("assists"))
-            fg_s = (
-                f"{m.get('field_goals_made')}-{m.get('field_goals_attempted')}"
-                if m.get("field_goals_made") is not None and m.get("field_goals_attempted") is not None
-                else "UNKNOWN"
-            )
-            tp_s = (
-                f"{m.get('three_point_made')}-{m.get('three_point_attempted')}"
-                if m.get("three_point_made") is not None and m.get("three_point_attempted") is not None
-                else "UNKNOWN"
-            )
-            ft_s = (
-                f"{m.get('free_throws_made')}-{m.get('free_throws_attempted')}"
-                if m.get("free_throws_made") is not None and m.get("free_throws_attempted") is not None
-                else "UNKNOWN"
-            )
-            loc = prov.get("doc_id") or (
-                str(prov.get("raw_sha256") or "")[:12] if prov.get("raw_sha256") else "-"
-            )
-            rev_mark = "[LOUD_REVISION]" if g.get("is_revised") else "-"
+        if games_list:
+            lines.extend([
+                "",
+                "| Date | Round | Opponent | MIN | PTS-REB-AST | FG / 3P / FT | Locator | Revision |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- |",
+            ])
+            for g in games_list:
+                if not isinstance(g, dict):
+                    continue
+                m = g.get("metrics") or {}
+                prov = g.get("provenance") or {}
+                g_date = g.get("game_date") or "-"
+                rnd = g.get("round_label") or "-"
+                opp = g.get("opponent_team_name") or g.get("opponent_team_id") or "-"
+                mins = _fmt_num(m.get("minutes_played"))
+                pts = "UNKNOWN" if m.get("points") is None else str(m.get("points"))
+                reb = "UNKNOWN" if m.get("rebounds") is None else str(m.get("rebounds"))
+                ast = "UNKNOWN" if m.get("assists") is None else str(m.get("assists"))
+                fg_s = (
+                    f"{m.get('field_goals_made')}-{m.get('field_goals_attempted')}"
+                    if m.get("field_goals_made") is not None and m.get("field_goals_attempted") is not None
+                    else "UNKNOWN"
+                )
+                tp_s = (
+                    f"{m.get('three_point_made')}-{m.get('three_point_attempted')}"
+                    if m.get("three_point_made") is not None and m.get("three_point_attempted") is not None
+                    else "UNKNOWN"
+                )
+                ft_s = (
+                    f"{m.get('free_throws_made')}-{m.get('free_throws_attempted')}"
+                    if m.get("free_throws_made") is not None and m.get("free_throws_attempted") is not None
+                    else "UNKNOWN"
+                )
+                loc = prov.get("doc_id") or (
+                    str(prov.get("raw_sha256") or "")[:12] if prov.get("raw_sha256") else "-"
+                )
+                rev_mark = "[LOUD_REVISION]" if g.get("is_revised") else "-"
+                lines.append(
+                    f"| {g_date} | {rnd} | {opp} | {mins} | {pts}-{reb}-{ast} | {fg_s} / {tp_s} / {ft_s} | {loc} | {rev_mark} |"
+                )
+        else:
             lines.append(
-                f"| {g_date} | {rnd} | {opp} | {mins} | {pts}-{reb}-{ast} | {fg_s} / {tp_s} / {ft_s} | {loc} | {rev_mark} |"
+                f"- Played Games in Window: 0 (no played appearances recorded in window; dnp_excluded={dnp_n})"
             )
 
         game_revs = recent_games.get("revision_summaries") or []

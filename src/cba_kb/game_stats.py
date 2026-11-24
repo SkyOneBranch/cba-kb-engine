@@ -267,13 +267,44 @@ def _is_dnp_record(rec: Dict[str, Any]) -> bool:
     return isinstance(reason, str) and bool(reason.strip())
 
 
+def _record_player_key(rec: Dict[str, Any]) -> tuple[str, str]:
+    uid = rec.get("player_uid")
+    if isinstance(uid, str) and uid.strip():
+        return ("player_uid", uid.strip())
+    pid = rec.get("provider_player_id")
+    if pid is not None and not isinstance(pid, bool) and str(pid).strip():
+        return ("provider_player_id", str(pid).strip())
+    pname = rec.get("player_name")
+    if isinstance(pname, str) and pname.strip():
+        return ("player_name", pname.strip())
+    return ("record_id", str(rec["record_id"]).strip())
+
+
+def _same_player_identity(rec: Dict[str, Any], prior_rec: Dict[str, Any]) -> bool:
+    if _record_player_key(rec) != _record_player_key(prior_rec):
+        return False
+    u1, u2 = rec.get("player_uid"), prior_rec.get("player_uid")
+    if isinstance(u1, str) and u1.strip() and isinstance(u2, str) and u2.strip():
+        if u1.strip() != u2.strip():
+            return False
+    p1, p2 = rec.get("provider_player_id"), prior_rec.get("provider_player_id")
+    if p1 is not None and p2 is not None and str(p1).strip() and str(p2).strip():
+        if str(p1).strip() != str(p2).strip():
+            return False
+    return True
+
+
 def reconcile_game_stat_revisions(
     records: Sequence[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """Resolve supersession chains across PLAYER_GAME_STATS records with LOUD_REVISION output.
 
-    Never silently overwrites prior records: superseded records are preserved in
-    `superseded_records` and every supersession link produces a `LOUD_REVISION` summary.
+    Fail-closed invariants:
+    - Target `supersedes_record_id` must exist in the record set.
+    - Revision must bind to the exact same player identity, game_id, and season.
+    - Cyclic and forked revision chains are rejected with GameStatsValidationError.
+    - Never silently overwrites prior records: superseded records are preserved in
+      `superseded_records` and every valid supersession link produces a `LOUD_REVISION` summary.
     """
     by_id: Dict[str, Dict[str, Any]] = {}
     for rec in records or ():
@@ -286,6 +317,8 @@ def reconcile_game_stat_revisions(
         by_id[rid] = dict(rec)
 
     superseded_ids: set[str] = set()
+    superseded_by: Dict[str, str] = {}
+    supersedes_map: Dict[str, str] = {}
     revision_summaries: List[Dict[str, Any]] = []
 
     for rid in sorted(by_id):
@@ -293,6 +326,31 @@ def reconcile_game_stat_revisions(
         prior_id = rec.get("supersedes_record_id")
         if isinstance(prior_id, str) and prior_id.strip():
             prior_clean = prior_id.strip()
+            if prior_clean == rid:
+                raise GameStatsValidationError(f"REVISION_CYCLE_DETECTED:{rid}")
+            if prior_clean not in by_id:
+                raise GameStatsValidationError(
+                    f"SUPERSEDED_RECORD_NOT_FOUND:{rid}->{prior_clean}"
+                )
+            prior_rec = by_id[prior_clean]
+            if not _same_player_identity(rec, prior_rec):
+                raise GameStatsValidationError(
+                    f"CROSS_PLAYER_REVISION_REJECTED:{rid}->{prior_clean}"
+                )
+            if str(rec["game_id"]).strip() != str(prior_rec["game_id"]).strip():
+                raise GameStatsValidationError(
+                    f"CROSS_GAME_REVISION_REJECTED:{rid}->{prior_clean}"
+                )
+            if str(rec["season"]).strip() != str(prior_rec["season"]).strip():
+                raise GameStatsValidationError(
+                    f"CROSS_SEASON_REVISION_REJECTED:{rid}->{prior_clean}"
+                )
+            if prior_clean in superseded_by:
+                raise GameStatsValidationError(
+                    f"FORKED_REVISION_CHAIN:{prior_clean}:{superseded_by[prior_clean]},{rid}"
+                )
+            superseded_by[prior_clean] = rid
+            supersedes_map[rid] = prior_clean
             superseded_ids.add(prior_clean)
             reason = rec.get("revision_reason") or "OFFICIAL_POST_GAME_REVISION"
             revision_summaries.append({
@@ -308,6 +366,18 @@ def reconcile_game_stat_revisions(
                     f"{rid} supersedes {prior_clean} ({reason})"
                 ),
             })
+
+    # Detect multi-hop cycles (e.g. A -> B -> A)
+    for start_rid in sorted(supersedes_map):
+        seen: set[str] = {start_rid}
+        curr = supersedes_map[start_rid]
+        while curr in supersedes_map:
+            if curr in seen:
+                raise GameStatsValidationError(f"REVISION_CYCLE_DETECTED:{start_rid}")
+            seen.add(curr)
+            curr = supersedes_map[curr]
+        if curr in seen:
+            raise GameStatsValidationError(f"REVISION_CYCLE_DETECTED:{start_rid}")
 
     active_records: List[Dict[str, Any]] = []
     superseded_records: List[Dict[str, Any]] = []
