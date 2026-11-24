@@ -7,7 +7,7 @@ sanitization before uploading local instance snapshots.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
@@ -200,8 +200,8 @@ class R2Config:
 def _safe_key(raw: str) -> str:
     """Deterministic R2 key segment shared with the Cloudflare Worker gateway.
 
-    Contract:
-    - Strip whitespace and lowercase.
+    Contract (exact parity with JS ``replace(/^[\\s\\u001c-\\u001f\\u0085]+|[\\s\\u001c-\\u001f\\u0085]+$/g, "").toLowerCase()``):
+    - Strip leading/trailing Unicode whitespace (including ``\\u001c-\\u001f`` and ``\\u0085``) and lowercase.
     - If matching ``^[a-z0-9._-]+$``, return as-is.
     - Otherwise return ``k_<sha256(utf8)[:24]>``.
     """
@@ -216,6 +216,35 @@ def _safe_key(raw: str) -> str:
 
 safe_key = _safe_key
 _safe_key_segment = _safe_key
+
+
+def _parse_iso_utc(raw: Any) -> Optional[datetime]:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _is_lock_expired(
+    lock_doc: Mapping[str, Any],
+    now: datetime,
+    default_ttl_seconds: float,
+) -> bool:
+    expires_dt = _parse_iso_utc(lock_doc.get("expires_at_utc"))
+    if expires_dt is not None:
+        return now >= expires_dt
+    created_dt = _parse_iso_utc(lock_doc.get("created_at_utc"))
+    if created_dt is not None:
+        return now >= (created_dt + timedelta(seconds=float(default_ttl_seconds)))
+    return False
 
 
 def _safe_season_segment(season: str) -> str:
@@ -332,17 +361,17 @@ class R2CloudStateStore:
             "etag": lower_resp.get("etag"),
         }
 
-    def get_bytes(
+    def _get_bytes_with_etag(
         self,
         key: str,
         *,
         expected_sha256: Optional[str] = None,
-    ) -> Optional[bytes]:
+    ) -> Tuple[Optional[bytes], Optional[str]]:
         full_key = self._full_key(key)
         url = self._object_url(full_key)
         status, resp_headers, body = self._request("GET", url)
         if status == 404:
-            return None
+            return None, None
         if status != 200:
             raise RuntimeError(f"R2_GET_FAILED:{status}:{key}")
 
@@ -362,17 +391,43 @@ class R2CloudStateStore:
                 )
             if expected_sha256.strip().lower() != actual_sha:
                 raise CloudStateIntegrityError(f"R2_OBJECT_SHA256_MISMATCH:{key}")
+        raw_etag = lower_resp.get("etag")
+        etag = raw_etag.strip() if isinstance(raw_etag, str) and raw_etag.strip() else None
+        return body, etag
+
+    def _get_json_with_etag(self, key: str) -> Tuple[Optional[Any], Optional[str]]:
+        raw, etag = self._get_bytes_with_etag(key)
+        if raw is None:
+            return None, None
+        return json.loads(raw.decode("utf-8")), etag
+
+    def get_bytes(
+        self,
+        key: str,
+        *,
+        expected_sha256: Optional[str] = None,
+    ) -> Optional[bytes]:
+        body, _ = self._get_bytes_with_etag(key, expected_sha256=expected_sha256)
         return body
 
-    def delete_key(self, key: str) -> bool:
+    def _delete_key_conditional(
+        self,
+        key: str,
+        *,
+        if_match: Optional[str] = None,
+    ) -> bool:
         full_key = self._full_key(key)
         url = self._object_url(full_key)
-        status, _, _ = self._request("DELETE", url)
+        headers = {"If-Match": if_match} if if_match else None
+        status, _, _ = self._request("DELETE", url, headers=headers)
         if status in (200, 204):
             return True
-        if status == 404:
+        if status in (404, 412):
             return False
         raise RuntimeError(f"R2_DELETE_FAILED:{status}:{key}")
+
+    def delete_key(self, key: str) -> bool:
+        return self._delete_key_conditional(key)
 
     def list_keys(self, prefix: str = "") -> List[str]:
         rel_prefix = str(prefix or "").lstrip("/")
@@ -542,6 +597,34 @@ class R2CloudStateStore:
                 _PROCESS_LOCKS[scope] = lock_obj
             return lock_obj
 
+    def _put_lock_conditional(
+        self,
+        lock_key: str,
+        lock_doc: Mapping[str, Any],
+        *,
+        if_none_match: Optional[str] = None,
+        if_match: Optional[str] = None,
+    ) -> int:
+        payload = json.dumps(
+            dict(lock_doc),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        sha256_hex = hashlib.sha256(payload).hexdigest()
+        full_key = self._full_key(lock_key)
+        url = self._object_url(full_key)
+        headers: Dict[str, str] = {
+            "Content-Type": "application/json; charset=utf-8",
+            "x-amz-meta-sha256": sha256_hex,
+        }
+        if if_none_match is not None:
+            headers["If-None-Match"] = if_none_match
+        if if_match is not None:
+            headers["If-Match"] = if_match
+        status, _, _ = self._request("PUT", url, headers=headers, data=payload)
+        return status
+
     def acquire_active_job_lock(
         self,
         season: str,
@@ -550,54 +633,85 @@ class R2CloudStateStore:
         job_id: str,
         owner_id: str,
         extra: Optional[Mapping[str, Any]] = None,
+        lock_ttl_seconds: float = 300.0,
+        now_utc: Optional[datetime] = None,
     ) -> Tuple[bool, Dict[str, Any]]:
-        """Atomically acquire an active job lock using a local mutex + R2 If-None-Match: *."""
+        """Atomically acquire an active job lock with lease TTL and crash takeover."""
+        ttl = float(lock_ttl_seconds)
+        if ttl <= 0:
+            raise ValueError("R2_LOCK_TTL_MUST_BE_POSITIVE")
+        now = now_utc if now_utc is not None else datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        else:
+            now = now.astimezone(timezone.utc)
+
+        lock_doc: Dict[str, Any] = dict(extra) if isinstance(extra, Mapping) else {}
+        lock_doc["job_id"] = str(job_id)
+        lock_doc["owner_id"] = str(owner_id)
+        lock_doc["person"] = str(person_key)
+        lock_doc["season"] = str(season)
+        lock_doc["status"] = str(lock_doc.get("status") or "RUNNING")
+        created_str = lock_doc.get("created_at_utc") or now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        lock_doc["created_at_utc"] = created_str
+        created_dt = _parse_iso_utc(created_str) or now
+        lock_doc["expires_at_utc"] = (created_dt + timedelta(seconds=ttl)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
         lock_key = self._lock_key(person_key, season)
         with self._local_lock_for(lock_key):
-            existing = self.get_json(lock_key)
+            existing, existing_etag = self._get_json_with_etag(lock_key)
             if isinstance(existing, dict):
                 existing_status = str(existing.get("status") or "").strip().upper()
-                if existing_status in _ACTIVE_LOCK_STATUSES:
+                if existing_status in _ACTIVE_LOCK_STATUSES and not _is_lock_expired(
+                    existing, now, ttl
+                ):
                     return False, existing
-                # Clear stale/terminal lock before conditional create
+                # Expired or terminal lock: atomically recover via If-Match or delete+create
+                if existing_etag:
+                    status = self._put_lock_conditional(
+                        lock_key, lock_doc, if_match=existing_etag
+                    )
+                    if status in (200, 201, 204):
+                        return True, lock_doc
+                    if status == 412:
+                        winner, _ = self._get_json_with_etag(lock_key)
+                        return False, winner if isinstance(winner, dict) else {}
+                    raise RuntimeError(f"R2_LOCK_PUT_FAILED:{status}:{lock_key}")
                 self.delete_key(lock_key)
 
-            lock_doc: Dict[str, Any] = dict(extra) if isinstance(extra, Mapping) else {}
-            lock_doc["job_id"] = str(job_id)
-            lock_doc["owner_id"] = str(owner_id)
-            lock_doc["person"] = str(person_key)
-            lock_doc["season"] = str(season)
-            lock_doc["status"] = str(lock_doc.get("status") or "RUNNING")
-            if not lock_doc.get("created_at_utc"):
-                lock_doc["created_at_utc"] = datetime.now(timezone.utc).strftime(
-                    "%Y-%m-%dT%H:%M:%SZ"
-                )
-
-            payload = json.dumps(
-                lock_doc,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-            sha256_hex = hashlib.sha256(payload).hexdigest()
-            full_key = self._full_key(lock_key)
-            url = self._object_url(full_key)
-            status, _, _ = self._request(
-                "PUT",
-                url,
-                headers={
-                    "Content-Type": "application/json; charset=utf-8",
-                    "x-amz-meta-sha256": sha256_hex,
-                    "If-None-Match": "*",
-                },
-                data=payload,
+            status = self._put_lock_conditional(
+                lock_key, lock_doc, if_none_match="*"
             )
+            if status in (200, 201, 204):
+                return True, lock_doc
             if status == 412:
-                winner = self.get_json(lock_key)
-                return False, winner if isinstance(winner, dict) else {}
-            if status not in (200, 201, 204):
-                raise RuntimeError(f"R2_LOCK_PUT_FAILED:{status}:{lock_key}")
-            return True, lock_doc
+                winner, winner_etag = self._get_json_with_etag(lock_key)
+                if isinstance(winner, dict):
+                    winner_status = str(winner.get("status") or "").strip().upper()
+                    if winner_status in _ACTIVE_LOCK_STATUSES and not _is_lock_expired(
+                        winner, now, ttl
+                    ):
+                        return False, winner
+                    # Winner lock is already expired or terminal -> attempt atomic takeover
+                    if winner_etag:
+                        takeover_status = self._put_lock_conditional(
+                            lock_key, lock_doc, if_match=winner_etag
+                        )
+                    else:
+                        self.delete_key(lock_key)
+                        takeover_status = self._put_lock_conditional(
+                            lock_key, lock_doc, if_none_match="*"
+                        )
+                    if takeover_status in (200, 201, 204):
+                        return True, lock_doc
+                    if takeover_status == 412:
+                        latest, _ = self._get_json_with_etag(lock_key)
+                        return False, latest if isinstance(latest, dict) else {}
+                    raise RuntimeError(f"R2_LOCK_PUT_FAILED:{takeover_status}:{lock_key}")
+                return False, {}
+            raise RuntimeError(f"R2_LOCK_PUT_FAILED:{status}:{lock_key}")
 
     def release_active_job_lock(
         self,
@@ -607,30 +721,45 @@ class R2CloudStateStore:
         owner_id: Optional[str] = None,
         job_id: Optional[str] = None,
     ) -> bool:
-        """Conditionally release an active job lock only if owner_id/job_id match."""
+        """Conditionally release an active job lock using owner_id/job_id + If-Match ETag."""
+        if not isinstance(owner_id, str) or not owner_id.strip():
+            return False
         lock_key = self._lock_key(person_key, season)
         with self._local_lock_for(lock_key):
-            current = self.get_json(lock_key)
+            current, etag = self._get_json_with_etag(lock_key)
             if not isinstance(current, dict):
                 return False
-            if owner_id is not None and current.get("owner_id") != owner_id:
+            current_owner = current.get("owner_id")
+            if not isinstance(current_owner, str) or current_owner != owner_id:
                 return False
-            if job_id is not None and current.get("job_id") != job_id:
-                return False
-            return self.delete_key(lock_key)
+            if job_id is not None:
+                current_job = current.get("job_id")
+                if not isinstance(current_job, str) or current_job != job_id:
+                    return False
+            return self._delete_key_conditional(lock_key, if_match=etag)
 
     def find_active_job_for_person(
         self,
         person_key: str,
         season: str,
+        *,
+        now_utc: Optional[datetime] = None,
+        default_ttl_seconds: float = 300.0,
     ) -> Optional[Dict[str, Any]]:
         lock_doc = self.get_json(self._lock_key(person_key, season))
         if not isinstance(lock_doc, dict):
             return None
         status = str(lock_doc.get("status") or "").strip().upper()
-        if status in _ACTIVE_LOCK_STATUSES:
-            return lock_doc
-        return None
+        if status not in _ACTIVE_LOCK_STATUSES:
+            return None
+        if now_utc is not None:
+            now = now_utc.replace(tzinfo=timezone.utc) if now_utc.tzinfo is None else now_utc.astimezone(timezone.utc)
+            if _is_lock_expired(lock_doc, now, default_ttl_seconds):
+                return None
+        elif lock_doc.get("expires_at_utc"):
+            if _is_lock_expired(lock_doc, datetime.now(timezone.utc), default_ttl_seconds):
+                return None
+        return lock_doc
 
     def set_active_job_lock(
         self,

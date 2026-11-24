@@ -16,10 +16,13 @@
 const DEFAULT_SEASON = "2026-2027";
 const DEFAULT_FRESHNESS_TTL_HOURS = 24;
 const DEFAULT_STALE_AFTER_HOURS = 48;
+const DEFAULT_LOCK_TTL_SECONDS = 300;
 const WAIT_TIMEOUT_MS = 28000;
 const POLL_INTERVAL_MS = 2000;
 const AUTH_SCHEME = "bearer";
 const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+const UNICODE_TRIM_RE = /^[\s\u001c-\u001f\u0085]+|[\s\u001c-\u001f\u0085]+$/g;
+const ACTIVE_LOCK_STATUSES = new Set(["RUNNING", "PENDING", "ACQUIRING_IN_CLOUD"]);
 const VALID_COVERAGE_STATUSES = new Set(["COMPLETE", "PARTIAL", "STALE", "UNKNOWN"]);
 const LEAGUE_COVERAGE_DOMAINS = [
   ["domestic_registration", "国内球员注册"],
@@ -82,12 +85,12 @@ export async function sha256Hex(input) {
 
 /**
  * Key parity with Python `cba_kb.cloud_state._safe_key_segment`:
- * - trim + lowercase
+ * - trim Unicode whitespace including U+0085 and U+001C..U+001F + lowercase
  * - if /^[a-z0-9._-]+$/ return normalized ASCII directly
  * - otherwise return "k_" + sha256(utf8(norm)).slice(0, 24)
  */
 export async function safeKey(value) {
-  const norm = String(value || "").trim().toLowerCase();
+  const norm = String(value ?? "").replace(UNICODE_TRIM_RE, "").toLowerCase();
   if (!norm) {
     throw new Error("R2_KEY_SEGMENT_EMPTY");
   }
@@ -109,7 +112,7 @@ function extractDeclaredSha256(obj) {
   return "";
 }
 
-export async function readR2Json(bucket, key) {
+async function readR2ObjectWithMeta(bucket, key) {
   if (!bucket) return null;
   const obj = await bucket.get(key);
   if (!obj) return null;
@@ -124,18 +127,25 @@ export async function readR2Json(bucket, key) {
   if (actualSha !== declaredSha) {
     throw new Error(`R2_OBJECT_SHA256_MISMATCH:digest_mismatch:${key}`);
   }
-  return JSON.parse(new TextDecoder("utf-8").decode(rawBytes));
+  const data = JSON.parse(new TextDecoder("utf-8").decode(rawBytes));
+  return { data, etag: obj.etag || obj.httpEtag || null };
 }
 
-export async function writeR2Json(bucket, key, data) {
+export async function readR2Json(bucket, key) {
+  const loaded = await readR2ObjectWithMeta(bucket, key);
+  return loaded ? loaded.data : null;
+}
+
+export async function writeR2Json(bucket, key, data, extraOpts = {}) {
   if (!bucket) return null;
   const encoded = new TextEncoder().encode(JSON.stringify(data));
   const sha256 = await sha256Hex(encoded);
-  await bucket.put(key, encoded, {
+  const putResult = await bucket.put(key, encoded, {
+    ...extraOpts,
     httpMetadata: { contentType: "application/json; charset=utf-8" },
     customMetadata: { sha256 },
   });
-  return { key, sha256 };
+  return { key, sha256, putResult };
 }
 
 export async function verifyCardRecord(card) {
@@ -156,6 +166,110 @@ export async function verifyCardRecord(card) {
     throw new Error("R2_OBJECT_SHA256_MISMATCH:card_sha256");
   }
   return { markdown, card_sha256: actual };
+}
+
+async function verifyAndAttachJobCard(env, job, fallbackSeasonKey = null, fallbackPersonKey = null) {
+  if (!job || typeof job !== "object") return job;
+  // Unconditional SHA-256 verification whenever card markdown is embedded in jobs/<id>.json
+  if (typeof job.card_markdown === "string" || typeof job.markdown === "string") {
+    const verified = await verifyCardRecord(job);
+    job.card_markdown = verified.markdown;
+    job.card_sha256 = verified.card_sha256;
+    return job;
+  }
+  if (job.status === "COMPLETED") {
+    const seasonKey = fallbackSeasonKey || (job.season ? await safeKey(job.season) : null);
+    const personKey = fallbackPersonKey || (job.person ? await safeKey(job.person) : null);
+    if (seasonKey && personKey) {
+      const card = await readR2Json(env.CBA_KB_R2, `cards/${seasonKey}/${personKey}.json`);
+      if (card) {
+        const verified = await verifyCardRecord(card);
+        job.card_markdown = verified.markdown;
+        job.card_sha256 = verified.card_sha256;
+      }
+    }
+  }
+  return job;
+}
+
+export async function acquireLockAtomic(
+  bucket,
+  lockKey,
+  { person, season, nowMs = Date.now(), lockTtlSeconds = DEFAULT_LOCK_TTL_SECONDS },
+) {
+  const jobId = `job_${nowMs}_${Math.random().toString(36).slice(2, 10)}`;
+  const ownerId = crypto.randomUUID();
+  const createdAt = new Date(nowMs).toISOString();
+  const expiresAt = new Date(nowMs + Number(lockTtlSeconds) * 1000).toISOString();
+  const lockDoc = {
+    job_id: jobId,
+    owner_id: ownerId,
+    status: "RUNNING",
+    person,
+    season,
+    created_at_utc: createdAt,
+    expires_at_utc: expiresAt,
+  };
+
+  if (!bucket) {
+    return { acquired: true, jobDoc: lockDoc };
+  }
+
+  const encoded = new TextEncoder().encode(JSON.stringify(lockDoc));
+  const lockSha = await sha256Hex(encoded);
+  const createRes = await bucket.put(lockKey, encoded, {
+    onlyIf: { etagDoesNotMatch: "*" },
+    httpMetadata: { contentType: "application/json; charset=utf-8" },
+    customMetadata: { sha256: lockSha },
+  });
+  if (createRes !== null && createRes !== undefined) {
+    return { acquired: true, jobDoc: lockDoc };
+  }
+
+  // Lock already exists: inspect whether it is active and unexpired
+  const existing = await readR2ObjectWithMeta(bucket, lockKey);
+  if (existing && existing.data) {
+    const exDoc = existing.data;
+    const status = String(exDoc.status || "").trim().toUpperCase();
+    const expMs = exDoc.expires_at_utc ? Date.parse(exDoc.expires_at_utc) : NaN;
+    const isExpired = Number.isFinite(expMs) && nowMs >= expMs;
+    if (ACTIVE_LOCK_STATUSES.has(status) && !isExpired && exDoc.job_id) {
+      return { acquired: false, jobDoc: exDoc };
+    }
+
+    // Expired or non-active lock: atomic takeover via etagMatches
+    const takeoverOpts = {
+      httpMetadata: { contentType: "application/json; charset=utf-8" },
+      customMetadata: { sha256: lockSha },
+    };
+    if (existing.etag) {
+      takeoverOpts.onlyIf = { etagMatches: existing.etag };
+    } else {
+      takeoverOpts.onlyIf = { etagDoesNotMatch: "*" };
+    }
+    const takeoverRes = await bucket.put(lockKey, encoded, takeoverOpts);
+    if (takeoverRes !== null && takeoverRes !== undefined) {
+      return { acquired: true, jobDoc: lockDoc };
+    }
+
+    // Another worker won the takeover race: re-read and deduplicate
+    const winner = await readR2ObjectWithMeta(bucket, lockKey);
+    if (winner && winner.data && winner.data.job_id) {
+      return { acquired: false, jobDoc: winner.data };
+    }
+  }
+
+  // Fallback retry if lock vanished between create and read
+  const retryRes = await bucket.put(lockKey, encoded, {
+    onlyIf: { etagDoesNotMatch: "*" },
+    httpMetadata: { contentType: "application/json; charset=utf-8" },
+    customMetadata: { sha256: lockSha },
+  });
+  if (retryRes !== null && retryRes !== undefined) {
+    return { acquired: true, jobDoc: lockDoc };
+  }
+  const finalLock = await readR2Json(bucket, lockKey);
+  return { acquired: false, jobDoc: finalLock || lockDoc };
 }
 
 export function evaluateLeagueCoverage(
@@ -366,16 +480,7 @@ async function handleJobStatus(env, jobId) {
   if (!job) {
     return jsonResponse({ status: "NOT_FOUND", job_id: jobId }, 404);
   }
-  if (job.status === "COMPLETED" && !job.card_markdown && job.person && job.season) {
-    const seasonKey = await safeKey(job.season);
-    const personKey = await safeKey(job.person);
-    const card = await readR2Json(env.CBA_KB_R2, `cards/${seasonKey}/${personKey}.json`);
-    if (card) {
-      const verified = await verifyCardRecord(card);
-      job.card_markdown = verified.markdown;
-      job.card_sha256 = verified.card_sha256;
-    }
-  }
+  await verifyAndAttachJobCard(env, job);
   return jsonResponse(job, 200);
 }
 
@@ -417,40 +522,33 @@ async function handlePersonQuery(request, env) {
     }
   }
 
-  // Concurrency deduplication lock
+  // Atomic concurrency deduplication lock via R2 conditional put
   const lockKey = `locks/${seasonKey}/${personKey}.json`;
-  const activeLock = await readR2Json(env.CBA_KB_R2, lockKey);
-  let jobId = activeLock && activeLock.status === "RUNNING" ? activeLock.job_id : null;
-  const deduplicated = Boolean(jobId);
+  const lockResult = await acquireLockAtomic(env.CBA_KB_R2, lockKey, { person, season });
+  const jobId = lockResult.jobDoc.job_id;
+  const ownerId = lockResult.jobDoc.owner_id || "";
+  const deduplicated = !lockResult.acquired;
 
-  if (!jobId) {
-    jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-    const jobDoc = {
-      job_id: jobId,
-      status: "RUNNING",
+  if (lockResult.acquired) {
+    await writeR2Json(env.CBA_KB_R2, `jobs/${jobId}.json`, lockResult.jobDoc);
+    await triggerCollectorRunner(env, {
       person,
       season,
-      created_at_utc: new Date().toISOString(),
-    };
-    await writeR2Json(env.CBA_KB_R2, `jobs/${jobId}.json`, jobDoc);
-    await writeR2Json(env.CBA_KB_R2, lockKey, jobDoc);
-    await triggerCollectorRunner(env, { person, season, job_id: jobId, force_refresh: forceRefresh });
+      job_id: jobId,
+      owner_id: ownerId,
+      force_refresh: forceRefresh,
+    });
   }
 
   // Bounded poll up to 28s to avoid 45s client timeout
-  const deadline = Date.now() + WAIT_TIMEOUT_MS;
+  const waitTimeoutMs = Number((env && env.WAIT_TIMEOUT_MS) ?? WAIT_TIMEOUT_MS);
+  const pollIntervalMs = Number((env && env.POLL_INTERVAL_MS) ?? POLL_INTERVAL_MS);
+  const deadline = Date.now() + Math.max(0, waitTimeoutMs);
   while (Date.now() < deadline) {
-    await sleep(Math.min(POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
+    await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
     const polled = await readR2Json(env.CBA_KB_R2, `jobs/${jobId}.json`);
     if (polled && polled.status && polled.status !== "RUNNING") {
-      if (polled.status === "COMPLETED" && !polled.card_markdown) {
-        const card = await readR2Json(env.CBA_KB_R2, `cards/${seasonKey}/${personKey}.json`);
-        if (card) {
-          const verified = await verifyCardRecord(card);
-          polled.card_markdown = verified.markdown;
-          polled.card_sha256 = verified.card_sha256;
-        }
-      }
+      await verifyAndAttachJobCard(env, polled, seasonKey, personKey);
       return jsonResponse(polled, 200);
     }
   }

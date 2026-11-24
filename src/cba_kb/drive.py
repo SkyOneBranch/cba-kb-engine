@@ -603,7 +603,9 @@ def _assert_folder_not_in_protected_zone(
     protected_ids: set[str],
 ) -> None:
     if not protected_ids:
-        return
+        raise ValueError(
+            'SNOWBALL_PROTECTED_ZONE_UNCONFIGURED: protected zone folder IDs required before Drive write'
+        )
     if target_folder_id in protected_ids:
         raise ValueError('SNOWBALL_FOLDER_IN_PROTECTED_ZONE')
 

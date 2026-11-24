@@ -421,11 +421,13 @@ def main():
     q.add_argument('--person',required=True)
     q.add_argument('--season',default='2026-2027')
     q.add_argument('--job-id',default=None)
+    q.add_argument('--owner-id',default=None)
     q.add_argument('--instance-root',type=Path,default=None,dest='snowball_instance_root')
     q.add_argument('--collector-cmd',default=None)
     q.add_argument('--force-refresh',action='store_true',default=False)
     q.add_argument('--freshness-ttl-hours',type=float,default=24.0)
     q.add_argument('--snowball-folder-id',default=None)
+    q.add_argument('--forbidden-folder-ids',default=None)
     q.add_argument('--format',choices=('json','markdown'),default='json')
     q=sub.add_parser('cloud-state-push')
     q.add_argument('--source-dir',type=Path,required=True)
@@ -1893,11 +1895,16 @@ def main():
                 instance=instance,
             )
             snowball_folder_id = a.snowball_folder_id or os.environ.get('CBA_KB_DRIVE_SNOWBALL_FOLDER_ID')
+            raw_forbidden = a.forbidden_folder_ids or os.environ.get('CBA_KB_DRIVE_PROTECTED_FOLDER_IDS') or ''
+            forbidden_ids = [item.strip() for item in raw_forbidden.split(',') if item.strip()]
             drive_upserter = None
             production_policy = None
             if snowball_folder_id:
                 if instance is not None:
-                    production_policy = instance.read_json('production.json')
+                    try:
+                        production_policy = instance.read_json('production.json')
+                    except FileNotFoundError:
+                        production_policy = None
                     drive = Drive(root, instance)
                     drive_upserter = lambda **kw: upsert_snowball_card_to_drive(drive, **kw)
                 elif os.environ.get('CBA_KB_DRIVE_TOKEN_JSON'):
@@ -1908,15 +1915,18 @@ def main():
                 acquisition_backend=backend,
                 drive_upserter=drive_upserter,
                 snowball_folder_id=snowball_folder_id,
+                forbidden_folder_ids=forbidden_ids,
                 production_policy=production_policy,
             )
             explicit_job_id = a.job_id.strip() if isinstance(a.job_id, str) and a.job_id.strip() else None
+            explicit_owner_id = a.owner_id.strip() if isinstance(a.owner_id, str) and a.owner_id.strip() else None
             result = orch.get_or_acquire_person(
                 a.person,
                 season=a.season,
                 force_refresh=a.force_refresh,
                 freshness_ttl_hours=a.freshness_ttl_hours,
                 job_id=explicit_job_id,
+                owner_id=explicit_owner_id,
             )
             if a.format == 'markdown':
                 stage(a.command, 'done')

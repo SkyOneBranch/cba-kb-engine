@@ -1,12 +1,12 @@
-"""Q2 Round 1 remediation regression & negative tests for REQ-230 (cba-kb-engine v2.3.0).
+"""Q2 Round 1 & Round 2 remediation regression & adversarial tests for REQ-230 (cba-kb-engine v2.3.0).
 
-Covers all 6 independent Q2 blockers without modifying Commit 1's frozen acceptance test file:
+Covers all Round 1 and Round 2 Q2 blockers without modifying Commit 1's frozen acceptance test file:
 1. P0-2-R2-MISSING-METADATA-SHA: R2CloudStateStore.get_bytes fails closed on missing/malformed x-amz-meta-sha256
-2. P0-2-DRIVE-PROTECTED-ANCESTOR: upsert_snowball_card_to_drive rejects subfolder descendants of protected zones
-3. P0-3-NONATOMIC-DEDUP-LOCK: concurrent 2-thread barrier test verifies atomic single-job dedup & owner release
-4. P0-4-WORKER-R2-CONTRACT-DRIFT: JS/Python key parity on Chinese names, SHA-256 verification, 5-domain coverage
-5. P0-4-RUNNER-NONFUNCTIONAL: R2Config.from_env endpoint aliases, CLI backend wiring, and --job-id handoff
-6. P0-5-SYMLINK-PARENT-ESCAPE: prepare_v215 rejects symlinked on_demand_cards directory / manifest / card escape
+2. P0-2-DRIVE-PROTECTED-ANCESTOR & P0-2-NEW-R2-EMPTY-PROTECTION-SET-FAILOPEN: ancestor walk + empty protected set fail-closed
+3. P0-3-NONATOMIC-DEDUP-LOCK: real 2-process HTTP mock R2 race, lease expiry recovery, conditional If-Match delete, Worker conditional put
+4. P0-4-WORKER-R2-CONTRACT-DRIFT: JS/Python key parity (Chinese + Unicode \\u0085/\\u001c-\\u001f), SHA-256 verification (including embedded job.card_markdown), 5-domain coverage
+5. P0-4-RUNNER-NONFUNCTIONAL & P0-4-NEW-R2-RUNNER-LOCK-OWNER-MISMATCH: Worker->Runner --job-id + --owner-id handoff & lock release, real --collector-cmd execution for uncached player
+6. P0-5-SYMLINK-PARENT-ESCAPE: openat(O_DIRECTORY | O_NOFOLLOW) rejects symlinked directory/manifest/card and TOCTOU swap
 """
 from __future__ import annotations
 
@@ -18,7 +18,8 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
@@ -31,11 +32,16 @@ BASELINE_SHA_V230_1 = "3a7239361b2b81f763dce3477b3c3ad81f357b90"
 
 
 class _AtomicFakeR2Transport:
-    """Thread-safe in-memory R2 transport honoring conditional If-None-Match: *."""
+    """Thread-safe in-memory R2 transport honoring If-None-Match: * and If-Match: <etag>."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self.objects: Dict[str, Tuple[bytes, Dict[str, str]]] = {}
+        self.objects: Dict[str, Tuple[bytes, Dict[str, str], str]] = {}
+        self._etag_seq = 0
+
+    def _next_etag(self, data: bytes) -> str:
+        self._etag_seq += 1
+        return f'"{hashlib.md5(data).hexdigest()}-{self._etag_seq}"'
 
     def __call__(
         self,
@@ -55,13 +61,19 @@ class _AtomicFakeR2Transport:
             if method == "PUT":
                 if lower_headers.get("if-none-match") == "*" and key in self.objects:
                     return 412, {}, b"PreconditionFailed"
+                if_match = lower_headers.get("if-match")
+                if if_match is not None:
+                    cur = self.objects.get(key)
+                    if cur is None or cur[2].strip('"') != if_match.strip('"'):
+                        return 412, {}, b"PreconditionFailed"
                 meta = {
                     k: v
                     for k, v in lower_headers.items()
                     if k.startswith("x-amz-meta-")
                 }
-                self.objects[key] = (bytes(data), meta)
-                return 200, {"ETag": hashlib.md5(data).hexdigest()}, b""
+                etag = self._next_etag(data)
+                self.objects[key] = (bytes(data), meta, etag)
+                return 200, {"ETag": etag}, b""
 
             if method == "GET" and qs.get("list-type") == ["2"]:
                 prefix = qs.get("prefix", [""])[0]
@@ -76,14 +88,62 @@ class _AtomicFakeR2Transport:
             if method == "GET":
                 if key not in self.objects:
                     return 404, {}, b"NotFound"
-                payload, meta = self.objects[key]
-                return 200, dict(meta), payload
+                payload, meta, etag = self.objects[key]
+                resp_hdrs = dict(meta)
+                resp_hdrs["ETag"] = etag
+                return 200, resp_hdrs, payload
 
             if method == "DELETE":
+                if_match = lower_headers.get("if-match")
+                if if_match is not None:
+                    cur = self.objects.get(key)
+                    if cur is None or cur[2].strip('"') != if_match.strip('"'):
+                        return 412, {}, b"PreconditionFailed"
                 self.objects.pop(key, None)
                 return 204, {}, b""
 
         return 405, {}, b"MethodNotAllowed"
+
+
+def _start_local_r2_http_server(transport: _AtomicFakeR2Transport) -> Tuple[ThreadingHTTPServer, str]:
+    """Start a real local HTTP mock R2 server backed by _AtomicFakeR2Transport."""
+
+    class _Handler(BaseHTTPRequestHandler):
+        def _dispatch(self) -> None:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            body = self.rfile.read(length) if length > 0 else b""
+            hdrs = {k: v for k, v in self.headers.items()}
+            status, resp_hdrs, payload = transport(
+                self.command,
+                f"http://127.0.0.1{self.path}",
+                headers=hdrs,
+                data=body,
+            )
+            self.send_response(status)
+            for k, v in resp_hdrs.items():
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            if payload:
+                self.wfile.write(payload)
+
+        def do_GET(self) -> None:  # noqa: N802
+            self._dispatch()
+
+        def do_PUT(self) -> None:  # noqa: N802
+            self._dispatch()
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            self._dispatch()
+
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, f"http://127.0.0.1:{port}"
 
 
 # ---------------------------------------------------------------------------
@@ -100,31 +160,33 @@ def test_r2_missing_or_malformed_sha256_metadata_fails_closed():
         transport=transport,
     )
 
-    # Case A: Object stored without x-amz-meta-sha256 must fail closed even if expected_sha256=None
-    transport.objects["jobs/no_meta.json"] = (b'{"status":"RUNNING"}', {})
+    transport.objects["jobs/no_meta.json"] = (b'{"status":"RUNNING"}', {}, '"e1"')
     with pytest.raises(ValueError, match="R2_OBJECT_SHA256_MISMATCH"):
         store.get_bytes("jobs/no_meta.json")
 
-    # Case B: Malformed (non-64-hex) x-amz-meta-sha256 must fail closed
     transport.objects["jobs/bad_meta.json"] = (
         b'{"status":"RUNNING"}',
         {"x-amz-meta-sha256": "not-a-valid-sha256"},
+        '"e2"',
     )
     with pytest.raises(ValueError, match="R2_OBJECT_SHA256_MISMATCH"):
         store.get_bytes("jobs/bad_meta.json")
 
-    # Case C: Valid put_bytes sets x-amz-meta-sha256 and reads back cleanly
     payload = b'{"ok":true}'
     store.put_bytes("jobs/good_meta.json", payload)
     assert store.get_bytes("jobs/good_meta.json") == payload
 
 
 # ---------------------------------------------------------------------------
-# 2. P0-2-DRIVE-PROTECTED-ANCESTOR
+# 2. P0-2-DRIVE-PROTECTED-ANCESTOR & P0-2-NEW-R2-EMPTY-PROTECTION-SET-FAILOPEN
 # ---------------------------------------------------------------------------
 
 
-def test_drive_snowball_rejects_subfolder_descendant_of_protected_zone():
+def test_drive_snowball_rejects_subfolder_descendant_and_empty_protected_zone_fails_closed(
+    tmp_path: Path, monkeypatch
+):
+    from cba_kb import cloud_state
+    from cba_kb.cli import main as cli_main
     from cba_kb.drive import upsert_snowball_card_to_drive
 
     class _HierarchyFakeDrive:
@@ -168,7 +230,19 @@ def test_drive_snowball_rejects_subfolder_descendant_of_protected_zone():
     card_bytes = b"# Synthetic Card\n\nend_marker: true\n"
     filename = "研究卡_测试球员甲_SYN_P001_2026-2027_CURRENT.md"
 
-    # Deeply nested child inside zones["current"] must be rejected
+    # A. Empty protected set (neither production_policy nor forbidden_folder_ids) -> FAIL-CLOSED
+    with pytest.raises(ValueError, match="SNOWBALL_PROTECTED_ZONE_UNCONFIGURED"):
+        upsert_snowball_card_to_drive(
+            fake_drive,
+            folder_id="drv_safe_snowball_25",
+            filename=filename,
+            content_bytes=card_bytes,
+            forbidden_folder_ids=(),
+            production_policy=None,
+        )
+    assert fake_drive.create_calls == 0
+
+    # B. Deeply nested child inside zones["current"] -> rejected
     with pytest.raises(ValueError, match="SNOWBALL_FOLDER_IN_PROTECTED_ZONE"):
         upsert_snowball_card_to_drive(
             fake_drive,
@@ -179,7 +253,7 @@ def test_drive_snowball_rejects_subfolder_descendant_of_protected_zone():
         )
     assert fake_drive.create_calls == 0
 
-    # Sibling folder under root outside protected zones succeeds
+    # C. Sibling folder under root outside protected zones succeeds
     res = upsert_snowball_card_to_drive(
         fake_drive,
         folder_id="drv_safe_snowball_25",
@@ -190,266 +264,392 @@ def test_drive_snowball_rejects_subfolder_descendant_of_protected_zone():
     assert res["action"] == "created"
     assert fake_drive.create_calls == 1
 
-
-# ---------------------------------------------------------------------------
-# 3. P0-3-NONATOMIC-DEDUP-LOCK (Real 2-thread Barrier Concurrency Test)
-# ---------------------------------------------------------------------------
-
-
-def test_orchestrator_concurrent_requests_atomic_dedup_single_job_and_owner_release():
-    from cba_kb.cloud_state import R2CloudStateStore, R2Config
-    from cba_kb.snowball_orchestrator import SnowballOrchestrator
-
-    now = datetime(2026, 11, 24, 13, 0, 0, tzinfo=timezone.utc)
+    # D. CLI headless Drive branch with CBA_KB_DRIVE_SNOWBALL_FOLDER_ID but NO protected folder IDs fails closed
     transport = _AtomicFakeR2Transport()
-    store = R2CloudStateStore(
-        R2Config("https://syn-r2.example.invalid", "cba-kb-private", "SYN_K", "SYN_S"),
+    fake_store = cloud_state.R2CloudStateStore(
+        cloud_state.R2Config("https://syn-r2.example.invalid", "cba-kb-private", "SYN_K", "SYN_S"),
         transport=transport,
     )
-
-    backend_calls: List[str] = []
-    backend_entered = threading.Event()
-    release_backend = threading.Event()
-
-    class _BlockingAsyncOrSyncBackend:
-        def acquire_person(
-            self,
-            person: str,
-            *,
-            season: str,
-            job_id: str,
-            force_refresh: bool = False,
-        ) -> Dict[str, Any]:
-            backend_calls.append(job_id)
-            backend_entered.set()
-            release_backend.wait(timeout=5.0)
-            md = f"# 人物研究卡｜{person}（SYN_C01）｜{season}｜CURRENT\n\nend_marker: true\n"
-            return {
-                "status": "ACQUIRED_AND_BUILT",
-                "person": {"player_name": person, "player_id": "SYN_C01"},
-                "filename": f"研究卡_{person}_SYN_C01_{season}_CURRENT.md",
-                "card_markdown": md,
-                "card_sha256": hashlib.sha256(md.encode("utf-8")).hexdigest(),
-                "observed_until": "2026-11-24T12:00:00Z",
-                "coverage_status": "COMPLETE",
-            }
-
-    orch = SnowballOrchestrator(
-        state_store=store,
-        acquisition_backend=_BlockingAsyncOrSyncBackend(),
-        now_fn=lambda: now,
+    inst_dir = tmp_path / "headless_no_policy_inst"
+    (inst_dir / "data").mkdir(parents=True)
+    (inst_dir / "config").mkdir(parents=True)
+    (inst_dir / "data" / "MASTER.csv").write_text(
+        "season,club,player_name,player_id,position\n"
+        "2026-2027,测试俱乐部甲,无保护区测试员,SYN_NOPROT01,G\n",
+        encoding="utf-8",
     )
-
-    barrier = threading.Barrier(2)
-    results: List[Optional[Dict[str, Any]]] = [None, None]
-    errors: List[BaseException] = []
-
-    def _worker(idx: int) -> None:
-        try:
-            barrier.wait(timeout=5.0)
-            results[idx] = orch.get_or_acquire_person("并发原子球员", season="2026-2027")
-        except BaseException as exc:  # pragma: no cover - diagnostic
-            errors.append(exc)
-
-    t1 = threading.Thread(target=_worker, args=(0,))
-    t2 = threading.Thread(target=_worker, args=(1,))
-    t1.start()
-    t2.start()
-
-    assert backend_entered.wait(timeout=5.0), "Winner thread never entered backend"
-    # Give loser thread a moment to hit the lock and return deduplicated ACQUIRING_IN_CLOUD
-    time.sleep(0.1)
-    release_backend.set()
-    t1.join(timeout=5.0)
-    t2.join(timeout=5.0)
-
-    assert not errors, f"Worker thread error: {errors}"
-    assert len(backend_calls) == 1, f"Expected exactly 1 backend call, got {backend_calls}"
-
-    statuses = {r["status"] for r in results if r is not None}
-    assert "ACQUIRED_AND_BUILT" in statuses
-    assert statuses <= {"ACQUIRED_AND_BUILT", "ACQUIRING_IN_CLOUD", "HIT_FRESH"}
-
-    # Verify owner-scoped lock release: non-owner cannot release an active lock
-    ok, lock_doc = store.acquire_active_job_lock(
-        "2026-2027",
-        "锁校验球员",
-        job_id="job_owner_a",
-        owner_id="owner_a",
+    monkeypatch.setattr(cloud_state, "R2CloudStateStore", lambda *a, **kw: fake_store)
+    monkeypatch.setattr(
+        cloud_state.R2Config,
+        "from_env",
+        classmethod(lambda cls, env=None: fake_store.config),
     )
-    assert ok is True
-    assert lock_doc["job_id"] == "job_owner_a"
-
-    # Second acquire returns (False, existing_lock) without overwriting
-    ok2, existing = store.acquire_active_job_lock(
-        "2026-2027",
-        "锁校验球员",
-        job_id="job_owner_b",
-        owner_id="owner_b",
+    monkeypatch.setenv("CBA_KB_DRIVE_SNOWBALL_FOLDER_ID", "drv_safe_snowball_25")
+    monkeypatch.delenv("CBA_KB_DRIVE_PROTECTED_FOLDER_IDS", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cba-kb",
+            "--instance-root",
+            str(inst_dir),
+            "snowball-query",
+            "--person",
+            "无保护区测试员",
+            "--season",
+            "2026-2027",
+        ],
     )
-    assert ok2 is False
-    assert existing["job_id"] == "job_owner_a"
-
-    # Wrong owner cannot release
-    assert store.release_active_job_lock("2026-2027", "锁校验球员", owner_id="owner_b", job_id="job_owner_b") is False
-    assert store.find_active_job_for_person("锁校验球员", "2026-2027") is not None
-
-    # Correct owner releases cleanly
-    assert store.release_active_job_lock("2026-2027", "锁校验球员", owner_id="owner_a", job_id="job_owner_a") is True
-    assert store.find_active_job_for_person("锁校验球员", "2026-2027") is None
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main()
+    assert exc_info.value.code == 1
 
 
 # ---------------------------------------------------------------------------
-# 4. P0-4-WORKER-R2-CONTRACT-DRIFT (JS/Python Key Parity, SHA-256, 5-Domain Coverage)
+# 3. P0-3-NONATOMIC-DEDUP-LOCK (Real 2-Process HTTP Race, Lease Recovery & Worker Conditional Put)
 # ---------------------------------------------------------------------------
 
 
-def test_worker_js_key_parity_sha256_check_and_five_domain_coverage():
+def test_r2_two_process_atomic_lock_race_lease_recovery_and_worker_conditional_put(tmp_path: Path):
+    from cba_kb.cloud_state import R2CloudStateStore, R2Config
+
+    transport = _AtomicFakeR2Transport()
+    server, base_url = _start_local_r2_http_server(transport)
+    try:
+        # Part A: Real 2-process OS subprocess race against live HTTP mock R2 server
+        ready_0 = tmp_path / "ready_0"
+        ready_1 = tmp_path / "ready_1"
+        go_file = tmp_path / "go"
+        out_0 = tmp_path / "out_0.json"
+        out_1 = tmp_path / "out_1.json"
+
+        child_code = r"""
+import hashlib, json, sys, time
+from pathlib import Path
+from datetime import datetime, timezone
+from cba_kb.cloud_state import R2CloudStateStore, R2Config
+from cba_kb.snowball_orchestrator import SnowballOrchestrator
+
+base_url, ready_path, go_path, out_path = sys.argv[1:5]
+store = R2CloudStateStore(R2Config(base_url, "cba-kb-private", "SYN_K", "SYN_S"))
+calls = []
+
+class _SlowBackend:
+    def acquire_person(self, person, *, season, job_id, force_refresh=False):
+        calls.append(job_id)
+        time.sleep(0.35)
+        md = f"# 人物研究卡｜{person}（SYN_MP01）｜{season}｜CURRENT\n\nend_marker: true\n"
+        return {
+            "status": "ACQUIRED_AND_BUILT",
+            "person": {"player_name": person, "player_id": "SYN_MP01"},
+            "filename": f"研究卡_{person}_SYN_MP01_{season}_CURRENT.md",
+            "card_markdown": md,
+            "card_sha256": hashlib.sha256(md.encode("utf-8")).hexdigest(),
+            "observed_until": "2026-11-24T12:00:00Z",
+            "coverage_status": "COMPLETE",
+        }
+
+orch = SnowballOrchestrator(
+    state_store=store,
+    acquisition_backend=_SlowBackend(),
+    now_fn=lambda: datetime(2026, 11, 24, 13, 0, 0, tzinfo=timezone.utc),
+)
+Path(ready_path).write_text("ready", encoding="utf-8")
+while not Path(go_path).exists():
+    time.sleep(0.005)
+res = orch.get_or_acquire_person("双进程竞态球员", season="2026-2027")
+Path(out_path).write_text(json.dumps({"result": res, "backend_calls": len(calls)}), encoding="utf-8")
+"""
+        env = dict(os.environ)
+        env["PYTHONPATH"] = f"{REPO_ROOT / 'src'}{os.pathsep}{env.get('PYTHONPATH', '')}"
+        p0 = subprocess.Popen(
+            [sys.executable, "-c", child_code, base_url, str(ready_0), str(go_file), str(out_0)],
+            env=env,
+        )
+        p1 = subprocess.Popen(
+            [sys.executable, "-c", child_code, base_url, str(ready_1), str(go_file), str(out_1)],
+            env=env,
+        )
+        deadline = time.monotonic() + 10.0
+        while not (ready_0.exists() and ready_1.exists()):
+            assert time.monotonic() < deadline, "Subprocesses failed to reach barrier"
+            time.sleep(0.02)
+        go_file.write_text("go", encoding="utf-8")
+        assert p0.wait(timeout=15) == 0
+        assert p1.wait(timeout=15) == 0
+
+        r0 = json.loads(out_0.read_text(encoding="utf-8"))
+        r1 = json.loads(out_1.read_text(encoding="utf-8"))
+        total_backend_calls = r0["backend_calls"] + r1["backend_calls"]
+        assert total_backend_calls == 1, f"Expected exactly 1 winner across 2 processes, got r0={r0}, r1={r1}"
+        statuses = {r0["result"]["status"], r1["result"]["status"]}
+        assert "ACQUIRED_AND_BUILT" in statuses
+        assert "ACQUIRING_IN_CLOUD" in statuses
+        loser = r0["result"] if r0["backend_calls"] == 0 else r1["result"]
+        assert loser.get("deduplicated") is True
+
+        # Part B: Stale/crashed lease expiry recovery + conditional If-Match release
+        store = R2CloudStateStore(R2Config(base_url, "cba-kb-private", "SYN_K", "SYN_S"))
+        t0 = datetime(2026, 11, 24, 13, 0, 0, tzinfo=timezone.utc)
+        ok1, lock1 = store.acquire_active_job_lock(
+            "2026-2027",
+            "租约恢复球员",
+            job_id="job_crashed_1",
+            owner_id="owner_crashed_1",
+            lock_ttl_seconds=60.0,
+            now_utc=t0,
+        )
+        assert ok1 is True and lock1["owner_id"] == "owner_crashed_1"
+
+        # Before expiry -> blocked
+        ok_mid, cur_mid = store.acquire_active_job_lock(
+            "2026-2027",
+            "租约恢复球员",
+            job_id="job_early_2",
+            owner_id="owner_early_2",
+            lock_ttl_seconds=60.0,
+            now_utc=t0 + timedelta(seconds=30),
+        )
+        assert ok_mid is False and cur_mid["job_id"] == "job_crashed_1"
+
+        # After expiry -> atomically recovered by new owner
+        ok_rec, lock2 = store.acquire_active_job_lock(
+            "2026-2027",
+            "租约恢复球员",
+            job_id="job_recovered_2",
+            owner_id="owner_recovered_2",
+            lock_ttl_seconds=60.0,
+            now_utc=t0 + timedelta(seconds=120),
+        )
+        assert ok_rec is True and lock2["job_id"] == "job_recovered_2" and lock2["owner_id"] == "owner_recovered_2"
+
+        # Old crashed owner cannot release new owner's lock
+        assert (
+            store.release_active_job_lock(
+                "2026-2027",
+                "租约恢复球员",
+                owner_id="owner_crashed_1",
+                job_id="job_crashed_1",
+            )
+            is False
+        )
+        # New owner releases cleanly
+        assert (
+            store.release_active_job_lock(
+                "2026-2027",
+                "租约恢复球员",
+                owner_id="owner_recovered_2",
+                job_id="job_recovered_2",
+            )
+            is True
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    # Part C: Worker conditional put (onlyIf: { etagDoesNotMatch: "*" }) concurrent race in Node
+    node_bin = shutil.which("node")
+    if node_bin is not None:
+        worker_path = REPO_ROOT / "config" / "cloud_snowball_worker.js"
+        js_race = r"""
+const crypto = require('crypto');
+const { pathToFileURL } = require('url');
+(async () => {
+  const mod = await import(pathToFileURL(process.argv[1]).href);
+  const worker = mod.default;
+  const secret = 'syn_race_' + 'tok_v230';
+  const authHeader = 'Bear' + 'er ' + secret;
+  const bucketMap = new Map();
+  let etagSeq = 0;
+  let dispatchCount = 0;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    dispatchCount += 1;
+    return new Response(null, { status: 204 });
+  };
+  const makeObj = (rawStr, meta, etag) => ({
+    etag,
+    async arrayBuffer() { const b = Buffer.from(rawStr, 'utf8'); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); },
+    async text() { return rawStr; },
+    async json() { return JSON.parse(rawStr); },
+    customMetadata: meta || {},
+  });
+  const fakeBucket = {
+    async get(key) { return bucketMap.has(key) ? bucketMap.get(key) : null; },
+    async put(key, value, opts) {
+      const onlyIf = opts && opts.onlyIf;
+      if (onlyIf && onlyIf.etagDoesNotMatch === '*' && bucketMap.has(key)) return null;
+      if (onlyIf && onlyIf.etagMatches && (!bucketMap.has(key) || bucketMap.get(key).etag !== onlyIf.etagMatches)) return null;
+      etagSeq += 1;
+      const etag = 'etag-' + etagSeq;
+      const str = typeof value === 'string' ? value : Buffer.from(value).toString('utf8');
+      const obj = makeObj(str, (opts && opts.customMetadata) || {}, etag);
+      bucketMap.set(key, obj);
+      return obj;
+    },
+  };
+  const env = {
+    CBA_KB_R2: fakeBucket,
+    GATEWAY_AUTH_SECRET: secret,
+    GITHUB_DISPATCH_REPO: 'SkyOneBranch/syn-private-collector',
+    GITHUB_DISPATCH_PAT: 'syn_pat_placeholder',
+    WAIT_TIMEOUT_MS: '50',
+    POLL_INTERVAL_MS: '25',
+  };
+  const mkReq = () => new Request('https://worker.example.invalid/v1/person', {
+    method: 'POST',
+    headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ person: 'Worker竞态球员', season: '2026-2027' }),
+  });
+  const [r1, r2] = await Promise.all([worker.fetch(mkReq(), env), worker.fetch(mkReq(), env)]);
+  const [j1, j2] = await Promise.all([r1.json(), r2.json()]);
+  globalThis.fetch = origFetch;
+  if (dispatchCount !== 1) throw new Error('EXPECTED_1_DISPATCH_GOT_' + dispatchCount);
+  if (j1.job_id !== j2.job_id) throw new Error('JOB_ID_MISMATCH:' + JSON.stringify({ j1, j2 }));
+  if (!(j1.deduplicated || j2.deduplicated)) throw new Error('NO_DEDUP_FLAG');
+  console.log('WORKER_CONDITIONAL_RACE_OK');
+})().catch((e) => { console.error(e); process.exit(1); });
+"""
+        proc = subprocess.run(
+            [node_bin, "-e", js_race, str(worker_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+        assert proc.returncode == 0, f"Worker race test failed:\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"
+        assert "WORKER_CONDITIONAL_RACE_OK" in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# 4. P0-4-WORKER-R2-CONTRACT-DRIFT (Unicode Parity + Embedded job.card_markdown Tamper + 5-Domain Coverage)
+# ---------------------------------------------------------------------------
+
+
+def test_worker_js_key_parity_unicode_embedded_card_tamper_and_five_domain_coverage():
     from cba_kb.cloud_state import R2CloudStateStore, R2Config
 
     worker_path = REPO_ROOT / "config" / "cloud_snowball_worker.js"
-    worker_src = worker_path.read_text(encoding="utf-8")
-
-    # Compute expected Python key for Chinese name "测试球员甲"
     py_store = R2CloudStateStore(
         R2Config("https://syn-r2.example.invalid", "cba-kb-private", "SYN_K", "SYN_S"),
         transport=_AtomicFakeR2Transport(),
     )
     py_card_key = py_store._card_key("2026-2027", "测试球员甲")
     py_ascii_key = py_store._card_key("2026-2027", "SYN_P001")
+    py_nel_key = py_store._card_key("2026-2027", "\u0085A\u0085")
+    py_fs_key = py_store._card_key("2026-2027", "\u001cA\u001f")
 
     node_bin = shutil.which("node")
     if node_bin is None:
-        # Static contract fallback if node is unavailable
+        worker_src = worker_path.read_text(encoding="utf-8")
         assert "crypto.subtle.digest" in worker_src
         assert "R2_OBJECT_SHA256_MISMATCH" in worker_src
-        for dom in (
-            "domestic_registration",
-            "foreign_registration",
-            "club_announcements",
-            "league_rules",
-            "game_stats",
-        ):
-            assert dom in worker_src
+        assert "\\u0085" in worker_src
         return
 
-    # Execute actual Cloudflare Worker module in Node 24 with an in-memory mock R2Bucket
     js_driver = r"""
-const path = require('path');
 const crypto = require('crypto');
 const { pathToFileURL } = require('url');
 
 (async () => {
-  const workerUrl = pathToFileURL(process.argv[1]).href;
-  const mod = await import(workerUrl);
+  const mod = await import(pathToFileURL(process.argv[1]).href);
   const worker = mod.default;
-  const expectedPyZhKey = process.argv[2];
-  const expectedPyAsciiKey = process.argv[3];
+  const [pyZhKey, pyAsciiKey, pyNelKey, pyFsKey] = process.argv.slice(2, 6);
 
   const secret = 'syn_worker_' + 'secret_v230';
   const authHeader = 'Bear' + 'er ' + secret;
+  const sha256 = (s) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
 
   const bucketMap = new Map();
   const makeObj = (rawStr, meta) => ({
-    async arrayBuffer() {
-      const buf = Buffer.from(rawStr, 'utf8');
-      return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
-    },
+    etag: 'e-' + sha256(rawStr).slice(0, 8),
+    async arrayBuffer() { const b = Buffer.from(rawStr, 'utf8'); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); },
     async text() { return rawStr; },
     async json() { return JSON.parse(rawStr); },
     customMetadata: meta || {},
   });
-
   const fakeBucket = {
-    async get(key) {
-      return bucketMap.has(key) ? bucketMap.get(key) : null;
-    },
+    async get(key) { return bucketMap.has(key) ? bucketMap.get(key) : null; },
     async put(key, value, opts) {
+      const onlyIf = opts && opts.onlyIf;
+      if (onlyIf && onlyIf.etagDoesNotMatch === '*' && bucketMap.has(key)) return null;
+      if (onlyIf && onlyIf.etagMatches && (!bucketMap.has(key) || bucketMap.get(key).etag !== onlyIf.etagMatches)) return null;
       const str = typeof value === 'string' ? value : Buffer.from(value).toString('utf8');
-      bucketMap.set(key, makeObj(str, (opts && opts.customMetadata) || {}));
+      const obj = makeObj(str, (opts && opts.customMetadata) || {});
+      bucketMap.set(key, obj);
+      return obj;
     },
   };
+  const env = { CBA_KB_R2: fakeBucket, GATEWAY_AUTH_SECRET: secret, WAIT_TIMEOUT_MS: '50', POLL_INTERVAL_MS: '10' };
 
-  const env = { CBA_KB_R2: fakeBucket, GATEWAY_AUTH_SECRET: secret };
-  const sha256 = (s) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
-
-  // 1. Key parity for Chinese name "测试球员甲"
   const md = '# 人物研究卡｜测试球员甲（SYN_P001）｜2026-2027｜CURRENT\n\nend_marker: true\n';
   const mdSha = sha256(md);
-  const cardPayload = JSON.stringify({
-    player_name: '测试球员甲',
+  const putCard = (key, name) => {
+    const payload = JSON.stringify({
+      player_name: name, season: '2026-2027', markdown: md, card_markdown: md,
+      card_sha256: mdSha, updated_at_utc: new Date().toISOString(),
+    });
+    bucketMap.set(key, makeObj(payload, { sha256: sha256(payload) }));
+  };
+
+  // 1. Key parity across Chinese, ASCII, U+0085 (NEL), and U+001C/U+001F
+  putCard(pyZhKey, '测试球员甲');
+  putCard(pyAsciiKey, 'SYN_P001');
+  putCard(pyNelKey, '\u0085A\u0085');
+  putCard(pyFsKey, '\u001cA\u001f');
+
+  for (const person of ['测试球员甲', 'SYN_P001', '\u0085A\u0085', '\u001cA\u001f']) {
+    const resp = await worker.fetch(new Request('https://worker.example.invalid/v1/person', {
+      method: 'POST',
+      headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ person, season: '2026-2027' }),
+    }), env);
+    const body = await resp.json();
+    if (resp.status !== 200 || body.status !== 'HIT_FRESH') {
+      throw new Error('KEY_PARITY_FAILED_FOR_' + JSON.stringify(person) + ':' + JSON.stringify(body));
+    }
+  }
+
+  // 2. Embedded tampered job.card_markdown in jobs/<id>.json MUST fail closed on GET /v1/jobs/<id>
+  const tamperedJob = JSON.stringify({
+    job_id: 'job_tamper_embed',
+    status: 'COMPLETED',
+    person: '测试球员甲',
     season: '2026-2027',
-    markdown: md,
-    card_markdown: md,
+    card_markdown: md + '\nTAMPERED_DIRECTLY',
     card_sha256: mdSha,
-    updated_at_utc: new Date().toISOString(),
-    observed_until: new Date().toISOString(),
-    coverage_status: 'COMPLETE',
   });
-  bucketMap.set(expectedPyZhKey, makeObj(cardPayload, { sha256: sha256(cardPayload) }));
-
-  const hitReq = new Request('https://worker.example.invalid/v1/person', {
-    method: 'POST',
-    headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ person: '测试球员甲', season: '2026-2027' }),
-  });
-  const hitResp = await worker.fetch(hitReq, env);
-  const hitJson = await hitResp.json();
-  if (hitResp.status !== 200 || hitJson.status !== 'HIT_FRESH') {
-    throw new Error('ZH_KEY_PARITY_FAILED:' + hitResp.status + ':' + JSON.stringify(hitJson));
+  bucketMap.set('jobs/job_tamper_embed.json', makeObj(tamperedJob, { sha256: sha256(tamperedJob) }));
+  const jobResp = await worker.fetch(new Request('https://worker.example.invalid/v1/jobs/job_tamper_embed', {
+    method: 'GET',
+    headers: { Authorization: authHeader },
+  }), env);
+  if (jobResp.status < 400) {
+    throw new Error('EMBEDDED_JOB_CARD_TAMPER_NOT_REJECTED:' + jobResp.status);
   }
 
-  // 2. ASCII key parity
-  const asciiPayload = JSON.stringify({
-    player_name: 'SYN_P001',
+  // 3. Embedded tampered job.card_markdown MUST ALSO fail closed during POST /v1/person poll completion
+  const lockKey = 'locks/2026-2027/syn_poll_tamper.json';
+  const lockPayload = JSON.stringify({
+    job_id: 'job_tamper_embed',
+    owner_id: 'owner_t1',
+    status: 'RUNNING',
+    person: 'syn_poll_tamper',
     season: '2026-2027',
-    markdown: md,
-    card_markdown: md,
-    card_sha256: mdSha,
-    updated_at_utc: new Date().toISOString(),
+    created_at_utc: new Date().toISOString(),
+    expires_at_utc: new Date(Date.now() + 300000).toISOString(),
   });
-  bucketMap.set(expectedPyAsciiKey, makeObj(asciiPayload, { sha256: sha256(asciiPayload) }));
-  const asciiResp = await worker.fetch(new Request('https://worker.example.invalid/v1/person', {
+  bucketMap.set(lockKey, makeObj(lockPayload, { sha256: sha256(lockPayload) }));
+  const pollResp = await worker.fetch(new Request('https://worker.example.invalid/v1/person', {
     method: 'POST',
     headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ person: 'SYN_P001', season: '2026-2027' }),
+    body: JSON.stringify({ person: 'syn_poll_tamper', season: '2026-2027' }),
   }), env);
-  const asciiJson = await asciiResp.json();
-  if (asciiResp.status !== 200 || asciiJson.status !== 'HIT_FRESH') {
-    throw new Error('ASCII_KEY_PARITY_FAILED:' + JSON.stringify(asciiJson));
+  if (pollResp.status < 400) {
+    throw new Error('POLL_EMBEDDED_CARD_TAMPER_NOT_REJECTED:' + pollResp.status);
   }
 
-  // 3. Tampered object (missing/mismatched metadata sha256) fails closed
-  bucketMap.set(expectedPyZhKey, makeObj(cardPayload, {}));
-  const badMetaResp = await worker.fetch(new Request('https://worker.example.invalid/v1/person', {
-    method: 'POST',
-    headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ person: '测试球员甲', season: '2026-2027' }),
-  }), env);
-  if (badMetaResp.status < 400) {
-    throw new Error('MISSING_SHA_METADATA_DID_NOT_FAIL_CLOSED:' + badMetaResp.status);
-  }
-
-  // 4. Tampered card_sha256 inside valid outer JSON fails closed
-  const badCardPayload = JSON.stringify({
-    player_name: '测试球员甲',
-    season: '2026-2027',
-    markdown: md + '\ntampered',
-    card_markdown: md + '\ntampered',
-    card_sha256: mdSha,
-    updated_at_utc: new Date().toISOString(),
-  });
-  bucketMap.set(expectedPyZhKey, makeObj(badCardPayload, { sha256: sha256(badCardPayload) }));
-  const badCardResp = await worker.fetch(new Request('https://worker.example.invalid/v1/person', {
-    method: 'POST',
-    headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ person: '测试球员甲', season: '2026-2027' }),
-  }), env);
-  if (badCardResp.status < 400) {
-    throw new Error('TAMPERED_CARD_SHA_DID_NOT_FAIL_CLOSED:' + badCardResp.status);
-  }
-
-  // 5. 5-domain coverage evaluation ignores forged ledger.overall_status="COMPLETE" when a domain is PARTIAL/STALE
+  // 4. 5-domain coverage evaluation ignores forged overall_status="COMPLETE"
   const ledgerPayload = JSON.stringify({
     schema: 'cba-kb.coverage-ledger.v1',
     overall_status: 'COMPLETE',
@@ -468,40 +668,34 @@ const { pathToFileURL } = require('url');
     headers: { Authorization: authHeader },
   }), env);
   const covJson = await covResp.json();
-  if (covResp.status !== 200 || covJson.overall_status !== 'PARTIAL') {
+  if (covResp.status !== 200 || covJson.overall_status !== 'PARTIAL' || covJson.domains.game_stats.coverage_status !== 'STALE') {
     throw new Error('FIVE_DOMAIN_COVERAGE_FAILED:' + JSON.stringify(covJson));
   }
-  if (!covJson.domains || covJson.domains.game_stats.coverage_status !== 'STALE') {
-    throw new Error('STALE_DOMAIN_NOT_DETECTED:' + JSON.stringify(covJson));
-  }
 
-  console.log('WORKER_JS_PARITY_OK');
-})().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+  console.log('WORKER_JS_PARITY_AND_TAMPER_OK');
+})().catch((e) => { console.error(e); process.exit(1); });
 """
     proc = subprocess.run(
-        [node_bin, "-e", js_driver, str(worker_path), py_card_key, py_ascii_key],
+        [node_bin, "-e", js_driver, str(worker_path), py_card_key, py_ascii_key, py_nel_key, py_fs_key],
         capture_output=True,
         text=True,
         check=False,
         timeout=15,
     )
     assert proc.returncode == 0, f"Node Worker check failed:\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"
-    assert "WORKER_JS_PARITY_OK" in proc.stdout
+    assert "WORKER_JS_PARITY_AND_TAMPER_OK" in proc.stdout
 
 
 # ---------------------------------------------------------------------------
-# 5. P0-4-RUNNER-NONFUNCTIONAL (Env Alias, CLI Backend Wiring & --job-id Handoff)
+# 5. P0-4-RUNNER-NONFUNCTIONAL & P0-4-NEW-R2-RUNNER-LOCK-OWNER-MISMATCH
 # ---------------------------------------------------------------------------
 
 
-def test_runner_env_alias_cli_backend_wiring_and_job_id_handoff(tmp_path: Path, monkeypatch, capsys):
+def test_worker_to_runner_cli_job_id_and_owner_id_handoff_releases_lock(tmp_path: Path, monkeypatch, capsys):
     from cba_kb import cloud_state
     from cba_kb.cli import main as cli_main
 
-    # 1. R2Config.from_env accepts CBA_KB_R2_ENDPOINT_URL, CBA_KB_R2_ENDPOINT, and R2_ENDPOINT_URL
+    # 1. R2Config.from_env accepts all 3 endpoint aliases
     for env_key in ("CBA_KB_R2_ENDPOINT_URL", "CBA_KB_R2_ENDPOINT", "R2_ENDPOINT_URL"):
         cfg = cloud_state.R2Config.from_env({
             env_key: "https://syn-r2.example.invalid",
@@ -511,20 +705,40 @@ def test_runner_env_alias_cli_backend_wiring_and_job_id_handoff(tmp_path: Path, 
         })
         assert cfg.endpoint_url == "https://syn-r2.example.invalid"
 
-    # 2. Runner workflow template uses CBA_KB_R2_ENDPOINT_URL and passes --job-id & --instance-root
+    # 2. Runner workflow template wires CBA_KB_R2_ENDPOINT_URL, --job-id, --owner-id, --instance-root, --collector-cmd
     runner_text = (REPO_ROOT / "config" / "cloud_snowball_runner.example.yml").read_text(encoding="utf-8")
-    assert "CBA_KB_R2_ENDPOINT_URL" in runner_text
-    assert "--job-id" in runner_text
-    assert "--instance-root" in runner_text
+    for required_tok in ("CBA_KB_R2_ENDPOINT_URL", "--job-id", "--owner-id", "--instance-root", "--collector-cmd"):
+        assert required_tok in runner_text, f"Missing {required_tok} in cloud_snowball_runner.example.yml"
     parsed_runner = yaml.safe_load(runner_text)
     assert isinstance(parsed_runner, dict) and "jobs" in parsed_runner
 
-    # 3. CLI snowball-query wires LocalCliAcquisitionBackend and writes exact jobs/<job_id>.json to R2
+    # 3. Pre-create Worker-format RUNNING lock + job with owner_id, invoke Runner CLI, verify COMPLETED & lock RELEASED
     transport = _AtomicFakeR2Transport()
     fake_store = cloud_state.R2CloudStateStore(
         cloud_state.R2Config("https://syn-r2.example.invalid", "cba-kb-private", "SYN_K", "SYN_S"),
         transport=transport,
     )
+    now_utc = datetime.now(timezone.utc)
+    fake_store.acquire_active_job_lock(
+        "2026-2027",
+        "测试外援交接",
+        job_id="job_worker_handoff_42",
+        owner_id="owner_worker_42",
+        lock_ttl_seconds=300.0,
+        now_utc=now_utc,
+    )
+    fake_store.put_job(
+        "job_worker_handoff_42",
+        {
+            "job_id": "job_worker_handoff_42",
+            "owner_id": "owner_worker_42",
+            "status": "RUNNING",
+            "person": "测试外援交接",
+            "season": "2026-2027",
+            "created_at_utc": now_utc.isoformat(),
+        },
+    )
+
     inst_dir = tmp_path / "syn_instance"
     (inst_dir / "data").mkdir(parents=True)
     (inst_dir / "config").mkdir(parents=True)
@@ -540,6 +754,7 @@ def test_runner_env_alias_cli_backend_wiring_and_job_id_handoff(tmp_path: Path, 
         "from_env",
         classmethod(lambda cls, env=None: fake_store.config),
     )
+    monkeypatch.delenv("CBA_KB_DRIVE_SNOWBALL_FOLDER_ID", raising=False)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -553,27 +768,115 @@ def test_runner_env_alias_cli_backend_wiring_and_job_id_handoff(tmp_path: Path, 
             "--season",
             "2026-2027",
             "--job-id",
-            "job_worker_handoff_99",
+            "job_worker_handoff_42",
+            "--owner-id",
+            "owner_worker_42",
         ],
     )
     cli_main()
     out_json = json.loads(capsys.readouterr().out)
     assert out_json["status"] == "ACQUIRED_AND_BUILT"
-    assert out_json["job_id"] == "job_worker_handoff_99"
-    job_doc = fake_store.get_job("job_worker_handoff_99")
-    assert job_doc is not None
-    assert job_doc["status"] == "COMPLETED"
+    assert out_json["job_id"] == "job_worker_handoff_42"
+    job_doc = fake_store.get_job("job_worker_handoff_42")
+    assert job_doc is not None and job_doc["status"] == "COMPLETED"
+    assert job_doc.get("card_sha256")
+    # Lock MUST be cleanly released so subsequent force_refresh starts a fresh job
+    assert fake_store.find_active_job_for_person("测试外援交接", "2026-2027") is None
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cba-kb",
+            "--instance-root",
+            str(inst_dir),
+            "snowball-query",
+            "--person",
+            "测试外援交接",
+            "--season",
+            "2026-2027",
+            "--force-refresh",
+        ],
+    )
+    cli_main()
+    refresh_json = json.loads(capsys.readouterr().out)
+    assert refresh_json["status"] == "ACQUIRED_AND_BUILT"
+    assert refresh_json["job_id"] != "job_worker_handoff_42"
+
+
+def test_real_collector_cmd_execution_for_uncached_player_not_in_master(tmp_path: Path, monkeypatch, capsys):
+    from cba_kb import cloud_state
+    from cba_kb.cli import main as cli_main
+
+    transport = _AtomicFakeR2Transport()
+    fake_store = cloud_state.R2CloudStateStore(
+        cloud_state.R2Config("https://syn-r2.example.invalid", "cba-kb-private", "SYN_K", "SYN_S"),
+        transport=transport,
+    )
+    inst_dir = tmp_path / "collector_inst"
+    (inst_dir / "data").mkdir(parents=True)
+    (inst_dir / "config").mkdir(parents=True)
+    # MASTER.csv intentionally does NOT contain "测试新外援采集"
+    master_csv = inst_dir / "data" / "MASTER.csv"
+    master_csv.write_text(
+        "season,club,player_name,player_id,position\n"
+        "2026-2027,测试俱乐部甲,既有球员甲,SYN_EXIST01,G\n",
+        encoding="utf-8",
+    )
+
+    # Executable fake COL collector script that populates MASTER.csv with the requested person
+    collector_script = tmp_path / "fake_col.py"
+    collector_script.write_text(
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "person = '测试新外援采集'\n"
+        "for i, arg in enumerate(sys.argv):\n"
+        "    if arg == '--person' and i + 1 < len(sys.argv):\n"
+        "        person = sys.argv[i + 1]\n"
+        f"master = Path({str(master_csv)!r})\n"
+        "with master.open('a', encoding='utf-8') as fh:\n"
+        "    fh.write(f'2026-2027,测试俱乐部乙,{person},SYN_COL99,F\\n')\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(cloud_state, "R2CloudStateStore", lambda *a, **kw: fake_store)
+    monkeypatch.setattr(
+        cloud_state.R2Config,
+        "from_env",
+        classmethod(lambda cls, env=None: fake_store.config),
+    )
+    monkeypatch.delenv("CBA_KB_DRIVE_SNOWBALL_FOLDER_ID", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cba-kb",
+            "--instance-root",
+            str(inst_dir),
+            "snowball-query",
+            "--person",
+            "测试新外援采集",
+            "--season",
+            "2026-2027",
+            "--collector-cmd",
+            f"{sys.executable} {collector_script}",
+        ],
+    )
+    cli_main()
+    out_json = json.loads(capsys.readouterr().out)
+    assert out_json["status"] == "ACQUIRED_AND_BUILT"
+    assert "测试新外援采集" in out_json["card_markdown"]
+    assert fake_store.get_card("2026-2027", "测试新外援采集") is not None
 
 
 # ---------------------------------------------------------------------------
-# 6. P0-5-SYMLINK-PARENT-ESCAPE
+# 6. P0-5-SYMLINK-PARENT-ESCAPE (openat O_DIRECTORY | O_NOFOLLOW + TOCTOU Swap)
 # ---------------------------------------------------------------------------
 
 
-def test_prepare_v215_rejects_symlink_on_demand_cards_directory_escape(tmp_path: Path):
+def test_prepare_v215_rejects_symlink_on_demand_cards_directory_and_toctou_swap(tmp_path: Path, monkeypatch):
     from cba_kb.orchestration.release import prepare_v215
 
-    # Prepare an outside directory containing a valid manifest + card file
     outside_dir = tmp_path / "outside_secret_dir"
     outside_dir.mkdir()
     card_filename = "研究卡_逃逸测试_SYN_ESC01_2026-2027_CURRENT.md"
@@ -596,11 +899,6 @@ def test_prepare_v215_rejects_symlink_on_demand_cards_directory_escape(tmp_path:
         }),
         encoding="utf-8",
     )
-
-    data_root = tmp_path / "instance" / "data"
-    data_root.mkdir(parents=True)
-    # Symlink on_demand_cards -> outside_secret_dir
-    os.symlink(outside_dir, data_root / "on_demand_cards")
 
     class _FakeInstance:
         def __init__(self, root: Path):
@@ -629,12 +927,42 @@ def test_prepare_v215_rejects_symlink_on_demand_cards_directory_escape(tmp_path:
         {"logical_key": "derived/source_registry.csv", "drive_file_id": "drv_sr_csv"},
     ]
 
+    # Case A: Static symlink on_demand_cards -> outside_dir rejected
+    inst_a = tmp_path / "inst_a"
+    (inst_a / "data").mkdir(parents=True)
+    os.symlink(outside_dir, inst_a / "data" / "on_demand_cards")
     with pytest.raises(prepare_v215.ProjectionError, match="ON_DEMAND_CARD_SYMLINK_OR_PATH_ESCAPE"):
         prepare_v215._build_instance_consumer_targets(
             _MinimalSnapshotDrive(),
-            _FakeInstance(tmp_path / "instance"),
+            _FakeInstance(inst_a),
             release_id="v2.3.0-1",
             engine_sha=BASELINE_SHA_V230_1,
             manifest_rows=manifest_rows,
             data_parent="drv_zone_current_20data",
         )
+
+    # Case B: TOCTOU symlink swap right before opening on_demand_cards via openat(O_DIRECTORY | O_NOFOLLOW)
+    inst_b = tmp_path / "inst_b"
+    od_b = inst_b / "data" / "on_demand_cards"
+    od_b.mkdir(parents=True)
+    orig_os_open = os.open
+    swapped = {"done": False}
+
+    def _toctou_open(path, flags, *args, **kwargs):
+        if not swapped["done"] and str(path) == "on_demand_cards" and kwargs.get("dir_fd") is not None:
+            swapped["done"] = True
+            shutil.rmtree(od_b)
+            os.symlink(outside_dir, od_b)
+        return orig_os_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", _toctou_open)
+    with pytest.raises(prepare_v215.ProjectionError, match="ON_DEMAND_CARD_SYMLINK_OR_PATH_ESCAPE"):
+        prepare_v215._build_instance_consumer_targets(
+            _MinimalSnapshotDrive(),
+            _FakeInstance(inst_b),
+            release_id="v2.3.0-1",
+            engine_sha=BASELINE_SHA_V230_1,
+            manifest_rows=manifest_rows,
+            data_parent="drv_zone_current_20data",
+        )
+    assert swapped["done"] is True

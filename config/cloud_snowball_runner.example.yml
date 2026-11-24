@@ -23,6 +23,11 @@ on:
         required: false
         default: ""
         type: string
+      owner_id:
+        description: Cloud acquisition lock owner identifier
+        required: false
+        default: ""
+        type: string
       force_refresh:
         description: Bypass fresh cache and negative receipt TTL
         required: false
@@ -46,10 +51,13 @@ jobs:
       CBA_KB_R2_SECRET_ACCESS_KEY: ${{ secrets.CBA_KB_R2_SECRET_ACCESS_KEY }}
       CBA_KB_DRIVE_TOKEN_JSON: ${{ secrets.CBA_KB_DRIVE_TOKEN_JSON }}
       CBA_KB_DRIVE_SNOWBALL_FOLDER_ID: ${{ secrets.CBA_KB_DRIVE_SNOWBALL_FOLDER_ID }}
+      CBA_KB_DRIVE_PROTECTED_FOLDER_IDS: ${{ secrets.CBA_KB_DRIVE_PROTECTED_FOLDER_IDS }}
+      COLLECTOR_CMD: ${{ vars.CBA_KB_COLLECTOR_CMD || 'cba-kb-collector collect' }}
       INSTANCE_ROOT: ./workspace/cloud_instance
       TARGET_PERSON: ${{ github.event.client_payload.person || inputs.person }}
       TARGET_SEASON: ${{ github.event.client_payload.season || inputs.season || '2026-2027' }}
       TARGET_JOB_ID: ${{ github.event.client_payload.job_id || inputs.job_id }}
+      TARGET_OWNER_ID: ${{ github.event.client_payload.owner_id || inputs.owner_id || '' }}
       FORCE_REFRESH: ${{ github.event.client_payload.force_refresh || inputs.force_refresh || 'false' }}
     steps:
       - name: Checkout private collector repository
@@ -79,6 +87,8 @@ jobs:
             --person "${TARGET_PERSON}" \
             --season "${TARGET_SEASON}" \
             --job-id "${TARGET_JOB_ID}" \
+            --owner-id "${TARGET_OWNER_ID}" \
             --instance-root "${INSTANCE_ROOT:-.}" \
+            --collector-cmd "${COLLECTOR_CMD}" \
             --snowball-folder-id "${CBA_KB_DRIVE_SNOWBALL_FOLDER_ID}" \
             ${EXTRA_FLAGS}

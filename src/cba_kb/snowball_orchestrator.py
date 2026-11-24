@@ -18,13 +18,16 @@ from __future__ import annotations
 
 import abc
 import hashlib
+import inspect
 import json
+import os
+import shlex
 import subprocess
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import requests
 
@@ -89,14 +92,20 @@ class LocalCliAcquisitionBackend(AcquisitionBackend):
     def __init__(
         self,
         *,
-        collector_cmd: Optional[Sequence[str]] = None,
+        collector_cmd: Optional[Union[str, Sequence[str]]] = None,
         instance: Optional[Any] = None,
         instance_root: Optional[Any] = None,
         local_resolver_inputs: Optional[Mapping[str, Any]] = None,
         whitelist_sources: Sequence[str] = ("local_kb",),
         timeout_seconds: float = 300.0,
     ) -> None:
-        self.collector_cmd = tuple(collector_cmd) if collector_cmd else None
+        if isinstance(collector_cmd, str):
+            parts = shlex.split(collector_cmd)
+            self.collector_cmd: Optional[Tuple[str, ...]] = tuple(parts) if parts else None
+        elif collector_cmd:
+            self.collector_cmd = tuple(str(x) for x in collector_cmd)
+        else:
+            self.collector_cmd = None
         if instance is None and instance_root is not None:
             root = Path(instance_root).expanduser().resolve()
             instance = Instance(
@@ -107,7 +116,12 @@ class LocalCliAcquisitionBackend(AcquisitionBackend):
                 data_root=(root / "data").resolve(),
             )
         self.instance = instance
-        self.instance_root = Path(instance_root).expanduser().resolve() if instance_root is not None else None
+        if instance_root is not None:
+            self.instance_root: Optional[Path] = Path(instance_root).expanduser().resolve()
+        elif instance is not None and getattr(instance, "root", None) is not None:
+            self.instance_root = Path(instance.root).expanduser().resolve()
+        else:
+            self.instance_root = None
         self.local_resolver_inputs = dict(local_resolver_inputs or {})
         self.whitelist_sources = tuple(whitelist_sources)
         self.timeout_seconds = float(timeout_seconds)
@@ -120,6 +134,7 @@ class LocalCliAcquisitionBackend(AcquisitionBackend):
         job_id: str,
         force_refresh: bool = False,
     ) -> Dict[str, Any]:
+        collector_sources: Optional[List[str]] = None
         if self.collector_cmd:
             cmd = [
                 *self.collector_cmd,
@@ -130,6 +145,13 @@ class LocalCliAcquisitionBackend(AcquisitionBackend):
                 "--job-id",
                 job_id,
             ]
+            env = os.environ.copy()
+            env["CBA_KB_TARGET_PERSON"] = person
+            env["CBA_KB_TARGET_SEASON"] = season
+            env["CBA_KB_TARGET_JOB_ID"] = job_id
+            if self.instance_root is not None:
+                cmd.extend(["--instance-root", str(self.instance_root)])
+                env["CBA_KB_INSTANCE_ROOT"] = str(self.instance_root)
             if force_refresh:
                 cmd.append("--force-refresh")
             proc = subprocess.run(
@@ -138,15 +160,31 @@ class LocalCliAcquisitionBackend(AcquisitionBackend):
                 text=True,
                 check=False,
                 timeout=self.timeout_seconds,
+                env=env,
+                shell=False,
             )
             if proc.returncode != 0:
                 raise RuntimeError(
                     f"LOCAL_CLI_ACQUISITION_FAILED(rc={proc.returncode}): {proc.stderr.strip()}"
                 )
-            parsed = json.loads(proc.stdout.strip() or "{}")
-            if not isinstance(parsed, dict):
-                raise ValueError("LOCAL_CLI_ACQUISITION_INVALID_JSON")
-            return parsed
+            stdout_text = proc.stdout.strip()
+            if stdout_text:
+                try:
+                    parsed = json.loads(stdout_text)
+                except ValueError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    p_status = str(parsed.get("status") or "").upper()
+                    if isinstance(parsed.get("whitelist_sources_checked"), list):
+                        collector_sources = [str(s) for s in parsed["whitelist_sources_checked"]]
+                    if p_status in ("ACQUIRED_AND_BUILT", "BUILT") and (
+                        parsed.get("card_markdown") or parsed.get("markdown")
+                    ):
+                        return parsed
+                    if p_status in ("UNDECIDED", "ACQUIRING_IN_CLOUD"):
+                        return parsed
+                    if p_status == "UNKNOWN_AFTER_WHITELIST_CHECK" and self.instance is None and not self.local_resolver_inputs:
+                        return parsed
 
         res = build_person_card(
             person,
@@ -174,7 +212,7 @@ class LocalCliAcquisitionBackend(AcquisitionBackend):
             }
         return {
             "status": "UNKNOWN_AFTER_WHITELIST_CHECK",
-            "whitelist_sources_checked": list(self.whitelist_sources),
+            "whitelist_sources_checked": list(collector_sources or self.whitelist_sources),
         }
 
 
@@ -298,6 +336,7 @@ class SnowballOrchestrator:
         instance: Optional[Any] = None,
         default_negative_ttl_hours: float = 24.0,
         stale_after_hours: float = 48.0,
+        lock_ttl_seconds: float = 300.0,
         now_fn: Optional[Callable[[], datetime]] = None,
     ) -> None:
         self.state_store = state_store
@@ -312,6 +351,7 @@ class SnowballOrchestrator:
         self.instance = instance
         self.default_negative_ttl_hours = float(default_negative_ttl_hours)
         self.stale_after_hours = float(stale_after_hours)
+        self.lock_ttl_seconds = float(lock_ttl_seconds)
         self.now_fn = now_fn
         self._inflight_locks_guard = threading.Lock()
         self._inflight_locks: Dict[Tuple[str, str], threading.Lock] = {}
@@ -328,6 +368,34 @@ class SnowballOrchestrator:
                 self._inflight_locks[key] = lock
             return lock
 
+    @staticmethod
+    def _is_lock_expired(lock_doc: Mapping[str, Any], *, now_utc: datetime) -> bool:
+        exp = _parse_utc(lock_doc.get("expires_at_utc"))
+        if exp is None:
+            return False
+        return now_utc >= exp
+
+    @staticmethod
+    def _can_adopt_existing_lock(
+        existing: Mapping[str, Any],
+        *,
+        explicit_job_id: Optional[str],
+        explicit_owner_id: Optional[str],
+    ) -> Tuple[bool, Optional[str]]:
+        if not explicit_job_id:
+            return False, None
+        existing_job_id = str(existing.get("job_id") or "").strip()
+        if existing_job_id != explicit_job_id:
+            return False, None
+        existing_owner = str(existing.get("owner_id") or "").strip()
+        if explicit_owner_id:
+            if existing_owner and existing_owner != explicit_owner_id:
+                return False, None
+            return True, existing_owner or explicit_owner_id
+        if existing_owner:
+            return True, existing_owner
+        return False, None
+
     def _try_acquire_lock(
         self,
         *,
@@ -336,30 +404,53 @@ class SnowballOrchestrator:
         job_id: str,
         explicit_job_id: Optional[str],
         owner_id: str,
+        explicit_owner_id: Optional[str],
+        now_utc: datetime,
         now_iso: str,
         force_refresh: bool,
     ) -> Tuple[bool, Dict[str, Any]]:
+        expires_iso = _iso_utc(now_utc + timedelta(seconds=self.lock_ttl_seconds))
         extra: Dict[str, Any] = {
             "person": person,
             "season": season,
             "force_refresh": bool(force_refresh),
             "created_at_utc": now_iso,
             "updated_at_utc": now_iso,
+            "expires_at_utc": expires_iso,
         }
         with self._person_mutex(season, person):
             acquire_fn = getattr(self.state_store, "acquire_active_job_lock", None)
             if callable(acquire_fn):
+                call_kwargs: Dict[str, Any] = {
+                    "job_id": job_id,
+                    "owner_id": owner_id,
+                    "extra": extra,
+                }
+                try:
+                    sig = inspect.signature(acquire_fn)
+                    if "lock_ttl_seconds" in sig.parameters:
+                        call_kwargs["lock_ttl_seconds"] = self.lock_ttl_seconds
+                    if "now_utc" in sig.parameters:
+                        call_kwargs["now_utc"] = now_utc
+                except (TypeError, ValueError):
+                    pass
                 acquired, lock_doc = acquire_fn(
                     season,
                     person,
-                    job_id=job_id,
-                    owner_id=owner_id,
-                    extra=extra,
+                    **call_kwargs,
                 )
                 if acquired:
-                    return True, dict(lock_doc) if isinstance(lock_doc, dict) else {"job_id": job_id, "owner_id": owner_id}
+                    doc = dict(lock_doc) if isinstance(lock_doc, dict) else {"job_id": job_id, "owner_id": owner_id}
+                    doc.setdefault("owner_id", owner_id)
+                    return True, doc
                 existing = dict(lock_doc) if isinstance(lock_doc, dict) else {}
-                if explicit_job_id and str(existing.get("job_id") or "").strip() == explicit_job_id:
+                adoptable, adopted_owner = self._can_adopt_existing_lock(
+                    existing,
+                    explicit_job_id=explicit_job_id,
+                    explicit_owner_id=explicit_owner_id,
+                )
+                if adoptable and adopted_owner:
+                    existing["owner_id"] = adopted_owner
                     return True, existing
                 return False, existing
 
@@ -368,9 +459,20 @@ class SnowballOrchestrator:
             if isinstance(active_lock, dict):
                 lock_status = str(active_lock.get("status") or "").upper()
                 lock_job_id = str(active_lock.get("job_id") or "").strip()
-                if lock_status in _ACTIVE_LOCK_STATUSES and lock_job_id:
-                    if explicit_job_id and lock_job_id == explicit_job_id:
-                        return True, dict(active_lock)
+                if (
+                    lock_status in _ACTIVE_LOCK_STATUSES
+                    and lock_job_id
+                    and not self._is_lock_expired(active_lock, now_utc=now_utc)
+                ):
+                    adoptable, adopted_owner = self._can_adopt_existing_lock(
+                        active_lock,
+                        explicit_job_id=explicit_job_id,
+                        explicit_owner_id=explicit_owner_id,
+                    )
+                    if adoptable and adopted_owner:
+                        adopted = dict(active_lock)
+                        adopted["owner_id"] = adopted_owner
+                        return True, adopted
                     return False, dict(active_lock)
             lock_doc = {
                 "job_id": job_id,
@@ -534,6 +636,7 @@ class SnowballOrchestrator:
         force_refresh: bool = False,
         freshness_ttl_hours: float = 24.0,
         job_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Serve fresh person card from R2 or orchestrate on-demand acquisition."""
         if not isinstance(person, str) or not person.strip():
@@ -542,6 +645,9 @@ class SnowballOrchestrator:
         q_clean = person.strip()
         explicit_job_id = (
             job_id.strip() if isinstance(job_id, str) and job_id.strip() else None
+        )
+        explicit_owner_id = (
+            owner_id.strip() if isinstance(owner_id, str) and owner_id.strip() else None
         )
         now = self._now_utc()
 
@@ -574,6 +680,14 @@ class SnowballOrchestrator:
                     raise ValueError("CACHED_CARD_SHA256_MISMATCH")
                 if explicit_job_id:
                     done_iso = _iso_utc(now)
+                    release_owner = explicit_owner_id
+                    if release_owner is None:
+                        cur_lock = self.state_store.find_active_job_for_person(q_clean, season)
+                        if (
+                            isinstance(cur_lock, dict)
+                            and str(cur_lock.get("job_id") or "").strip() == explicit_job_id
+                        ):
+                            release_owner = str(cur_lock.get("owner_id") or "").strip() or None
                     self.state_store.put_job(
                         explicit_job_id,
                         {
@@ -589,7 +703,7 @@ class SnowballOrchestrator:
                     self._release_lock(
                         season=season,
                         person=q_clean,
-                        owner_id=None,
+                        owner_id=release_owner,
                         job_id=explicit_job_id,
                     )
                 return {
@@ -612,6 +726,14 @@ class SnowballOrchestrator:
             )
             if active_nr is not None:
                 if explicit_job_id:
+                    release_owner = explicit_owner_id
+                    if release_owner is None:
+                        cur_lock = self.state_store.find_active_job_for_person(q_clean, season)
+                        if (
+                            isinstance(cur_lock, dict)
+                            and str(cur_lock.get("job_id") or "").strip() == explicit_job_id
+                        ):
+                            release_owner = str(cur_lock.get("owner_id") or "").strip() or None
                     self.state_store.put_job(
                         explicit_job_id,
                         {
@@ -626,7 +748,7 @@ class SnowballOrchestrator:
                     self._release_lock(
                         season=season,
                         person=q_clean,
-                        owner_id=None,
+                        owner_id=release_owner,
                         job_id=explicit_job_id,
                     )
                 return {
@@ -646,7 +768,11 @@ class SnowballOrchestrator:
             if isinstance(active_lock, dict):
                 lock_status = str(active_lock.get("status") or "").upper()
                 lock_job_id = str(active_lock.get("job_id") or "").strip()
-                if lock_status in _ACTIVE_LOCK_STATUSES and lock_job_id:
+                if (
+                    lock_status in _ACTIVE_LOCK_STATUSES
+                    and lock_job_id
+                    and not self._is_lock_expired(active_lock, now_utc=now)
+                ):
                     return {
                         "status": "ACQUIRING_IN_CLOUD",
                         "job_id": lock_job_id,
@@ -664,7 +790,7 @@ class SnowballOrchestrator:
             }
 
         resolved_job_id = explicit_job_id or f"job_{uuid.uuid4().hex[:12]}"
-        owner_id = uuid.uuid4().hex
+        effective_owner_id = explicit_owner_id or uuid.uuid4().hex
         now_iso = _iso_utc(now)
 
         acquired, lock_doc = self._try_acquire_lock(
@@ -672,7 +798,9 @@ class SnowballOrchestrator:
             person=q_clean,
             job_id=resolved_job_id,
             explicit_job_id=explicit_job_id,
-            owner_id=owner_id,
+            owner_id=effective_owner_id,
+            explicit_owner_id=explicit_owner_id,
+            now_utc=now,
             now_iso=now_iso,
             force_refresh=force_refresh,
         )
@@ -688,7 +816,7 @@ class SnowballOrchestrator:
                 "next_action": "call check_acquisition_job",
             }
 
-        lock_owner_id: Optional[str] = lock_doc.get("owner_id") or owner_id
+        lock_owner_id: Optional[str] = str(lock_doc.get("owner_id") or "").strip() or effective_owner_id
         job_doc: Dict[str, Any] = {
             "job_id": resolved_job_id,
             "owner_id": lock_owner_id,
