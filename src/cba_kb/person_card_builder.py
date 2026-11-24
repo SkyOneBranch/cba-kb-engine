@@ -232,6 +232,7 @@ def _build_candidate_pool(
     """Build unified person candidate skeletons without merging distinct identities."""
     candidates: List[Dict[str, Any]] = []
     by_uid: Dict[str, Dict[str, Any]] = {}
+    by_pid: Dict[str, Dict[str, Any]] = {}
 
     # 1. Seed from identity_registry
     reg = identity_registry if isinstance(identity_registry, dict) else {}
@@ -295,6 +296,8 @@ def _build_candidate_pool(
         candidates.append(entry)
         if uid:
             by_uid[uid] = entry
+        if pid:
+            by_pid.setdefault(pid, entry)
 
     def _candidate_clubs_norm(c: Dict[str, Any]) -> set[str]:
         clubs = {_norm_key(c.get("current_club"))}
@@ -313,18 +316,19 @@ def _build_candidate_pool(
         *,
         former_club_norm: str = "",
     ) -> bool:
+        # Fail closed when either side lacks club evidence: missing club is never compatibility proof.
         if not row_clubs_norm:
-            return True
+            return False
         c_clubs = _candidate_clubs_norm(c)
         if not c_clubs:
-            return True
+            return False
         if c_clubs & row_clubs_norm:
             return True
         if former_club_norm and former_club_norm in c_clubs:
             return True
         return False
 
-    # 2. Enrich or add from domestic MASTER rows (fail-closed on club conflict)
+    # 2. Enrich or add from domestic MASTER rows (fail-closed on missing/conflicting club or unknown explicit ID)
     by_name_domestic: Dict[str, List[Dict[str, Any]]] = {}
     for c in candidates:
         nk = _norm_key(c["player_name"])
@@ -347,14 +351,60 @@ def _build_candidate_pool(
         nk = _norm_key(pname)
 
         target: Optional[Dict[str, Any]] = None
-        # Explicit stable identifier binding takes precedence
+        # Explicit stable identifier binding takes precedence and NEVER falls back to name merge
         row_uid = str(row.get("player_uid") or "").strip()
+        row_pid = str(row.get("provider_player_id") or row.get("player_id") or "").strip()
         if not row_uid:
             rk = str(row.get("record_key") or "").strip()
             if rk and rk in trusted_record_links:
                 row_uid = trusted_record_links[rk]
-        if row_uid and row_uid in by_uid:
-            target = by_uid[row_uid]
+
+        if row_uid:
+            if row_uid in by_uid:
+                target = by_uid[row_uid]
+            else:
+                new_c = {
+                    "player_uid": row_uid,
+                    "player_id": row_pid or None,
+                    "player_name": pname,
+                    "player_name_en": None,
+                    "aliases": [],
+                    "current_club": club or None,
+                    "clubs_history": [club] if club else [],
+                    "registration_type": "DOMESTIC",
+                    "jersey_number": None,
+                    "position": None,
+                    "domestic_records": [],
+                    "foreign_records": [],
+                }
+                candidates.append(new_c)
+                by_uid[row_uid] = new_c
+                if row_pid:
+                    by_pid.setdefault(row_pid, new_c)
+                by_name_domestic.setdefault(nk, []).append(new_c)
+                target = new_c
+        elif row_pid:
+            if row_pid in by_pid:
+                target = by_pid[row_pid]
+            else:
+                new_c = {
+                    "player_uid": None,
+                    "player_id": row_pid,
+                    "player_name": pname,
+                    "player_name_en": None,
+                    "aliases": [],
+                    "current_club": club or None,
+                    "clubs_history": [club] if club else [],
+                    "registration_type": "DOMESTIC",
+                    "jersey_number": None,
+                    "position": None,
+                    "domestic_records": [],
+                    "foreign_records": [],
+                }
+                candidates.append(new_c)
+                by_pid[row_pid] = new_c
+                by_name_domestic.setdefault(nk, []).append(new_c)
+                target = new_c
         else:
             existing = by_name_domestic.get(nk, [])
             compatible = [
@@ -365,10 +415,10 @@ def _build_candidate_pool(
                 target = compatible[0]
 
         if target is None:
-            # Never auto-merge across conflicting clubs or ambiguous candidates
+            # Never auto-merge across missing/conflicting clubs or ambiguous candidates
             key = (nk, _norm_key(club))
-            if key not in unmatched_master_by_name_club:
-                new_c: Dict[str, Any] = {
+            if not club or key not in unmatched_master_by_name_club:
+                new_c = {
                     "player_uid": None,
                     "player_id": None,
                     "player_name": pname,
@@ -382,10 +432,13 @@ def _build_candidate_pool(
                     "domestic_records": [],
                     "foreign_records": [],
                 }
-                unmatched_master_by_name_club[key] = new_c
+                if club:
+                    unmatched_master_by_name_club[key] = new_c
                 candidates.append(new_c)
                 by_name_domestic.setdefault(nk, []).append(new_c)
-            target = unmatched_master_by_name_club[key]
+                target = new_c
+            else:
+                target = unmatched_master_by_name_club[key]
 
         target["domestic_records"].append(dict(row))
         if not target.get("registration_type"):
@@ -395,7 +448,7 @@ def _build_candidate_pool(
                 target["clubs_history"].append(club)
             target["current_club"] = club
 
-    # 3. Enrich or add from foreign registration rows (fail-closed on club conflict)
+    # 3. Enrich or add from foreign registration rows (fail-closed on missing/conflicting club or unknown explicit ID)
     unmatched_foreign_by_key: Dict[tuple[str, str, str], Dict[str, Any]] = {}
     for row in foreign_rows or ():
         if not isinstance(row, dict):
@@ -411,8 +464,51 @@ def _build_candidate_pool(
 
         target = None
         row_uid = str(row.get("player_uid") or "").strip()
-        if row_uid and row_uid in by_uid:
-            target = by_uid[row_uid]
+        row_pid = str(row.get("provider_player_id") or row.get("player_id") or "").strip()
+        if row_uid:
+            if row_uid in by_uid:
+                target = by_uid[row_uid]
+            else:
+                new_f = {
+                    "player_uid": row_uid,
+                    "player_id": row_pid or None,
+                    "player_name": p_zh or p_en,
+                    "player_name_en": p_en or None,
+                    "aliases": [p_en] if p_en and p_zh else [],
+                    "current_club": club or None,
+                    "clubs_history": [club] if club else [],
+                    "registration_type": "FOREIGN",
+                    "jersey_number": jersey,
+                    "position": pos,
+                    "domestic_records": [],
+                    "foreign_records": [],
+                }
+                candidates.append(new_f)
+                by_uid[row_uid] = new_f
+                if row_pid:
+                    by_pid.setdefault(row_pid, new_f)
+                target = new_f
+        elif row_pid:
+            if row_pid in by_pid:
+                target = by_pid[row_pid]
+            else:
+                new_f = {
+                    "player_uid": None,
+                    "player_id": row_pid,
+                    "player_name": p_zh or p_en,
+                    "player_name_en": p_en or None,
+                    "aliases": [p_en] if p_en and p_zh else [],
+                    "current_club": club or None,
+                    "clubs_history": [club] if club else [],
+                    "registration_type": "FOREIGN",
+                    "jersey_number": jersey,
+                    "position": pos,
+                    "domestic_records": [],
+                    "foreign_records": [],
+                }
+                candidates.append(new_f)
+                by_pid[row_pid] = new_f
+                target = new_f
         else:
             matched_c: List[Dict[str, Any]] = []
             for c in candidates:
@@ -430,8 +526,8 @@ def _build_candidate_pool(
 
         if target is None:
             fkey = (_norm_key(p_zh), _norm_key(p_en), _norm_key(club))
-            if fkey not in unmatched_foreign_by_key:
-                new_f: Dict[str, Any] = {
+            if not club or fkey not in unmatched_foreign_by_key:
+                new_f = {
                     "player_uid": None,
                     "player_id": None,
                     "player_name": p_zh or p_en,
@@ -445,9 +541,12 @@ def _build_candidate_pool(
                     "domestic_records": [],
                     "foreign_records": [],
                 }
-                unmatched_foreign_by_key[fkey] = new_f
+                if club:
+                    unmatched_foreign_by_key[fkey] = new_f
                 candidates.append(new_f)
-            target = unmatched_foreign_by_key[fkey]
+                target = new_f
+            else:
+                target = unmatched_foreign_by_key[fkey]
 
         target["foreign_records"].append(dict(row))
         target["registration_type"] = "FOREIGN"
