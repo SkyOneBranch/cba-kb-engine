@@ -147,7 +147,50 @@ Deliver Step 2 of `North Star v3.1` (**Plan B: 100% Pure-Cloud Serverless On-Dem
   - `enable_on_demand_cards_v230`: `True`
   - `incremental_delta_only`: `True`
   - `archive_format`: `"bundle_v1"`
-- `_build_instance_consumer_targets(...)` reads `coverage_ledger.json` and `on_demand_cards_manifest.json` (when `enable_on_demand_cards_v230` is True), verifies `card_sha256` fail-closed (`ProjectionError("ON_DEMAND_CARD_SHA256_MISMATCH")`), scrubs raw Drive IDs, and promotes cards into `20_data` via `O(Δ)` `bundle_v1`.
+- `_build_instance_consumer_targets(...)` reads `coverage_ledger.json` and `on_demand_cards_manifest.json` (when `enable_on_demand_cards_v230` is True), rejects symlinks and parent/path escapes across `data_root`, `on_demand_dir`, `on_demand_cards_manifest.json`, and every card file (with `O_NOFOLLOW` open-time enforcement), verifies `card_sha256` fail-closed (`ProjectionError("ON_DEMAND_CARD_SHA256_MISMATCH")`), scrubs raw Drive IDs, and promotes cards into `20_data` via `O(Δ)` `bundle_v1`.
+
+---
+
+### 3.6 P0-6: Stage D Pure-Cloud Deployment, `v2.3.0-1` Cutover & 20-Question Closed-Loop Acceptance (`AC-230-P0-6`, Deferred Post-Merge / Post-GO)
+
+#### Explicit Deferral Boundary
+- **Stage A–C Scope Boundary**: PR merge into `main` and Engine Release `v2.3.0` verify `P0-1` through `P0-5` strictly offline/clean-room (`0` real Google Drive `Drive A` mutations, `0` real Cloudflare R2 / Worker / GitHub Actions production mutations). Merging the Stage A–C PR **does NOT** claim that `P0-6` has been executed or verified in live cloud/production.
+- **Stage D Trigger**: `P0-6` executes **exclusively after**:
+  1. PR `#275` is merged to `main` (Human removes `status:hold` after independent Q1+Q2 PASS),
+  2. Engine Release `v2.3.0` is published with annotated tag `v2.3.0`, `RRC` (Release Readiness Check), and `PRV` (Post-Release Verification) receipts bound to the exact merge commit SHA, and
+  3. Human explicitly issues **`Cloud & Production GO`** in the session after verifying the Stage D preflight checklist.
+
+#### Human `Cloud & Production GO` Authorization Protocol & Evidence Binding
+Before any Stage D live cloud or `Drive A` mutation is permitted, the executor MUST present and bind:
+1. **Engine Release Evidence**: Exact `v2.3.0` tag commit SHA, GitHub Release URL, `RRC` receipt, and `PRV` readback receipt.
+2. **Stage A–C Zero-Production-Write Proof**: Explicit confirmation that `Drive A` remained untouched at `v2.2.2-1 / COMPLETE` (`565/565` active assets) and no live R2/Worker state was modified prior to `GO`.
+3. **Minimum Private Secrets Checklist** (stored exclusively in Cloudflare Worker Encrypted Secrets and private `cba-kb-collector` GitHub Actions Secrets — never committed to `cba-kb-engine`):
+   - Private R2 bucket credentials (`CBA_KB_R2_ENDPOINT_URL`, `CBA_KB_R2_BUCKET`, `CBA_KB_R2_ACCESS_KEY_ID`, `CBA_KB_R2_SECRET_ACCESS_KEY`)
+   - Gateway authorization secret (`GATEWAY_AUTH_SECRET` / `SNOWBALL_API_BEARER_TOKEN`)
+   - Private collector dispatch credential (`GITHUB_DISPATCH_REPO`, `GITHUB_DISPATCH_PAT`)
+   - Headless personal Drive OAuth JSON (`CBA_KB_DRIVE_TOKEN_JSON`, personal authorized user only; Service Accounts strictly forbidden)
+   - Dedicated isolated snowball folder ID (`CBA_KB_DRIVE_SNOWBALL_FOLDER_ID` for `25_snowball_按需即时卡/`, verified strictly outside `zones["current"|"history"|"staging"|"evidence"]`)
+4. **Stage D Execution Sequence** (post-`GO` only):
+   - Run `cba-kb cloud-state-push` to initialize sanitized `cloud_instance/` and `coverage_ledger.json` in private R2.
+   - Deploy private Cloudflare Worker edge gateway (`config/cloud_snowball_worker.js`) and private `cba-kb-collector` runner workflow (`config/cloud_snowball_runner.example.yml`).
+   - Execute `v2.3.0-1` `O(Δ)` cutover on `Drive A` (stamping Observation Horizon onto `00_entry/INDEX` and `_CURRENT` surfaces).
+   - Run the frozen 20-question closed-loop acceptance test on the 100% pure-cloud path (zero local Mac daemon dependency) and archive receipts to Notion Slots `07` & `08`.
+
+#### Frozen 20-Question Stage D Acceptance Matrix & Pass/Fail Thresholds
+All 20 questions MUST be executed against the live pure-cloud endpoint (with local machine offline/no local daemon) and recorded with exact timestamps, latencies, `job_id`s, R2 `card_sha256` digests, and `Drive A` sync receipts:
+
+| Category | Question IDs | Test Scenario | Concrete Pass Criteria |
+| --- | --- | --- | --- |
+| **Cat 1: Known / Cached Persons & League Coverage Horizon** | `Q01`–`Q10` (10 questions) | Query pre-existing players in KB + league-wide domestic/foreign/announcement coverage status | - Edge fast-path response `< 1.0s` (`HIT_FRESH` / `/v1/coverage`)<br>- Accurately reports `observed_until` and `COMPLETE` / `PARTIAL` / `STALE` gaps<br>- Zero exaggerated completeness wording when any domain is non-`COMPLETE`<br>- Official confirmed facts `FAIL = 0` |
+| **Cat 2: Uncached Active / Foreign Players (First-Ask Acquire + Second-Ask Hit)** | `Q11`–`Q15` (5 questions) | Ask about active domestic / new foreign players not yet carded in KB, then immediately re-ask the same player a 2nd time | - 1st ask triggers private cloud runner (`COL v0.6.0` whitelist + recent single-game stats -> R2 -> `build-person-card` -> R2 `cards/` + `Drive A` `25_snowball_按需即时卡/`)<br>- Returns full `card_markdown` directly in dialog (via 28s bounded wait or 1 `check_acquisition_job` follow-up, `0` HTTP `504` timeouts)<br>- Immediate 2nd ask hits R2 `HIT_FRESH` in `< 1.0s` (`network_called == false`) |
+| **Cat 3: Homonym Disambiguation** | `Q16`–`Q17` (2 questions) | Ambiguous homonym player queries | - Returns `status == "UNDECIDED"` with structured `candidates` list<br>- Never auto-merges profiles and never triggers blind external fetch |
+| **Cat 4: Whitelist-Absent Adversarial Queries & Negative-Receipt Cache** | `Q18`–`Q20` (3 questions) | Non-existent / unannounced players not present on official whitelist sources, followed by immediate re-query within 24h | - 1st ask returns `UNKNOWN_AFTER_WHITELIST_CHECK` (no fabricated stats/facts, no non-whitelist scraping) and persists `cba-kb.negative-receipt.v1` (24h TTL)<br>- Immediate re-query returns `UNKNOWN_NEGATIVE_CACHED` with `0` outbound network calls |
+
+#### Stage D Overall Release Gate Thresholds (All Mandatory)
+- **Official Confirmed Facts**: `FAIL == 0` (zero hallucinations, zero fabricated numbers, `Statement != Fact. Evidence != Fact. Unknown != 0.`).
+- **Honest Abstention Rate (HAR)**: `HAR >= 80%` across all unanswerable / out-of-scope / missing-coverage prompts.
+- **Production `Drive A` Integrity**: `v2.3.0-1` `release_status.json == COMPLETE`, `109/109` protected tables zero drift, `G1 == 0` (zero `UNEXPECTED_LIVE_OBJECT` in `20_data`), `25_snowball_按需即时卡/` strictly isolated from `zones["current"]`.
+- **Clean-Room & Security**: `G5 == 0`, `G6 == 0`, unauthorized gateway requests return `401` Fail-Closed.
 
 ---
 

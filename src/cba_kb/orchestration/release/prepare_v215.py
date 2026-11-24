@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import errno
 import io
 import json
+import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 
@@ -1504,6 +1507,43 @@ def _load_operational_bundle_records(instance, checkpoint: dict) -> list[dict]:
     return records
 
 
+def _assert_no_symlink_components(base_dir: Path, target_path: Path, *, label: str) -> None:
+    """Fail closed if base_dir, any intermediate component, or target_path is a symlink or escapes base_dir."""
+    if base_dir.is_symlink():
+        raise ProjectionError(f"ON_DEMAND_CARD_SYMLINK_OR_PATH_ESCAPE:{label}")
+    try:
+        rel = target_path.relative_to(base_dir)
+    except ValueError as exc:
+        raise ProjectionError(f"ON_DEMAND_CARD_SYMLINK_OR_PATH_ESCAPE:{label}") from exc
+    cur = base_dir
+    for part in rel.parts:
+        cur = cur / part
+        if cur.is_symlink():
+            raise ProjectionError(f"ON_DEMAND_CARD_SYMLINK_OR_PATH_ESCAPE:{label}")
+    if not target_path.resolve().is_relative_to(base_dir.resolve()):
+        raise ProjectionError(f"ON_DEMAND_CARD_SYMLINK_OR_PATH_ESCAPE:{label}")
+
+
+def _read_bytes_nofollow(path: Path, *, label: str) -> bytes:
+    """Read a regular file without following symlinks (O_NOFOLLOW)."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(path), flags)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EPERM, errno.EACCES):
+            raise ProjectionError(f"ON_DEMAND_CARD_SYMLINK_OR_PATH_ESCAPE:{label}") from exc
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ProjectionError(f"ON_DEMAND_CARD_SYMLINK_OR_PATH_ESCAPE:{label}")
+    except Exception:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "rb") as fh:
+        return fh.read()
+
+
 def _load_instance_observation_horizon(instance, release_spec: dict):
     """Load and evaluate coverage_ledger.json when v2.3.0 observation horizon is enabled."""
     if not release_spec.get("enable_observation_horizon_v230"):
@@ -1615,55 +1655,68 @@ def _build_instance_consumer_targets(
                 promoted_research[k] = v
 
     if release_spec.get("enable_on_demand_cards_v230"):
-        on_demand_dir = instance.data_root / "on_demand_cards"
-        od_manifest_path = on_demand_dir / "on_demand_cards_manifest.json"
-        if od_manifest_path.is_file():
-            try:
-                od_manifest = json.loads(od_manifest_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as exc:
-                raise ProjectionError(f"ON_DEMAND_CARDS_MANIFEST_INVALID:{exc}") from exc
-            if not isinstance(od_manifest, dict) or not isinstance(od_manifest.get("cards"), dict):
-                raise ProjectionError("ON_DEMAND_CARDS_MANIFEST_INVALID")
-            for card_key, card_entry in sorted(od_manifest["cards"].items()):
-                if not isinstance(card_entry, dict):
-                    raise ProjectionError(f"ON_DEMAND_CARD_ENTRY_INVALID:{card_key}")
-                filename = card_entry.get("filename")
-                if (
-                    not isinstance(filename, str)
-                    or not filename.strip()
-                    or "/" in filename
-                    or "\\" in filename
-                    or ".." in filename
-                ):
-                    raise ProjectionError(f"ON_DEMAND_CARD_FILENAME_INVALID:{card_key}")
-                filename = filename.strip()
-                card_path = on_demand_dir / filename
-                if (
-                    card_path.is_symlink()
-                    or not card_path.resolve().is_relative_to(on_demand_dir.resolve())
-                ):
-                    raise ProjectionError(f"ON_DEMAND_CARD_FILENAME_INVALID:{card_key}")
-                if not card_path.is_file():
-                    raise ProjectionError(f"ON_DEMAND_CARD_FILE_MISSING:{card_key}")
-                raw_card_bytes = card_path.read_bytes()
-                expected_sha = card_entry.get("card_sha256")
-                actual_sha = digest(raw_card_bytes)
-                if not isinstance(expected_sha, str) or actual_sha != expected_sha:
-                    raise ProjectionError(f"ON_DEMAND_CARD_SHA256_MISMATCH:{card_key}")
-                scrubbed_card_bytes = scrub_raw_drive_ids_for_consumer(
-                    raw_card_bytes.decode("utf-8")
-                ).encode("utf-8")
-                slug_src = f"{card_key}_{card_entry.get('season') or ''}"
-                slug = re.sub(r"[^A-Za-z0-9_]+", "_", slug_src).strip("_").lower() or "card"
-                logical_key = f"research/on_demand_{slug}"
-                promoted_research[logical_key] = {
-                    "name": filename,
-                    "mime": "text/markdown",
-                    "mode": "binary",
-                    "parent_role": "data",
-                    "publish_parent": data_parent,
-                    "content": scrubbed_card_bytes,
-                }
+        data_root = Path(instance.data_root)
+        if data_root.is_symlink():
+            raise ProjectionError("ON_DEMAND_CARD_SYMLINK_OR_PATH_ESCAPE:data_root")
+        on_demand_dir = data_root / "on_demand_cards"
+        if on_demand_dir.exists() or on_demand_dir.is_symlink():
+            _assert_no_symlink_components(data_root, on_demand_dir, label="on_demand_cards")
+            od_manifest_path = on_demand_dir / "on_demand_cards_manifest.json"
+            if od_manifest_path.exists() or od_manifest_path.is_symlink():
+                _assert_no_symlink_components(
+                    data_root, od_manifest_path, label="on_demand_cards_manifest.json"
+                )
+                _assert_no_symlink_components(
+                    on_demand_dir, od_manifest_path, label="on_demand_cards_manifest.json"
+                )
+                try:
+                    raw_manifest_bytes = _read_bytes_nofollow(
+                        od_manifest_path, label="on_demand_cards_manifest.json"
+                    )
+                    od_manifest = json.loads(raw_manifest_bytes.decode("utf-8"))
+                except ProjectionError:
+                    raise
+                except (OSError, ValueError) as exc:
+                    raise ProjectionError(f"ON_DEMAND_CARDS_MANIFEST_INVALID:{exc}") from exc
+                if not isinstance(od_manifest, dict) or not isinstance(od_manifest.get("cards"), dict):
+                    raise ProjectionError("ON_DEMAND_CARDS_MANIFEST_INVALID")
+                for card_key, card_entry in sorted(od_manifest["cards"].items()):
+                    if not isinstance(card_entry, dict):
+                        raise ProjectionError(f"ON_DEMAND_CARD_ENTRY_INVALID:{card_key}")
+                    filename = card_entry.get("filename")
+                    if (
+                        not isinstance(filename, str)
+                        or not filename.strip()
+                        or "/" in filename
+                        or "\\" in filename
+                        or ".." in filename
+                    ):
+                        raise ProjectionError(f"ON_DEMAND_CARD_FILENAME_INVALID:{card_key}")
+                    filename = filename.strip()
+                    card_path = on_demand_dir / filename
+                    _assert_no_symlink_components(data_root, card_path, label=str(card_key))
+                    _assert_no_symlink_components(on_demand_dir, card_path, label=str(card_key))
+                    if not card_path.is_file():
+                        raise ProjectionError(f"ON_DEMAND_CARD_FILE_MISSING:{card_key}")
+                    raw_card_bytes = _read_bytes_nofollow(card_path, label=str(card_key))
+                    expected_sha = card_entry.get("card_sha256")
+                    actual_sha = digest(raw_card_bytes)
+                    if not isinstance(expected_sha, str) or actual_sha != expected_sha:
+                        raise ProjectionError(f"ON_DEMAND_CARD_SHA256_MISMATCH:{card_key}")
+                    scrubbed_card_bytes = scrub_raw_drive_ids_for_consumer(
+                        raw_card_bytes.decode("utf-8")
+                    ).encode("utf-8")
+                    slug_src = f"{card_key}_{card_entry.get('season') or ''}"
+                    slug = re.sub(r"[^A-Za-z0-9_]+", "_", slug_src).strip("_").lower() or "card"
+                    logical_key = f"research/on_demand_{slug}"
+                    promoted_research[logical_key] = {
+                        "name": filename,
+                        "mime": "text/markdown",
+                        "mode": "binary",
+                        "parent_role": "data",
+                        "publish_parent": data_parent,
+                        "content": scrubbed_card_bytes,
+                    }
 
     targets = build_consumer_surface_targets_spec(
         release_id=release_id,

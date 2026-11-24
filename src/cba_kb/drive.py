@@ -502,6 +502,124 @@ class Drive:
             supportsAllDrives=True,
         ).execute(num_retries=0)
 
+    def get_parents(self, file_id):
+        """Return parent folder IDs for a Drive file or folder."""
+        meta = self.meta(file_id)
+        if not isinstance(meta, Mapping):
+            raise RuntimeError(f'DRIVE_PARENTS_UNAVAILABLE:{file_id}')
+        parents = meta.get('parents')
+        if parents is None:
+            return []
+        if not isinstance(parents, list):
+            raise RuntimeError(f'DRIVE_PARENTS_INVALID:{file_id}')
+        return [str(p).strip() for p in parents if isinstance(p, str) and p.strip()]
+
+
+_MAX_ANCESTOR_WALK_DEPTH = 64
+
+
+def _normalize_parent_ids(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        val = raw.strip()
+        return [val] if val else []
+    if isinstance(raw, (list, tuple, set)):
+        return [str(item).strip() for item in raw if isinstance(item, str) and item.strip()]
+    raise ValueError('DRIVE_PARENTS_INVALID')
+
+
+def _resolve_folder_parents(drive: Any, folder_id: str) -> list[str]:
+    """Resolve direct parent folder IDs for real Drive or fake Drive instances.
+
+    For real Drive (or objects exposing ``_svc``/``api``/``get_parents``/``get_file_metadata``/``meta``),
+    any lookup failure fails closed with ``SNOWBALL_FOLDER_IN_PROTECTED_ZONE``.
+    For minimal in-memory fakes that do not track folder hierarchy, returns ``[]``.
+    """
+    get_parents_fn = getattr(drive, 'get_parents', None)
+    if callable(get_parents_fn):
+        try:
+            return _normalize_parent_ids(get_parents_fn(folder_id))
+        except Exception as exc:
+            raise ValueError(
+                f'SNOWBALL_FOLDER_IN_PROTECTED_ZONE:ancestor_lookup_failed:{folder_id}'
+            ) from exc
+
+    get_meta_fn = getattr(drive, 'get_file_metadata', None)
+    if callable(get_meta_fn):
+        try:
+            meta = get_meta_fn(folder_id)
+            return _normalize_parent_ids(meta.get('parents') if isinstance(meta, Mapping) else None)
+        except Exception as exc:
+            raise ValueError(
+                f'SNOWBALL_FOLDER_IN_PROTECTED_ZONE:ancestor_lookup_failed:{folder_id}'
+            ) from exc
+
+    meta_fn = getattr(drive, 'meta', None)
+    if callable(meta_fn):
+        try:
+            meta = meta_fn(folder_id)
+            return _normalize_parent_ids(meta.get('parents') if isinstance(meta, Mapping) else None)
+        except Exception as exc:
+            raise ValueError(
+                f'SNOWBALL_FOLDER_IN_PROTECTED_ZONE:ancestor_lookup_failed:{folder_id}'
+            ) from exc
+
+    for mapping_attr in ('folder_parents', 'parents_by_id'):
+        mapping = getattr(drive, mapping_attr, None)
+        if isinstance(mapping, Mapping):
+            return _normalize_parent_ids(mapping.get(folder_id))
+
+    svc = getattr(drive, '_svc', None) or getattr(drive, 'api', None)
+    if svc is not None or isinstance(drive, Drive):
+        if svc is None:
+            raise ValueError(
+                f'SNOWBALL_FOLDER_IN_PROTECTED_ZONE:ancestor_lookup_unavailable:{folder_id}'
+            )
+        try:
+            resp = svc.files().get(
+                fileId=folder_id,
+                fields='id,parents',
+                supportsAllDrives=True,
+            ).execute()
+            return _normalize_parent_ids(resp.get('parents') if isinstance(resp, Mapping) else None)
+        except Exception as exc:
+            raise ValueError(
+                f'SNOWBALL_FOLDER_IN_PROTECTED_ZONE:ancestor_lookup_failed:{folder_id}'
+            ) from exc
+
+    files_map = getattr(drive, 'files', None)
+    if isinstance(files_map, Mapping) and folder_id in files_map:
+        entry = files_map[folder_id]
+        if isinstance(entry, Mapping):
+            return _normalize_parent_ids(entry.get('parents'))
+
+    return []
+
+
+def _assert_folder_not_in_protected_zone(
+    drive: Any,
+    target_folder_id: str,
+    protected_ids: set[str],
+) -> None:
+    if not protected_ids:
+        return
+    if target_folder_id in protected_ids:
+        raise ValueError('SNOWBALL_FOLDER_IN_PROTECTED_ZONE')
+
+    visited: set[str] = {target_folder_id}
+    queue: list[tuple[str, int]] = [(target_folder_id, 0)]
+    while queue:
+        current_id, depth = queue.pop(0)
+        if depth >= _MAX_ANCESTOR_WALK_DEPTH:
+            raise ValueError('SNOWBALL_FOLDER_IN_PROTECTED_ZONE:max_ancestor_depth_exceeded')
+        for parent_id in _resolve_folder_parents(drive, current_id):
+            if parent_id in protected_ids:
+                raise ValueError(f'SNOWBALL_FOLDER_IN_PROTECTED_ZONE:ancestor={parent_id}')
+            if parent_id not in visited:
+                visited.add(parent_id)
+                queue.append((parent_id, depth + 1))
+
 
 def _collect_protected_folder_ids(
     forbidden_folder_ids: Sequence[str] = (),
@@ -562,8 +680,7 @@ def upsert_snowball_card_to_drive(
         forbidden_folder_ids=forbidden_folder_ids,
         production_policy=production_policy,
     )
-    if target_folder_id in protected_ids:
-        raise ValueError('SNOWBALL_FOLDER_IN_PROTECTED_ZONE')
+    _assert_folder_not_in_protected_zone(drive, target_folder_id, protected_ids)
 
     from .current_state import clean
     clean(payload, clean_filename)

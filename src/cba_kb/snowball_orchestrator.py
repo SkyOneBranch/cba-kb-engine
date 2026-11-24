@@ -20,12 +20,15 @@ import abc
 import hashlib
 import json
 import subprocess
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import requests
 
+from .instance import Instance
 from .person_card_builder import (
     _find_active_negative_receipt,
     build_person_card,
@@ -88,12 +91,23 @@ class LocalCliAcquisitionBackend(AcquisitionBackend):
         *,
         collector_cmd: Optional[Sequence[str]] = None,
         instance: Optional[Any] = None,
+        instance_root: Optional[Any] = None,
         local_resolver_inputs: Optional[Mapping[str, Any]] = None,
         whitelist_sources: Sequence[str] = ("local_kb",),
         timeout_seconds: float = 300.0,
     ) -> None:
         self.collector_cmd = tuple(collector_cmd) if collector_cmd else None
+        if instance is None and instance_root is not None:
+            root = Path(instance_root).expanduser().resolve()
+            instance = Instance(
+                root=root,
+                config_root=(root / "config").resolve(),
+                credentials_store=(root / ".credentials").resolve(),
+                real_fixture_root=(root / "fixtures" / "real").resolve(),
+                data_root=(root / "data").resolve(),
+            )
         self.instance = instance
+        self.instance_root = Path(instance_root).expanduser().resolve() if instance_root is not None else None
         self.local_resolver_inputs = dict(local_resolver_inputs or {})
         self.whitelist_sources = tuple(whitelist_sources)
         self.timeout_seconds = float(timeout_seconds)
@@ -299,9 +313,96 @@ class SnowballOrchestrator:
         self.default_negative_ttl_hours = float(default_negative_ttl_hours)
         self.stale_after_hours = float(stale_after_hours)
         self.now_fn = now_fn
+        self._inflight_locks_guard = threading.Lock()
+        self._inflight_locks: Dict[Tuple[str, str], threading.Lock] = {}
 
     def _now_utc(self) -> datetime:
         return _utc_now(self.now_fn)
+
+    def _person_mutex(self, season: str, person: str) -> threading.Lock:
+        key = (season.strip(), person.strip().casefold())
+        with self._inflight_locks_guard:
+            lock = self._inflight_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._inflight_locks[key] = lock
+            return lock
+
+    def _try_acquire_lock(
+        self,
+        *,
+        season: str,
+        person: str,
+        job_id: str,
+        explicit_job_id: Optional[str],
+        owner_id: str,
+        now_iso: str,
+        force_refresh: bool,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        extra: Dict[str, Any] = {
+            "person": person,
+            "season": season,
+            "force_refresh": bool(force_refresh),
+            "created_at_utc": now_iso,
+            "updated_at_utc": now_iso,
+        }
+        with self._person_mutex(season, person):
+            acquire_fn = getattr(self.state_store, "acquire_active_job_lock", None)
+            if callable(acquire_fn):
+                acquired, lock_doc = acquire_fn(
+                    season,
+                    person,
+                    job_id=job_id,
+                    owner_id=owner_id,
+                    extra=extra,
+                )
+                if acquired:
+                    return True, dict(lock_doc) if isinstance(lock_doc, dict) else {"job_id": job_id, "owner_id": owner_id}
+                existing = dict(lock_doc) if isinstance(lock_doc, dict) else {}
+                if explicit_job_id and str(existing.get("job_id") or "").strip() == explicit_job_id:
+                    return True, existing
+                return False, existing
+
+            # Fallback for custom fake state stores without acquire_active_job_lock
+            active_lock = self.state_store.find_active_job_for_person(person, season)
+            if isinstance(active_lock, dict):
+                lock_status = str(active_lock.get("status") or "").upper()
+                lock_job_id = str(active_lock.get("job_id") or "").strip()
+                if lock_status in _ACTIVE_LOCK_STATUSES and lock_job_id:
+                    if explicit_job_id and lock_job_id == explicit_job_id:
+                        return True, dict(active_lock)
+                    return False, dict(active_lock)
+            lock_doc = {
+                "job_id": job_id,
+                "owner_id": owner_id,
+                "status": "RUNNING",
+                **extra,
+            }
+            self.state_store.set_active_job_lock(person, season, lock_doc)
+            return True, lock_doc
+
+    def _release_lock(
+        self,
+        *,
+        season: str,
+        person: str,
+        owner_id: Optional[str],
+        job_id: str,
+    ) -> None:
+        with self._person_mutex(season, person):
+            release_fn = getattr(self.state_store, "release_active_job_lock", None)
+            if callable(release_fn):
+                release_fn(season, person, owner_id=owner_id, job_id=job_id)
+                return
+            current = self.state_store.find_active_job_for_person(person, season)
+            if isinstance(current, dict):
+                cur_job_id = str(current.get("job_id") or "").strip()
+                cur_owner = current.get("owner_id")
+                if cur_job_id and cur_job_id != job_id:
+                    return
+                if owner_id is not None and cur_owner is not None and cur_owner != owner_id:
+                    return
+            self.state_store.clear_active_job_lock(person, season)
 
     def _resolve_local_candidates(
         self,
@@ -432,12 +533,16 @@ class SnowballOrchestrator:
         season: str = "2026-2027",
         force_refresh: bool = False,
         freshness_ttl_hours: float = 24.0,
+        job_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Serve fresh person card from R2 or orchestrate on-demand acquisition."""
         if not isinstance(person, str) or not person.strip():
             raise ValueError("PERSON_QUERY_REQUIRED")
 
         q_clean = person.strip()
+        explicit_job_id = (
+            job_id.strip() if isinstance(job_id, str) and job_id.strip() else None
+        )
         now = self._now_utc()
 
         # 1. Fail-closed homonym / multi-candidate disambiguation (0 network)
@@ -467,6 +572,26 @@ class SnowballOrchestrator:
                 stored_sha = card.get("card_sha256")
                 if stored_sha and stored_sha != md_sha:
                     raise ValueError("CACHED_CARD_SHA256_MISMATCH")
+                if explicit_job_id:
+                    done_iso = _iso_utc(now)
+                    self.state_store.put_job(
+                        explicit_job_id,
+                        {
+                            "job_id": explicit_job_id,
+                            "status": "COMPLETED",
+                            "person": q_clean,
+                            "season": season,
+                            "filename": card.get("filename"),
+                            "card_sha256": md_sha,
+                            "updated_at_utc": done_iso,
+                        },
+                    )
+                    self._release_lock(
+                        season=season,
+                        person=q_clean,
+                        owner_id=None,
+                        job_id=explicit_job_id,
+                    )
                 return {
                     "status": "HIT_FRESH",
                     "person": q_clean,
@@ -486,6 +611,24 @@ class SnowballOrchestrator:
                 q_clean, season=season, now_utc=now
             )
             if active_nr is not None:
+                if explicit_job_id:
+                    self.state_store.put_job(
+                        explicit_job_id,
+                        {
+                            "job_id": explicit_job_id,
+                            "status": "COMPLETED_UNKNOWN",
+                            "person": q_clean,
+                            "season": season,
+                            "negative_receipt": active_nr,
+                            "updated_at_utc": _iso_utc(now),
+                        },
+                    )
+                    self._release_lock(
+                        season=season,
+                        person=q_clean,
+                        owner_id=None,
+                        job_id=explicit_job_id,
+                    )
                 return {
                     "status": "UNKNOWN_NEGATIVE_CACHED",
                     "person": q_clean,
@@ -497,24 +640,22 @@ class SnowballOrchestrator:
                     "network_called": False,
                 }
 
-        # 4. Concurrency dedup lock: reuse existing in-flight job_id
-        active_lock = self.state_store.find_active_job_for_person(q_clean, season)
-        if isinstance(active_lock, dict):
-            lock_status = str(active_lock.get("status") or "").upper()
-            lock_job_id = str(active_lock.get("job_id") or "").strip()
-            if lock_status in _ACTIVE_LOCK_STATUSES and lock_job_id:
-                return {
-                    "status": "ACQUIRING_IN_CLOUD",
-                    "job_id": lock_job_id,
-                    "person": q_clean,
-                    "season": season,
-                    "deduplicated": True,
-                    "network_called": False,
-                    "next_action": "call check_acquisition_job",
-                }
-
-        # 5. Slow path: dispatch or run acquisition backend
+        # 4. Slow path: check backend availability & acquire atomic dedup lock BEFORE job write / backend call
         if self.acquisition_backend is None:
+            active_lock = self.state_store.find_active_job_for_person(q_clean, season)
+            if isinstance(active_lock, dict):
+                lock_status = str(active_lock.get("status") or "").upper()
+                lock_job_id = str(active_lock.get("job_id") or "").strip()
+                if lock_status in _ACTIVE_LOCK_STATUSES and lock_job_id:
+                    return {
+                        "status": "ACQUIRING_IN_CLOUD",
+                        "job_id": lock_job_id,
+                        "person": q_clean,
+                        "season": season,
+                        "deduplicated": True,
+                        "network_called": False,
+                        "next_action": "call check_acquisition_job",
+                    }
             return {
                 "status": "UNKNOWN_NO_BACKEND",
                 "person": q_clean,
@@ -522,10 +663,35 @@ class SnowballOrchestrator:
                 "network_called": False,
             }
 
-        job_id = f"job_{uuid.uuid4().hex[:12]}"
+        resolved_job_id = explicit_job_id or f"job_{uuid.uuid4().hex[:12]}"
+        owner_id = uuid.uuid4().hex
         now_iso = _iso_utc(now)
+
+        acquired, lock_doc = self._try_acquire_lock(
+            season=season,
+            person=q_clean,
+            job_id=resolved_job_id,
+            explicit_job_id=explicit_job_id,
+            owner_id=owner_id,
+            now_iso=now_iso,
+            force_refresh=force_refresh,
+        )
+        if not acquired:
+            existing_job_id = str(lock_doc.get("job_id") or "").strip()
+            return {
+                "status": "ACQUIRING_IN_CLOUD",
+                "job_id": existing_job_id,
+                "person": q_clean,
+                "season": season,
+                "deduplicated": True,
+                "network_called": False,
+                "next_action": "call check_acquisition_job",
+            }
+
+        lock_owner_id: Optional[str] = lock_doc.get("owner_id") or owner_id
         job_doc: Dict[str, Any] = {
-            "job_id": job_id,
+            "job_id": resolved_job_id,
+            "owner_id": lock_owner_id,
             "status": "RUNNING",
             "person": q_clean,
             "season": season,
@@ -533,19 +699,18 @@ class SnowballOrchestrator:
             "created_at_utc": now_iso,
             "updated_at_utc": now_iso,
         }
-        self.state_store.put_job(job_id, job_doc)
-        self.state_store.set_active_job_lock(q_clean, season, job_doc)
+        self.state_store.put_job(resolved_job_id, job_doc)
 
         try:
             backend_result = self.acquisition_backend.acquire_person(
                 q_clean,
                 season=season,
-                job_id=job_id,
+                job_id=resolved_job_id,
                 force_refresh=force_refresh,
             )
         except Exception as exc:
             self.state_store.put_job(
-                job_id,
+                resolved_job_id,
                 {
                     **job_doc,
                     "status": "FAILED",
@@ -553,11 +718,21 @@ class SnowballOrchestrator:
                     "updated_at_utc": _iso_utc(self._now_utc()),
                 },
             )
-            self.state_store.clear_active_job_lock(q_clean, season)
+            self._release_lock(
+                season=season,
+                person=q_clean,
+                owner_id=lock_owner_id,
+                job_id=resolved_job_id,
+            )
             raise
 
         if not isinstance(backend_result, dict):
-            self.state_store.clear_active_job_lock(q_clean, season)
+            self._release_lock(
+                season=season,
+                person=q_clean,
+                owner_id=lock_owner_id,
+                job_id=resolved_job_id,
+            )
             raise ValueError("ACQUISITION_BACKEND_INVALID_RESULT")
 
         backend_status = str(backend_result.get("status") or "").upper()
@@ -570,12 +745,22 @@ class SnowballOrchestrator:
                 or ""
             )
             if not md:
-                self.state_store.clear_active_job_lock(q_clean, season)
+                self._release_lock(
+                    season=season,
+                    person=q_clean,
+                    owner_id=lock_owner_id,
+                    job_id=resolved_job_id,
+                )
                 raise ValueError("ACQUIRED_CARD_MARKDOWN_EMPTY")
             md_sha = _sha256_text(md)
             provided_sha = backend_result.get("card_sha256")
             if provided_sha and provided_sha != md_sha:
-                self.state_store.clear_active_job_lock(q_clean, season)
+                self._release_lock(
+                    season=season,
+                    person=q_clean,
+                    owner_id=lock_owner_id,
+                    job_id=resolved_job_id,
+                )
                 raise ValueError("ACQUIRED_CARD_SHA256_MISMATCH")
 
             person_meta = (
@@ -625,7 +810,7 @@ class SnowballOrchestrator:
             self.state_store.put_card(season, q_clean, card_record)
 
             self.state_store.put_job(
-                job_id,
+                resolved_job_id,
                 {
                     **job_doc,
                     "status": "COMPLETED",
@@ -635,10 +820,15 @@ class SnowballOrchestrator:
                     "drive_sync": drive_receipt,
                 },
             )
-            self.state_store.clear_active_job_lock(q_clean, season)
+            self._release_lock(
+                season=season,
+                person=q_clean,
+                owner_id=lock_owner_id,
+                job_id=resolved_job_id,
+            )
             return {
                 "status": "ACQUIRED_AND_BUILT",
-                "job_id": job_id,
+                "job_id": resolved_job_id,
                 "person": q_clean,
                 "season": season,
                 "filename": filename,
@@ -665,11 +855,11 @@ class SnowballOrchestrator:
                 "checked_at_utc": done_iso,
                 "ttl_hours": ttl_hours,
                 "whitelist_sources_checked": whitelist_checked,
-                "job_id": job_id,
+                "job_id": resolved_job_id,
             }
             self.state_store.append_negative_receipt(receipt)
             self.state_store.put_job(
-                job_id,
+                resolved_job_id,
                 {
                     **job_doc,
                     "status": "COMPLETED_UNKNOWN",
@@ -677,10 +867,15 @@ class SnowballOrchestrator:
                     "negative_receipt": receipt,
                 },
             )
-            self.state_store.clear_active_job_lock(q_clean, season)
+            self._release_lock(
+                season=season,
+                person=q_clean,
+                owner_id=lock_owner_id,
+                job_id=resolved_job_id,
+            )
             return {
                 "status": "UNKNOWN_AFTER_WHITELIST_CHECK",
-                "job_id": job_id,
+                "job_id": resolved_job_id,
                 "person": q_clean,
                 "season": season,
                 "negative_receipt": receipt,
@@ -691,7 +886,7 @@ class SnowballOrchestrator:
         if backend_status == "UNDECIDED":
             candidates = list(backend_result.get("candidates") or [])
             self.state_store.put_job(
-                job_id,
+                resolved_job_id,
                 {
                     **job_doc,
                     "status": "UNDECIDED",
@@ -699,10 +894,15 @@ class SnowballOrchestrator:
                     "candidates": candidates,
                 },
             )
-            self.state_store.clear_active_job_lock(q_clean, season)
+            self._release_lock(
+                season=season,
+                person=q_clean,
+                owner_id=lock_owner_id,
+                job_id=resolved_job_id,
+            )
             return {
                 "status": "UNDECIDED",
-                "job_id": job_id,
+                "job_id": resolved_job_id,
                 "person": q_clean,
                 "season": season,
                 "candidates": candidates,
@@ -711,8 +911,8 @@ class SnowballOrchestrator:
             }
 
         if backend_status == "ACQUIRING_IN_CLOUD":
-            returned_job_id = str(backend_result.get("job_id") or job_id).strip() or job_id
-            if returned_job_id != job_id:
+            returned_job_id = str(backend_result.get("job_id") or resolved_job_id).strip() or resolved_job_id
+            if returned_job_id != resolved_job_id:
                 async_doc = {
                     **job_doc,
                     "job_id": returned_job_id,
@@ -734,17 +934,22 @@ class SnowballOrchestrator:
 
         # Fallback for unexpected backend status
         self.state_store.put_job(
-            job_id,
+            resolved_job_id,
             {
                 **job_doc,
                 "status": backend_status or "FAILED",
                 "updated_at_utc": done_iso,
             },
         )
-        self.state_store.clear_active_job_lock(q_clean, season)
+        self._release_lock(
+            season=season,
+            person=q_clean,
+            owner_id=lock_owner_id,
+            job_id=resolved_job_id,
+        )
         return {
             **backend_result,
-            "job_id": job_id,
+            "job_id": resolved_job_id,
             "person": q_clean,
             "season": season,
             "network_called": True,

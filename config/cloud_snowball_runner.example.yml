@@ -40,12 +40,13 @@ jobs:
     permissions:
       contents: read
     env:
-      CBA_KB_R2_ENDPOINT: ${{ secrets.CBA_KB_R2_ENDPOINT }}
+      CBA_KB_R2_ENDPOINT_URL: ${{ secrets.CBA_KB_R2_ENDPOINT_URL }}
       CBA_KB_R2_BUCKET: ${{ secrets.CBA_KB_R2_BUCKET }}
       CBA_KB_R2_ACCESS_KEY_ID: ${{ secrets.CBA_KB_R2_ACCESS_KEY_ID }}
       CBA_KB_R2_SECRET_ACCESS_KEY: ${{ secrets.CBA_KB_R2_SECRET_ACCESS_KEY }}
       CBA_KB_DRIVE_TOKEN_JSON: ${{ secrets.CBA_KB_DRIVE_TOKEN_JSON }}
       CBA_KB_DRIVE_SNOWBALL_FOLDER_ID: ${{ secrets.CBA_KB_DRIVE_SNOWBALL_FOLDER_ID }}
+      INSTANCE_ROOT: ./workspace/cloud_instance
       TARGET_PERSON: ${{ github.event.client_payload.person || inputs.person }}
       TARGET_SEASON: ${{ github.event.client_payload.season || inputs.season || '2026-2027' }}
       TARGET_JOB_ID: ${{ github.event.client_payload.job_id || inputs.job_id }}
@@ -77,5 +78,7 @@ jobs:
           cba-kb snowball-query \
             --person "${TARGET_PERSON}" \
             --season "${TARGET_SEASON}" \
+            --job-id "${TARGET_JOB_ID}" \
+            --instance-root "${INSTANCE_ROOT:-.}" \
             --snowball-folder-id "${CBA_KB_DRIVE_SNOWBALL_FOLDER_ID}" \
             ${EXTRA_FLAGS}

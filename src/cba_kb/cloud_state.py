@@ -14,15 +14,34 @@ import json
 import os
 from pathlib import Path
 import re
+import threading
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 import xml.etree.ElementTree as ET
 
 from .common import atomic
 
-_SAFE_ASCII_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_SAFE_ASCII_RE = re.compile(r"^[a-z0-9._-]+$")
 _SAFE_JOB_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _ACTIVE_LOCK_STATUSES = frozenset({"RUNNING", "QUEUED", "PENDING", "ACQUIRING_IN_CLOUD"})
+
+_PROCESS_LOCKS_GUARD = threading.Lock()
+_PROCESS_LOCKS: Dict[Tuple[str, str, str, str], threading.Lock] = {}
+
+
+class CloudStateIntegrityError(ValueError):
+    """Raised fail-closed when an R2/S3 object fails SHA-256 verification."""
+
+
+__all__ = [
+    "CloudStateIntegrityError",
+    "R2Config",
+    "R2CloudStateStore",
+    "sign_aws_sigv4_headers",
+    "safe_key",
+    "_safe_key",
+]
 
 R2Transport = Callable[
     [str, str],
@@ -140,7 +159,12 @@ class R2Config:
     @classmethod
     def from_env(cls, environ: Optional[Mapping[str, str]] = None) -> "R2Config":
         env = os.environ if environ is None else environ
-        endpoint = (env.get("CBA_KB_R2_ENDPOINT_URL") or env.get("R2_ENDPOINT_URL") or "").strip()
+        endpoint = (
+            env.get("CBA_KB_R2_ENDPOINT_URL")
+            or env.get("CBA_KB_R2_ENDPOINT")
+            or env.get("R2_ENDPOINT_URL")
+            or ""
+        ).strip()
         if not endpoint:
             account_id = (env.get("CBA_KB_R2_ACCOUNT_ID") or env.get("R2_ACCOUNT_ID") or "").strip()
             if account_id:
@@ -173,21 +197,32 @@ class R2Config:
         )
 
 
-def _safe_key_segment(raw: str) -> str:
-    text = str(raw or "").strip()
+def _safe_key(raw: str) -> str:
+    """Deterministic R2 key segment shared with the Cloudflare Worker gateway.
+
+    Contract:
+    - Strip whitespace and lowercase.
+    - If matching ``^[a-z0-9._-]+$``, return as-is.
+    - Otherwise return ``k_<sha256(utf8)[:24]>``.
+    """
+    text = str(raw or "").strip().lower()
     if not text:
         raise ValueError("R2_KEY_SEGMENT_EMPTY")
     if _SAFE_ASCII_RE.fullmatch(text):
-        return text.lower()
-    digest_hex = hashlib.sha256(text.lower().encode("utf-8")).hexdigest()[:24]
+        return text
+    digest_hex = hashlib.sha256(text.encode("utf-8")).hexdigest()[:24]
     return f"k_{digest_hex}"
+
+
+safe_key = _safe_key
+_safe_key_segment = _safe_key
 
 
 def _safe_season_segment(season: str) -> str:
     text = str(season or "").strip()
     if not text or "/" in text or "\\" in text or ".." in text:
         raise ValueError("R2_SEASON_INVALID")
-    return _safe_key_segment(text)
+    return _safe_key(text)
 
 
 def _normalize_prefix(prefix: str) -> str:
@@ -314,10 +349,19 @@ class R2CloudStateStore:
         actual_sha = hashlib.sha256(body).hexdigest()
         lower_resp = {k.lower(): v for k, v in resp_headers.items()}
         meta_sha = lower_resp.get("x-amz-meta-sha256")
-        if meta_sha is not None and meta_sha.strip().lower() != actual_sha:
-            raise ValueError(f"R2_OBJECT_SHA256_MISMATCH:{key}")
-        if expected_sha256 is not None and expected_sha256.strip().lower() != actual_sha:
-            raise ValueError(f"R2_OBJECT_SHA256_MISMATCH:{key}")
+        if not isinstance(meta_sha, str) or not _HEX64_RE.fullmatch(meta_sha.strip().lower()):
+            raise CloudStateIntegrityError(
+                f"R2_OBJECT_SHA256_MISMATCH:{key}:missing_or_invalid_metadata_sha256"
+            )
+        if meta_sha.strip().lower() != actual_sha:
+            raise CloudStateIntegrityError(f"R2_OBJECT_SHA256_MISMATCH:{key}")
+        if expected_sha256 is not None:
+            if not isinstance(expected_sha256, str) or not _HEX64_RE.fullmatch(expected_sha256.strip().lower()):
+                raise CloudStateIntegrityError(
+                    f"R2_OBJECT_SHA256_MISMATCH:{key}:invalid_expected_sha256"
+                )
+            if expected_sha256.strip().lower() != actual_sha:
+                raise CloudStateIntegrityError(f"R2_OBJECT_SHA256_MISMATCH:{key}")
         return body
 
     def delete_key(self, key: str) -> bool:
@@ -385,7 +429,7 @@ class R2CloudStateStore:
         return json.loads(raw.decode("utf-8"))
 
     def _card_key(self, season: str, person_key: str) -> str:
-        return f"cards/{_safe_season_segment(season)}/{_safe_key_segment(person_key)}.json"
+        return f"cards/{_safe_season_segment(season)}/{_safe_key(person_key)}.json"
 
     def put_card(
         self,
@@ -401,7 +445,7 @@ class R2CloudStateStore:
         declared_sha = record.get("card_sha256")
         if declared_sha is not None and str(declared_sha).strip():
             if str(declared_sha).strip().lower() != actual_sha:
-                raise ValueError("R2_OBJECT_SHA256_MISMATCH:card_sha256")
+                raise CloudStateIntegrityError("R2_OBJECT_SHA256_MISMATCH:card_sha256")
         record["card_sha256"] = actual_sha
         return self.put_json(self._card_key(season, person_key), record)
 
@@ -414,10 +458,10 @@ class R2CloudStateStore:
         markdown = record.get("markdown")
         declared_sha = record.get("card_sha256")
         if not isinstance(markdown, str) or not isinstance(declared_sha, str):
-            raise ValueError("R2_OBJECT_SHA256_MISMATCH:card_sha256")
+            raise CloudStateIntegrityError("R2_OBJECT_SHA256_MISMATCH:card_sha256")
         actual_sha = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
         if declared_sha.strip().lower() != actual_sha:
-            raise ValueError("R2_OBJECT_SHA256_MISMATCH:card_sha256")
+            raise CloudStateIntegrityError("R2_OBJECT_SHA256_MISMATCH:card_sha256")
         return record
 
     def put_coverage_ledger(self, ledger: Mapping[str, Any]) -> Dict[str, Any]:
@@ -482,7 +526,98 @@ class R2CloudStateStore:
         return data
 
     def _lock_key(self, person_key: str, season: str) -> str:
-        return f"locks/{_safe_season_segment(season)}/{_safe_key_segment(person_key)}.json"
+        return f"locks/{_safe_season_segment(season)}/{_safe_key(person_key)}.json"
+
+    def _local_lock_for(self, lock_key: str) -> threading.Lock:
+        scope = (
+            self.config.endpoint_url.rstrip("/"),
+            self.config.bucket.strip("/"),
+            self._base_prefix,
+            lock_key,
+        )
+        with _PROCESS_LOCKS_GUARD:
+            lock_obj = _PROCESS_LOCKS.get(scope)
+            if lock_obj is None:
+                lock_obj = threading.Lock()
+                _PROCESS_LOCKS[scope] = lock_obj
+            return lock_obj
+
+    def acquire_active_job_lock(
+        self,
+        season: str,
+        person_key: str,
+        *,
+        job_id: str,
+        owner_id: str,
+        extra: Optional[Mapping[str, Any]] = None,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """Atomically acquire an active job lock using a local mutex + R2 If-None-Match: *."""
+        lock_key = self._lock_key(person_key, season)
+        with self._local_lock_for(lock_key):
+            existing = self.get_json(lock_key)
+            if isinstance(existing, dict):
+                existing_status = str(existing.get("status") or "").strip().upper()
+                if existing_status in _ACTIVE_LOCK_STATUSES:
+                    return False, existing
+                # Clear stale/terminal lock before conditional create
+                self.delete_key(lock_key)
+
+            lock_doc: Dict[str, Any] = dict(extra) if isinstance(extra, Mapping) else {}
+            lock_doc["job_id"] = str(job_id)
+            lock_doc["owner_id"] = str(owner_id)
+            lock_doc["person"] = str(person_key)
+            lock_doc["season"] = str(season)
+            lock_doc["status"] = str(lock_doc.get("status") or "RUNNING")
+            if not lock_doc.get("created_at_utc"):
+                lock_doc["created_at_utc"] = datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
+
+            payload = json.dumps(
+                lock_doc,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            sha256_hex = hashlib.sha256(payload).hexdigest()
+            full_key = self._full_key(lock_key)
+            url = self._object_url(full_key)
+            status, _, _ = self._request(
+                "PUT",
+                url,
+                headers={
+                    "Content-Type": "application/json; charset=utf-8",
+                    "x-amz-meta-sha256": sha256_hex,
+                    "If-None-Match": "*",
+                },
+                data=payload,
+            )
+            if status == 412:
+                winner = self.get_json(lock_key)
+                return False, winner if isinstance(winner, dict) else {}
+            if status not in (200, 201, 204):
+                raise RuntimeError(f"R2_LOCK_PUT_FAILED:{status}:{lock_key}")
+            return True, lock_doc
+
+    def release_active_job_lock(
+        self,
+        season: str,
+        person_key: str,
+        *,
+        owner_id: Optional[str] = None,
+        job_id: Optional[str] = None,
+    ) -> bool:
+        """Conditionally release an active job lock only if owner_id/job_id match."""
+        lock_key = self._lock_key(person_key, season)
+        with self._local_lock_for(lock_key):
+            current = self.get_json(lock_key)
+            if not isinstance(current, dict):
+                return False
+            if owner_id is not None and current.get("owner_id") != owner_id:
+                return False
+            if job_id is not None and current.get("job_id") != job_id:
+                return False
+            return self.delete_key(lock_key)
 
     def find_active_job_for_person(
         self,

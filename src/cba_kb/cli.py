@@ -420,6 +420,9 @@ def main():
     q=sub.add_parser('snowball-query')
     q.add_argument('--person',required=True)
     q.add_argument('--season',default='2026-2027')
+    q.add_argument('--job-id',default=None)
+    q.add_argument('--instance-root',type=Path,default=None,dest='snowball_instance_root')
+    q.add_argument('--collector-cmd',default=None)
     q.add_argument('--force-refresh',action='store_true',default=False)
     q.add_argument('--freshness-ttl-hours',type=float,default=24.0)
     q.add_argument('--snowball-folder-id',default=None)
@@ -1876,31 +1879,44 @@ def main():
                     print(json.dumps(result, ensure_ascii=False, indent=2))
                 return
         elif a.command == 'snowball-query':
+            import shlex
             from .cloud_state import R2CloudStateStore, R2Config
             from .drive import upsert_snowball_card_to_drive
-            from .snowball_orchestrator import SnowballOrchestrator
+            from .snowball_orchestrator import LocalCliAcquisitionBackend, SnowballOrchestrator
             store = R2CloudStateStore(R2Config.from_env())
+            effective_instance_root = a.snowball_instance_root or a.instance_root
+            configured = effective_instance_root is not None or bool(os.environ.get('CBA_KB_INSTANCE_ROOT'))
+            instance = load_instance(root, effective_instance_root) if configured else None
+            collector_cmd = shlex.split(a.collector_cmd) if a.collector_cmd else None
+            backend = LocalCliAcquisitionBackend(
+                collector_cmd=collector_cmd,
+                instance=instance,
+            )
             snowball_folder_id = a.snowball_folder_id or os.environ.get('CBA_KB_DRIVE_SNOWBALL_FOLDER_ID')
             drive_upserter = None
             production_policy = None
             if snowball_folder_id:
-                configured = a.instance_root is not None or bool(os.environ.get('CBA_KB_INSTANCE_ROOT'))
-                instance = private_instance() if configured else None
                 if instance is not None:
                     production_policy = instance.read_json('production.json')
                     drive = Drive(root, instance)
                     drive_upserter = lambda **kw: upsert_snowball_card_to_drive(drive, **kw)
+                elif os.environ.get('CBA_KB_DRIVE_TOKEN_JSON'):
+                    drive = Drive(root, None)
+                    drive_upserter = lambda **kw: upsert_snowball_card_to_drive(drive, **kw)
             orch = SnowballOrchestrator(
                 state_store=store,
+                acquisition_backend=backend,
                 drive_upserter=drive_upserter,
                 snowball_folder_id=snowball_folder_id,
                 production_policy=production_policy,
             )
+            explicit_job_id = a.job_id.strip() if isinstance(a.job_id, str) and a.job_id.strip() else None
             result = orch.get_or_acquire_person(
                 a.person,
                 season=a.season,
                 force_refresh=a.force_refresh,
                 freshness_ttl_hours=a.freshness_ttl_hours,
+                job_id=explicit_job_id,
             )
             if a.format == 'markdown':
                 stage(a.command, 'done')

@@ -15,9 +15,19 @@
 
 const DEFAULT_SEASON = "2026-2027";
 const DEFAULT_FRESHNESS_TTL_HOURS = 24;
+const DEFAULT_STALE_AFTER_HOURS = 48;
 const WAIT_TIMEOUT_MS = 28000;
 const POLL_INTERVAL_MS = 2000;
 const AUTH_SCHEME = "bearer";
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+const VALID_COVERAGE_STATUSES = new Set(["COMPLETE", "PARTIAL", "STALE", "UNKNOWN"]);
+const LEAGUE_COVERAGE_DOMAINS = [
+  ["domestic_registration", "国内球员注册"],
+  ["foreign_registration", "外籍球员注册"],
+  ["club_announcements", "俱乐部官方公告"],
+  ["league_rules", "联赛规程与规则"],
+  ["game_stats", "官方比赛技术统计"],
+];
 
 function jsonResponse(payload, status = 200) {
   return new Response(JSON.stringify(payload), {
@@ -58,15 +68,267 @@ function verifyAuthorization(request, env) {
   return timingSafeEqual(parts[1], expected);
 }
 
-function safeKey(raw) {
-  return encodeURIComponent(String(raw || "").trim()).replace(/%/g, "_");
+export async function sha256Hex(input) {
+  const bytes = input instanceof Uint8Array
+    ? input
+    : (input instanceof ArrayBuffer
+      ? new Uint8Array(input)
+      : new TextEncoder().encode(String(input || "")));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
-async function readR2Json(bucket, key) {
+/**
+ * Key parity with Python `cba_kb.cloud_state._safe_key_segment`:
+ * - trim + lowercase
+ * - if /^[a-z0-9._-]+$/ return normalized ASCII directly
+ * - otherwise return "k_" + sha256(utf8(norm)).slice(0, 24)
+ */
+export async function safeKey(value) {
+  const norm = String(value || "").trim().toLowerCase();
+  if (!norm) {
+    throw new Error("R2_KEY_SEGMENT_EMPTY");
+  }
+  if (/^[a-z0-9._-]+$/.test(norm)) {
+    return norm;
+  }
+  const hex = await sha256Hex(new TextEncoder().encode(norm));
+  return `k_${hex.slice(0, 24)}`;
+}
+
+function extractDeclaredSha256(obj) {
+  const custom = (obj && obj.customMetadata) || {};
+  for (const [k, v] of Object.entries(custom)) {
+    const lk = String(k).toLowerCase();
+    if ((lk === "sha256" || lk === "x-amz-meta-sha256") && typeof v === "string") {
+      return v.trim().toLowerCase();
+    }
+  }
+  return "";
+}
+
+export async function readR2Json(bucket, key) {
   if (!bucket) return null;
   const obj = await bucket.get(key);
   if (!obj) return null;
-  return obj.json();
+
+  const rawBuf = await obj.arrayBuffer();
+  const rawBytes = new Uint8Array(rawBuf);
+  const declaredSha = extractDeclaredSha256(obj);
+  if (!declaredSha || !SHA256_HEX_RE.test(declaredSha)) {
+    throw new Error(`R2_OBJECT_SHA256_MISMATCH:missing_or_malformed_metadata:${key}`);
+  }
+  const actualSha = await sha256Hex(rawBytes);
+  if (actualSha !== declaredSha) {
+    throw new Error(`R2_OBJECT_SHA256_MISMATCH:digest_mismatch:${key}`);
+  }
+  return JSON.parse(new TextDecoder("utf-8").decode(rawBytes));
+}
+
+export async function writeR2Json(bucket, key, data) {
+  if (!bucket) return null;
+  const encoded = new TextEncoder().encode(JSON.stringify(data));
+  const sha256 = await sha256Hex(encoded);
+  await bucket.put(key, encoded, {
+    httpMetadata: { contentType: "application/json; charset=utf-8" },
+    customMetadata: { sha256 },
+  });
+  return { key, sha256 };
+}
+
+export async function verifyCardRecord(card) {
+  if (!card || typeof card !== "object") {
+    throw new Error("R2_OBJECT_SHA256_MISMATCH:card_record_invalid");
+  }
+  const markdown = typeof card.markdown === "string"
+    ? card.markdown
+    : (typeof card.card_markdown === "string" ? card.card_markdown : null);
+  const declared = typeof card.card_sha256 === "string"
+    ? card.card_sha256.trim().toLowerCase()
+    : "";
+  if (markdown === null || !SHA256_HEX_RE.test(declared)) {
+    throw new Error("R2_OBJECT_SHA256_MISMATCH:card_sha256");
+  }
+  const actual = await sha256Hex(new TextEncoder().encode(markdown));
+  if (actual !== declared) {
+    throw new Error("R2_OBJECT_SHA256_MISMATCH:card_sha256");
+  }
+  return { markdown, card_sha256: actual };
+}
+
+export function evaluateLeagueCoverage(
+  ledger,
+  nowMs = Date.now(),
+  staleAfterHours = DEFAULT_STALE_AFTER_HOURS,
+) {
+  const domainsOut = {};
+  if (!ledger || typeof ledger !== "object") {
+    for (const [domKey, label] of LEAGUE_COVERAGE_DOMAINS) {
+      domainsOut[domKey] = {
+        domain: domKey,
+        label,
+        observed_until: null,
+        coverage_status: "UNKNOWN",
+        missing_items: [],
+        source_count: 0,
+        honest_disclosure: `${label}缺少覆盖账本（status=UNKNOWN）。`,
+      };
+    }
+    return {
+      overall_status: "UNKNOWN",
+      observed_until: null,
+      domains: domainsOut,
+      missing_items: [],
+      honest_disclosure:
+        "未提供有效覆盖账本（coverage_ledger），当前各命题域覆盖状态均为 UNKNOWN。 Statement != Fact. Evidence != Fact. Unknown != 0.",
+    };
+  }
+
+  const grouped = {};
+  if (Array.isArray(ledger.sources)) {
+    for (const src of ledger.sources) {
+      if (!src || typeof src !== "object") continue;
+      const dom = String(src.domain || "").trim();
+      if (!dom) continue;
+      if (!grouped[dom]) grouped[dom] = [];
+      grouped[dom].push(src);
+    }
+  } else if (ledger.domains && typeof ledger.domains === "object") {
+    for (const [dom, entry] of Object.entries(ledger.domains)) {
+      if (entry && typeof entry === "object") {
+        grouped[dom] = [entry];
+      }
+    }
+  }
+
+  const staleMs = Number(staleAfterHours) * 3600 * 1000;
+  const allMissing = [];
+  const seenMissing = new Set();
+  const overallObsCandidates = [];
+
+  for (const [domKey, label] of LEAGUE_COVERAGE_DOMAINS) {
+    const domSources = grouped[domKey] || [];
+    if (domSources.length === 0) {
+      domainsOut[domKey] = {
+        domain: domKey,
+        label,
+        observed_until: null,
+        coverage_status: "UNKNOWN",
+        missing_items: [],
+        source_count: 0,
+        honest_disclosure: `${label}尚未记录有效观测来源（status=UNKNOWN）。`,
+      };
+      continue;
+    }
+
+    const domMissing = [];
+    const seenDomMissing = new Set();
+    const domObsCandidates = [];
+    const rawStatuses = [];
+
+    for (const src of domSources) {
+      let rawSt = String(src.status || src.coverage_status || "UNKNOWN").trim().toUpperCase();
+      if (!VALID_COVERAGE_STATUSES.has(rawSt)) rawSt = "UNKNOWN";
+      rawStatuses.push(rawSt);
+
+      if (typeof src.observed_until === "string" && src.observed_until.trim()) {
+        const obsStr = src.observed_until.trim();
+        const obsMs = Date.parse(obsStr);
+        if (Number.isFinite(obsMs)) {
+          domObsCandidates.push([obsMs, obsStr]);
+          overallObsCandidates.push([obsMs, obsStr]);
+        }
+      }
+
+      const mList = Array.isArray(src.missing)
+        ? src.missing
+        : (Array.isArray(src.missing_items) ? src.missing_items : []);
+      for (const mItem of mList) {
+        const mStr = String(mItem || "").trim();
+        if (!mStr) continue;
+        if (!seenDomMissing.has(mStr)) {
+          seenDomMissing.add(mStr);
+          domMissing.push(mStr);
+        }
+        if (!seenMissing.has(mStr)) {
+          seenMissing.add(mStr);
+          allMissing.push(mStr);
+        }
+      }
+    }
+
+    let domObsMs = null;
+    let domObsStr = null;
+    for (const [ms, str] of domObsCandidates) {
+      if (domObsMs === null || ms > domObsMs) {
+        domObsMs = ms;
+        domObsStr = str;
+      }
+    }
+
+    let domStatus;
+    if (rawStatuses.every((st) => st === "UNKNOWN")) {
+      domStatus = "UNKNOWN";
+    } else if (
+      rawStatuses.some((st) => st === "PARTIAL")
+      || domMissing.length > 0
+      || rawStatuses.some((st) => st === "UNKNOWN")
+    ) {
+      domStatus = "PARTIAL";
+    } else if (rawStatuses.some((st) => st === "STALE")) {
+      domStatus = "STALE";
+    } else {
+      domStatus = "COMPLETE";
+      if (domObsMs !== null && (nowMs - domObsMs) > staleMs) {
+        domStatus = "STALE";
+      }
+    }
+
+    domainsOut[domKey] = {
+      domain: domKey,
+      label,
+      observed_until: domObsStr,
+      coverage_status: domStatus,
+      missing_items: domMissing,
+      source_count: domSources.length,
+      honest_disclosure: `${label}覆盖状态：${domStatus}（observed_until=${domObsStr || "UNKNOWN"}）。`,
+    };
+  }
+
+  const domStatuses = Object.values(domainsOut).map((d) => d.coverage_status);
+  let overallStatus;
+  if (domStatuses.every((st) => st === "UNKNOWN")) {
+    overallStatus = "UNKNOWN";
+  } else if (domStatuses.every((st) => st === "COMPLETE")) {
+    overallStatus = "COMPLETE";
+  } else if (domStatuses.some((st) => st === "PARTIAL" || st === "UNKNOWN")) {
+    overallStatus = "PARTIAL";
+  } else {
+    overallStatus = "STALE";
+  }
+
+  let overallObs = null;
+  let maxObsMs = null;
+  for (const [ms, str] of overallObsCandidates) {
+    if (maxObsMs === null || ms > maxObsMs) {
+      maxObsMs = ms;
+      overallObs = str;
+    }
+  }
+  if (!overallObs && typeof ledger.generated_at_utc === "string" && ledger.generated_at_utc.trim()) {
+    overallObs = ledger.generated_at_utc.trim();
+  }
+
+  return {
+    overall_status: overallStatus,
+    observed_until: overallObs,
+    domains: domainsOut,
+    missing_items: allMissing,
+    honest_disclosure:
+      `已评估 5 个命题域（observed_until=${overallObs || "UNKNOWN"}），当前覆盖状态为 ${overallStatus}。 Statement != Fact. Evidence != Fact. Unknown != 0.`,
+  };
 }
 
 async function sleep(ms) {
@@ -96,22 +358,7 @@ async function triggerCollectorRunner(env, payload) {
 
 async function handleCoverage(env) {
   const ledger = await readR2Json(env.CBA_KB_R2, "coverage_ledger.json");
-  if (!ledger) {
-    return jsonResponse({
-      overall_status: "UNKNOWN",
-      observed_until: "",
-      domains: {},
-      missing_items: [],
-      honest_disclosure: "Coverage ledger is not yet published in cloud state.",
-    });
-  }
-  return jsonResponse({
-    overall_status: ledger.overall_status || "UNKNOWN",
-    observed_until: ledger.observed_until || ledger.generated_at_utc || "",
-    domains: ledger.domains || {},
-    missing_items: ledger.missing_items || [],
-    honest_disclosure: ledger.honest_disclosure || "",
-  });
+  return jsonResponse(evaluateLeagueCoverage(ledger));
 }
 
 async function handleJobStatus(env, jobId) {
@@ -120,13 +367,13 @@ async function handleJobStatus(env, jobId) {
     return jsonResponse({ status: "NOT_FOUND", job_id: jobId }, 404);
   }
   if (job.status === "COMPLETED" && !job.card_markdown && job.person && job.season) {
-    const card = await readR2Json(
-      env.CBA_KB_R2,
-      `cards/${job.season}/${safeKey(job.person)}.json`,
-    );
-    if (card && card.markdown) {
-      job.card_markdown = card.markdown;
-      job.card_sha256 = card.card_sha256 || job.card_sha256;
+    const seasonKey = await safeKey(job.season);
+    const personKey = await safeKey(job.person);
+    const card = await readR2Json(env.CBA_KB_R2, `cards/${seasonKey}/${personKey}.json`);
+    if (card) {
+      const verified = await verifyCardRecord(card);
+      job.card_markdown = verified.markdown;
+      job.card_sha256 = verified.card_sha256;
     }
   }
   return jsonResponse(job, 200);
@@ -146,20 +393,22 @@ async function handlePersonQuery(request, env) {
   const season = String((body && body.season) || DEFAULT_SEASON);
   const forceRefresh = Boolean(body && body.force_refresh);
   const ttlHours = Number((body && body.freshness_ttl_hours) || DEFAULT_FRESHNESS_TTL_HOURS);
-  const personKey = safeKey(person);
+  const seasonKey = await safeKey(season);
+  const personKey = await safeKey(person);
 
-  // Fast path: fresh cached card in R2 (< 0.5s)
+  // Fast path: fresh cached card in R2 (< 0.5s) with fail-closed SHA-256 verification
   if (!forceRefresh) {
-    const cached = await readR2Json(env.CBA_KB_R2, `cards/${season}/${personKey}.json`);
-    if (cached && cached.markdown && cached.updated_at_utc) {
+    const cached = await readR2Json(env.CBA_KB_R2, `cards/${seasonKey}/${personKey}.json`);
+    if (cached && cached.updated_at_utc) {
+      const verified = await verifyCardRecord(cached);
       const ageMs = Date.now() - Date.parse(cached.updated_at_utc);
       if (Number.isFinite(ageMs) && ageMs <= ttlHours * 3600 * 1000) {
         return jsonResponse({
           status: "HIT_FRESH",
           person: cached.player_name || person,
           season,
-          card_markdown: cached.markdown,
-          card_sha256: cached.card_sha256 || "",
+          card_markdown: verified.markdown,
+          card_sha256: verified.card_sha256,
           observed_until: cached.observed_until || "",
           coverage_status: cached.coverage_status || "UNKNOWN",
           network_called: false,
@@ -169,10 +418,10 @@ async function handlePersonQuery(request, env) {
   }
 
   // Concurrency deduplication lock
-  const lockKey = `locks/${season}/${personKey}.json`;
+  const lockKey = `locks/${seasonKey}/${personKey}.json`;
   const activeLock = await readR2Json(env.CBA_KB_R2, lockKey);
   let jobId = activeLock && activeLock.status === "RUNNING" ? activeLock.job_id : null;
-  let deduplicated = Boolean(jobId);
+  const deduplicated = Boolean(jobId);
 
   if (!jobId) {
     jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
@@ -183,10 +432,8 @@ async function handlePersonQuery(request, env) {
       season,
       created_at_utc: new Date().toISOString(),
     };
-    if (env.CBA_KB_R2) {
-      await env.CBA_KB_R2.put(`jobs/${jobId}.json`, JSON.stringify(jobDoc));
-      await env.CBA_KB_R2.put(lockKey, JSON.stringify(jobDoc));
-    }
+    await writeR2Json(env.CBA_KB_R2, `jobs/${jobId}.json`, jobDoc);
+    await writeR2Json(env.CBA_KB_R2, lockKey, jobDoc);
     await triggerCollectorRunner(env, { person, season, job_id: jobId, force_refresh: forceRefresh });
   }
 
@@ -197,10 +444,11 @@ async function handlePersonQuery(request, env) {
     const polled = await readR2Json(env.CBA_KB_R2, `jobs/${jobId}.json`);
     if (polled && polled.status && polled.status !== "RUNNING") {
       if (polled.status === "COMPLETED" && !polled.card_markdown) {
-        const card = await readR2Json(env.CBA_KB_R2, `cards/${season}/${personKey}.json`);
-        if (card && card.markdown) {
-          polled.card_markdown = card.markdown;
-          polled.card_sha256 = card.card_sha256 || polled.card_sha256;
+        const card = await readR2Json(env.CBA_KB_R2, `cards/${seasonKey}/${personKey}.json`);
+        if (card) {
+          const verified = await verifyCardRecord(card);
+          polled.card_markdown = verified.markdown;
+          polled.card_sha256 = verified.card_sha256;
         }
       }
       return jsonResponse(polled, 200);
@@ -226,19 +474,27 @@ export default {
     const path = url.pathname;
     const method = request.method.toUpperCase();
 
-    if (method === "GET" && path === "/v1/coverage") {
-      return handleCoverage(env);
-    }
-    if (method === "GET" && path.startsWith("/v1/jobs/")) {
-      const jobId = decodeURIComponent(path.slice("/v1/jobs/".length)).replace(/^\/+|\/+$/g, "");
-      if (!jobId || jobId.includes("/") || jobId.includes("\\") || jobId.includes("..")) {
-        return jsonResponse({ error: "INVALID_JOB_ID" }, 400);
+    try {
+      if (method === "GET" && path === "/v1/coverage") {
+        return await handleCoverage(env);
       }
-      return handleJobStatus(env, jobId);
+      if (method === "GET" && path.startsWith("/v1/jobs/")) {
+        const jobId = decodeURIComponent(path.slice("/v1/jobs/".length)).replace(/^\/+|\/+$/g, "");
+        if (!jobId || jobId.includes("/") || jobId.includes("\\") || jobId.includes("..")) {
+          return jsonResponse({ error: "INVALID_JOB_ID" }, 400);
+        }
+        return await handleJobStatus(env, jobId);
+      }
+      if (method === "POST" && path === "/v1/person") {
+        return await handlePersonQuery(request, env);
+      }
+      return jsonResponse({ error: "NOT_FOUND" }, 404);
+    } catch (err) {
+      const msg = err && err.message ? String(err.message) : "INTERNAL_ERROR";
+      if (msg.includes("R2_OBJECT_SHA256_MISMATCH")) {
+        return jsonResponse({ error: "R2_OBJECT_SHA256_MISMATCH" }, 500);
+      }
+      return jsonResponse({ error: "INTERNAL_ERROR" }, 500);
     }
-    if (method === "POST" && path === "/v1/person") {
-      return handlePersonQuery(request, env);
-    }
-    return jsonResponse({ error: "NOT_FOUND" }, 404);
   },
 };
