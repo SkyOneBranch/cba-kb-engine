@@ -58,6 +58,9 @@ def _is_known_legacy_non_bundle_release_dir(name: str) -> bool:
 
 
 DEFAULT_PROTECTED_BUNDLE_RELEASES: Tuple[str, ...] = _default_protected_bundle_releases()
+_KNOWN_RELEASE_IDS: frozenset[str] = frozenset(
+    str(rel_id).strip() for rel_id in _load_release_specs().keys() if str(rel_id).strip()
+)
 
 _COMPRESSED_SUFFIXES = (".tar.gz", ".tgz", ".zip")
 _PROTECTED_POLICY_ZONES = ("current", "evidence", "staging", "snowball", "root", "root_folder_id")
@@ -194,22 +197,73 @@ def _collect_protected_release_names(
     return names
 
 
-def _has_authoritative_release_state(
+def _validate_authoritative_release_state(
     *,
     active_release_id: Optional[str] = None,
     previous_release_id: Optional[str] = None,
     release_status: Optional[Mapping[str, Any]] = None,
 ) -> bool:
-    if isinstance(active_release_id, str) and active_release_id.strip():
-        return True
-    if isinstance(previous_release_id, str) and previous_release_id.strip():
-        return True
-    if isinstance(release_status, Mapping):
-        for key in ("release_id", "active_release_id", "current_release_id", "previous_release_id"):
+    """Validate any provided release-state anchor on ``execute=True``.
+
+    Returns True when at least one verified authoritative release-state anchor
+    was provided and validated against ``_KNOWN_RELEASE_IDS``; returns False
+    when none of ``release_status``, ``active_release_id``, or
+    ``previous_release_id`` was provided.
+
+    Raises ``ArchiveCompactionError("ARCHIVE_COMPACT_INVALID_RELEASE_STATE:...")``
+    immediately (0 writes) when a provided release-state argument is malformed,
+    references an unknown/forged release ID, or lacks ``status == "COMPLETE"``.
+    """
+    has_verified_anchor = False
+
+    if release_status is not None:
+        if not isinstance(release_status, Mapping):
+            raise ArchiveCompactionError(
+                "ARCHIVE_COMPACT_INVALID_RELEASE_STATE:release_status_not_mapping"
+            )
+        primary_rel = ""
+        for key in ("release_id", "active_release_id", "current_release_id"):
             val = release_status.get(key)
             if isinstance(val, str) and val.strip():
-                return True
-    return False
+                primary_rel = val.strip()
+                break
+        if not primary_rel or primary_rel not in _KNOWN_RELEASE_IDS:
+            raise ArchiveCompactionError(
+                f"ARCHIVE_COMPACT_INVALID_RELEASE_STATE:unknown_release_id={primary_rel or 'missing'}"
+            )
+        prev_in_status = release_status.get("previous_release_id")
+        if prev_in_status is not None:
+            prev_str = prev_in_status.strip() if isinstance(prev_in_status, str) else ""
+            if not prev_str or prev_str not in _KNOWN_RELEASE_IDS:
+                raise ArchiveCompactionError(
+                    "ARCHIVE_COMPACT_INVALID_RELEASE_STATE:"
+                    f"unknown_previous_release_id={prev_str or 'invalid'}"
+                )
+        status_val = release_status.get("status")
+        if not isinstance(status_val, str) or status_val.strip() != "COMPLETE":
+            raise ArchiveCompactionError(
+                f"ARCHIVE_COMPACT_INVALID_RELEASE_STATE:status={status_val!r}"
+            )
+        has_verified_anchor = True
+
+    if active_release_id is not None:
+        act_str = active_release_id.strip() if isinstance(active_release_id, str) else ""
+        if not act_str or act_str not in _KNOWN_RELEASE_IDS:
+            raise ArchiveCompactionError(
+                f"ARCHIVE_COMPACT_INVALID_RELEASE_STATE:unknown_active_release_id={act_str or 'invalid'}"
+            )
+        has_verified_anchor = True
+
+    if previous_release_id is not None:
+        prev_str = previous_release_id.strip() if isinstance(previous_release_id, str) else ""
+        if not prev_str or prev_str not in _KNOWN_RELEASE_IDS:
+            raise ArchiveCompactionError(
+                "ARCHIVE_COMPACT_INVALID_RELEASE_STATE:"
+                f"unknown_previous_release_id={prev_str or 'invalid'}"
+            )
+        has_verified_anchor = True
+
+    return has_verified_anchor
 
 
 def _is_compressed_archive_name(name: str) -> bool:
@@ -406,29 +460,36 @@ def compact_drive_archive(
         )
 
     # Lock 1b: Fail-Closed Release-State Anchor Check on execute=True (0 writes)
-    if execute and not _has_authoritative_release_state(
-        active_release_id=active_release_id,
-        previous_release_id=previous_release_id,
-        release_status=release_status,
-    ):
-        missing_default_protected = sorted(
-            set(DEFAULT_PROTECTED_BUNDLE_RELEASES) - protected_release_names
+    if execute:
+        has_verified_anchor = _validate_authoritative_release_state(
+            active_release_id=active_release_id,
+            previous_release_id=previous_release_id,
+            release_status=release_status,
         )
-        if missing_default_protected:
-            raise ArchiveCompactionError(
-                "ARCHIVE_COMPACT_MISSING_RELEASE_STATE:"
-                f"unprotected_bundle_releases={','.join(missing_default_protected[:5])}"
+        if not has_verified_anchor:
+            missing_default_protected = sorted(
+                set(DEFAULT_PROTECTED_BUNDLE_RELEASES) - protected_release_names
             )
-        unverified_dirs = sorted(
-            d["name"]
-            for d in top_level_candidate_dirs
-            if not _is_known_legacy_non_bundle_release_dir(d["name"])
-        )
-        if unverified_dirs:
-            raise ArchiveCompactionError(
-                "ARCHIVE_COMPACT_MISSING_RELEASE_STATE:"
-                f"unverified_dirs={','.join(unverified_dirs[:5])}"
+            if missing_default_protected:
+                raise ArchiveCompactionError(
+                    "ARCHIVE_COMPACT_MISSING_RELEASE_STATE:"
+                    f"unprotected_bundle_releases={','.join(missing_default_protected[:5])}"
+                )
+            if skipped_protected_dirs:
+                raise ArchiveCompactionError(
+                    "ARCHIVE_COMPACT_MISSING_RELEASE_STATE:"
+                    f"protected_release_dirs_present={','.join(sorted(skipped_protected_dirs)[:5])}"
+                )
+            unverified_dirs = sorted(
+                d["name"]
+                for d in top_level_candidate_dirs
+                if not _is_known_legacy_non_bundle_release_dir(d["name"])
             )
+            if unverified_dirs:
+                raise ArchiveCompactionError(
+                    "ARCHIVE_COMPACT_MISSING_RELEASE_STATE:"
+                    f"unverified_dirs={','.join(unverified_dirs[:5])}"
+                )
 
     plan_result: Dict[str, Any] = {
         "mode": "execute" if execute else "plan_only",

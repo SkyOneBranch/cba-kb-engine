@@ -374,7 +374,7 @@ def test_q2_3_archive_compactor_protects_v231_fail_closed_missing_state_and_nest
     res4 = compact_drive_archive(
         d4,
         history_folder_id="hist_root",
-        release_status={"release_id": "v2.3.1-1", "previous_release_id": "v2.3.0-1"},
+        release_status={"release_id": "v2.3.1-1", "previous_release_id": "v2.3.0-1", "status": "COMPLETE"},
         execute=True,
         tag="q2nested",
     )
@@ -522,3 +522,308 @@ def test_q2_6_chinese_name_boundary_blocks_substring_false_positives_in_title_an
         roster_candidates=roster_only_short,
     )
     assert any(c["doc_id"] == "doc_tp_001" for c in matched_tp)
+
+
+# ---------------------------------------------------------------------------
+# Round 2 Q1+Q2 Remediation Regression Tests
+# ---------------------------------------------------------------------------
+
+
+def test_r2_1_concurrent_dual_client_501_lock_acquire_release_and_reserved_extra_stripping() -> None:
+    objs: Dict[str, Tuple[bytes, Dict[str, str], str]] = {}
+    objs_guard = threading.Lock()
+
+    def _transport_501(method: str, url: str, *, headers: Dict[str, str], data: bytes = b""):
+        key = urlparse(url).path.lstrip("/").split("/", 1)[1]
+        lh = {k.lower(): v for k, v in headers.items()}
+        with objs_guard:
+            if method == "GET":
+                if key not in objs:
+                    return 404, {}, b"NotFound"
+                p, m, e = objs[key]
+                return 200, {**m, "ETag": e}, p
+            if method == "PUT":
+                if "if-none-match" in lh or "if-match" in lh:
+                    return 501, {}, b"NotImplemented"
+                meta = {k: v for k, v in lh.items() if k.startswith("x-amz-meta-")}
+                etag = f'"{hashlib.md5(data).hexdigest()}"'
+                objs[key] = (bytes(data), meta, etag)
+                return 200, {"ETag": etag}, b""
+        return 405, {}, b""
+
+    store_a = R2CloudStateStore(_r2_cfg(), transport=_transport_501, allow_s3_501_lock_fallback=True)
+    store_b = R2CloudStateStore(_r2_cfg(), transport=_transport_501, allow_s3_501_lock_fallback=True)
+
+    # 1. Reserved keys in extra cannot forge fencing_token, owner_id, status, or lock_mode
+    ok_forge, doc_forge = store_a.acquire_active_job_lock(
+        "2026-2027",
+        "合成防伪甲",
+        job_id="job_forge",
+        owner_id="real_owner",
+        extra={
+            "fencing_token": "forged",
+            "owner_id": "evil",
+            "status": "RELEASED",
+            "lock_mode": "bypass",
+        },
+    )
+    assert ok_forge is True
+    assert doc_forge["fencing_token"] != "forged"
+    assert doc_forge["owner_id"] == "real_owner"
+    assert doc_forge["status"] == "RUNNING"
+    assert "lock_mode" not in doc_forge
+
+    # 2. True concurrent dual-client race via threading.Barrier -> ONLY ONE acquires
+    barrier = threading.Barrier(2)
+    outcomes: List[Tuple[str, bool, Optional[Exception]]] = []
+    outcomes_guard = threading.Lock()
+
+    def _worker(tag: str, st: R2CloudStateStore) -> None:
+        barrier.wait()
+        try:
+            acquired, _ = st.acquire_active_job_lock(
+                "2026-2027", "合成并发乙", job_id=f"job_{tag}", owner_id=f"owner_{tag}"
+            )
+            with outcomes_guard:
+                outcomes.append((tag, acquired, None))
+        except Exception as exc:
+            with outcomes_guard:
+                outcomes.append((tag, False, exc))
+
+    t1 = threading.Thread(target=_worker, args=("A", store_a))
+    t2 = threading.Thread(target=_worker, args=("B", store_b))
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    winners = [o for o in outcomes if o[1] is True]
+    losers = [o for o in outcomes if o[1] is False]
+    assert len(winners) == 1, f"Expected exactly 1 lock winner, got {outcomes}"
+    assert len(losers) == 1
+    assert losers[0][2] is None or isinstance(losers[0][2], R2LockContentionError)
+
+    # 3. release_active_job_lock in 501 fallback fails closed if remote fencing_token changed mid-release
+    winner_tag = winners[0][0]
+    winner_store = store_a if winner_tag == "A" else store_b
+    lock_key = winner_store._lock_key("合成并发乙", "2026-2027")
+
+    get_count = {"n": 0}
+
+    def _tampering_release_transport(method: str, url: str, *, headers: Dict[str, str], data: bytes = b""):
+        key = urlparse(url).path.lstrip("/").split("/", 1)[1]
+        lh = {k.lower(): v for k, v in headers.items()}
+        if method == "GET":
+            get_count["n"] += 1
+            if key == lock_key and get_count["n"] >= 2:
+                # Simulate another process replacing the lock token between initial GET and 501 fallback pre-check
+                tampered = json.dumps(
+                    {
+                        "job_id": f"job_{winner_tag}",
+                        "owner_id": f"owner_{winner_tag}",
+                        "fencing_token": "hijacked_token",
+                        "status": "RUNNING",
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                return (
+                    200,
+                    {"x-amz-meta-sha256": hashlib.sha256(tampered).hexdigest(), "ETag": '"etag_hijack"'},
+                    tampered,
+                )
+            p, m, e = objs[key]
+            return 200, {**m, "ETag": e}, p
+        if method == "PUT":
+            if "if-none-match" in lh or "if-match" in lh:
+                return 501, {}, b"NotImplemented"
+            return 200, {"ETag": '"e_put"'}, b""
+        return 405, {}, b""
+
+    tampered_store = R2CloudStateStore(
+        _r2_cfg(), transport=_tampering_release_transport, allow_s3_501_lock_fallback=True
+    )
+    with pytest.raises(R2LockContentionError, match="owner_or_token_changed"):
+        tampered_store.release_active_job_lock(
+            "2026-2027", "合成并发乙", owner_id=f"owner_{winner_tag}", job_id=f"job_{winner_tag}"
+        )
+
+
+def test_r2_2_tar_pax_header_bomb_and_nonzero_dir_size_rejected(tmp_path: Path) -> None:
+    objs: Dict[str, Tuple[bytes, Dict[str, str], str]] = {}
+
+    def _put(payload: bytes) -> None:
+        objs[DEFAULT_INSTANCE_BUNDLE_KEY] = (
+            payload,
+            {"x-amz-meta-sha256": hashlib.sha256(payload).hexdigest()},
+            '"e1"',
+        )
+
+    def _transport(method: str, url: str, *, headers: Dict[str, str], data: bytes = b""):
+        key = urlparse(url).path.lstrip("/").split("/", 1)[1]
+        if method == "GET" and key in objs:
+            p, m, e = objs[key]
+            return 200, {**m, "ETag": e}, p
+        return 404, {}, b""
+
+    store = R2CloudStateStore(_r2_cfg(), transport=_transport)
+
+    # 1. Huge PAX extended header exceeding max_extracted_bytes -> _BoundedReadStream fails closed
+    buf_pax = io.BytesIO()
+    with tarfile.open(fileobj=buf_pax, mode="w:gz", format=tarfile.PAX_FORMAT) as tf:
+        ti = tarfile.TarInfo("data/MASTER.csv")
+        ti.pax_headers = {"comment": "P" * 32768}
+        ti.size = 2
+        tf.addfile(ti, io.BytesIO(b"a\n"))
+    _put(buf_pax.getvalue())
+    with pytest.raises(ValueError, match="R2_BUNDLE_EXTRACTED_SIZE_EXCEEDED"):
+        store.pull_instance_bundle(tmp_path / "out_pax", max_extracted_bytes=4096)
+
+    # 2. Directory member with non-zero size -> R2_BUNDLE_INVALID_DIR_SIZE
+    buf_dir = io.BytesIO()
+    with tarfile.open(fileobj=buf_dir, mode="w:gz") as tf:
+        ti_dir = tarfile.TarInfo("data")
+        ti_dir.type = tarfile.DIRTYPE
+        ti_dir.size = 32
+        tf.addfile(ti_dir, io.BytesIO(b"0" * 32))
+    _put(buf_dir.getvalue())
+    with pytest.raises(ValueError, match="R2_BUNDLE_INVALID_DIR_SIZE"):
+        store.pull_instance_bundle(tmp_path / "out_dir")
+
+
+def test_r2_3_archive_compactor_unanchored_v231_and_forged_release_status_fail_closed() -> None:
+    # 1. History dir containing v2.3.1-1/ + loose file with NO release-state anchor -> fail closed (0 writes)
+    d1 = _FakeDrive()
+    d1.add_folder("hist_root", "90_archive_历史归档")
+    v231_dir = d1.add_folder("dir_v231", "v2.3.1-1", ["hist_root"])
+    d1.add_file("b_v231", "release_bundle.tar.gz", v231_dir, b"gz", "application/gzip")
+    d1.add_file("loose_1", "before_old.json", "hist_root", b"{}", "application/json")
+    with pytest.raises(ArchiveCompactionError, match="ARCHIVE_COMPACT_MISSING_RELEASE_STATE"):
+        compact_drive_archive(d1, history_folder_id="hist_root", execute=True)
+    assert d1.upload_calls == 0
+    assert d1.trashed_ids == []
+
+    # 2. Forged release_status (unknown release_id) -> ARCHIVE_COMPACT_INVALID_RELEASE_STATE (0 writes)
+    with pytest.raises(ArchiveCompactionError, match="ARCHIVE_COMPACT_INVALID_RELEASE_STATE"):
+        compact_drive_archive(
+            d1,
+            history_folder_id="hist_root",
+            release_status={"release_id": "v2.9.9-1", "status": "COMPLETE"},
+            execute=True,
+        )
+    assert d1.upload_calls == 0
+
+    # 3. release_status missing status == COMPLETE -> ARCHIVE_COMPACT_INVALID_RELEASE_STATE (0 writes)
+    with pytest.raises(ArchiveCompactionError, match="ARCHIVE_COMPACT_INVALID_RELEASE_STATE"):
+        compact_drive_archive(
+            d1,
+            history_folder_id="hist_root",
+            release_status={"release_id": "v2.3.1-1"},
+            execute=True,
+        )
+    assert d1.upload_calls == 0
+
+
+def test_r2_4_foreign_table_malformed_continuation_and_short_columns_fail_closed() -> None:
+    # 1. Empty first col + non-Latin col 1 -> FOREIGN_ROW_MALFORMED_CONTINUATION
+    bad_cont = "\n".join([
+        "| 俱乐部 | 外籍球员 |  | 国籍 | 位置 | 球衣号 |",
+        "| --- | --- | --- | --- | --- | --- |",
+        "| 合成首钢 | SYNTH ONE | 外援一 | 合成国 | PG | 1 |",
+        "|  | 合成外援二 | 美国 | PG | 7 |  |",
+    ])
+    with pytest.raises(ValueError, match="FOREIGN_ROW_MALFORMED_CONTINUATION"):
+        _parse_foreign_registration_rows({"body": bad_cont})
+
+    # 2. <5 column data row inside foreign table -> FOREIGN_ROW_MALFORMED_COLUMNS
+    bad_cols = "\n".join([
+        "| 俱乐部 | 外籍球员 |  | 国籍 | 位置 | 球衣号 |",
+        "| --- | --- | --- | --- | --- | --- |",
+        "| 合成首钢 | SYNTH ONE | 外援一 | 合成国 | PG | 1 |",
+        "| 合成首钢 | 缺列行 | PG |",
+    ])
+    with pytest.raises(ValueError, match="FOREIGN_ROW_MALFORMED_COLUMNS"):
+        _parse_foreign_registration_rows({"body": bad_cols})
+
+
+def test_r2_5_p0_2_legacy_minimal_registration_profile_byte_identical_golden() -> None:
+    from cba_kb import kc_render
+
+    minimal_payload = {
+        "metric": "points_per_game",
+        "grains": {"STATS": {"posture": "UNKNOWN", "season": "2026-2027", "match_type": "-", "scope": "-"}},
+        "evidence_transparency": {
+            "posture": "UNKNOWN",
+            "unknown_subkind": "NO_SEASON_STATS_RECORDED_YET",
+            "scope_meta": {"player_name": "合成兼容甲", "player_id": "990009", "season": "2026-2027"},
+        },
+        "registration_profile": {
+            "player_name": "合成兼容甲",
+            "current_club": "合成俱乐部甲",
+            "registration_type": "DOMESTIC",
+        },
+    }
+    expected_golden = (
+        "# Research Card (Serving Projection)\n\n"
+        "## Statistical Evidence\n"
+        "- Posture: UNKNOWN\n"
+        "- Season: 2026-2027\n"
+        "- Match Type: -\n"
+        "- Scope: -\n"
+        "- Unknown: NO_SEASON_STATS_RECORDED_YET\n\n"
+        "## Registration & Identity Profile\n"
+        "- Player Name: 合成兼容甲\n"
+        "- Current Club: 合成俱乐部甲\n"
+        "- Registration Type: DOMESTIC\n\n"
+        "end_marker: true\n"
+    ).encode("utf-8")
+
+    rendered = kc_render.render_research_card(minimal_payload, evidence_verified=True)
+    assert rendered.encode("utf-8") == expected_golden
+
+
+def test_r2_6_p0_4_twenty_club_sixty_player_foreign_quick_index_completeness_under_25kb() -> None:
+    table_lines = [
+        "| 俱乐部 | 外籍球员 |  | 国籍 | 位置 | 球衣号 |",
+        "| --- | --- | --- | --- | --- | --- |",
+        "| 英文名 | 中文名 |  |  |  |  |",
+    ]
+    expected_clubs: List[str] = []
+    expected_players: List[str] = []
+    for c_idx in range(1, 21):
+        club = f"合成队{c_idx:02d}"
+        expected_clubs.append(club)
+        for p_idx, suffix in ((1, "甲"), (2, "乙"), (3, "丙")):
+            en = f"SYNTH P{c_idx:02d}{p_idx}"
+            zh = f"外援{c_idx:02d}{suffix}"
+            expected_players.append(zh)
+            jersey = c_idx + (p_idx - 1) * 20
+            if p_idx == 1:
+                table_lines.append(f"| {club} | {en} | {zh} | 合成国 | PG | {jersey} |")
+            else:
+                table_lines.append(f"| {en} | {zh} | 合成国 | SG | {jersey} |  |")
+
+    digest_bytes = render_collector_official_digest_md(
+        bundles=[
+            {
+                "doc_id": "doc_foreign_20x3_001",
+                "title": "2026-2027赛季CBA联赛外籍球员注册信息",
+                "source_tier": "T1",
+                "event_class": "foreign_registration",
+                "published_at": "2026-11-24",
+                "raw_sha256": "d" * 64,
+                "body": "\n".join(table_lines),
+            }
+        ],
+        release_id="v2.3.1-1",
+        engine_sha="7afb18b1e867146ed99cc73fa16e53d990c54e95",
+        compact_curated=True,
+        include_foreign_quick_index=True,
+    )
+    assert len(digest_bytes) < COLLECTOR_DIGEST_MAX_BYTES
+    text = digest_bytes.decode("utf-8")
+    for club in expected_clubs:
+        assert f"{club}（3人）" in text
+    for zh in expected_players:
+        assert zh in text
+

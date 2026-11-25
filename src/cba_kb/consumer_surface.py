@@ -1363,8 +1363,9 @@ def _parse_foreign_registration_rows(bundle: Dict[str, Any]) -> list[Dict[str, s
                 club = current_club
                 player_en, player_zh, nationality, position, jersey_number = cells[:5]
             elif first == "":
-                if not second or not any(cells[2:6]):
-                    continue
+                if not _is_latin_player_name(second) or not cells[2]:
+                    current_club = ""
+                    raise ValueError("FOREIGN_ROW_MALFORMED_CONTINUATION")
                 if not current_club:
                     raise ValueError("FOREIGN_ROW_ORPHAN_CONTINUATION")
                 club = current_club
@@ -1382,20 +1383,16 @@ def _parse_foreign_registration_rows(bundle: Dict[str, Any]) -> list[Dict[str, s
                 club = current_club
                 player_en, player_zh, nationality, position, jersey_number = cells[:5]
             elif first == "":
-                if not second or not any(cells[2:5]):
-                    continue
-                if not current_club:
-                    raise ValueError("FOREIGN_ROW_ORPHAN_CONTINUATION")
-                club = current_club
-                player_en, nationality, position, jersey_number = cells[1:5]
-                player_zh = ""
+                current_club = ""
+                raise ValueError("FOREIGN_ROW_MALFORMED_CONTINUATION")
             else:
                 club, player_en, nationality, position, jersey_number = cells[:5]
                 player_zh = ""
                 if club:
                     current_club = club
         else:
-            continue
+            current_club = ""
+            raise ValueError("FOREIGN_ROW_MALFORMED_COLUMNS")
 
         if not club or (not player_en and not player_zh):
             continue

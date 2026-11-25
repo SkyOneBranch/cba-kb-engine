@@ -6,8 +6,13 @@ sanitization before uploading local instance snapshots.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None  # type: ignore[assignment]
 import gzip
 import hashlib
 import hmac
@@ -18,8 +23,9 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 import tarfile
+import tempfile
 import threading
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 import uuid
 import xml.etree.ElementTree as ET
@@ -46,8 +52,49 @@ _BUNDLE_EXCLUDED_DIR_NAMES = frozenset({
     "__pycache__",
 })
 
+_RESERVED_LOCK_FIELDS = frozenset({
+    "fencing_token",
+    "owner_id",
+    "status",
+    "acquired_at",
+    "expires_at",
+    "lease_ttl_seconds",
+    "lock_mode",
+})
+
 _PROCESS_LOCKS_GUARD = threading.Lock()
 _PROCESS_LOCKS: Dict[Tuple[str, str, str, str], threading.Lock] = {}
+_FENCING_COUNTER = 0
+
+
+def _next_fencing_token() -> str:
+    global _FENCING_COUNTER
+    with _PROCESS_LOCKS_GUARD:
+        _FENCING_COUNTER += 1
+        seq = _FENCING_COUNTER
+    return f"{seq:016x}-{uuid.uuid4().hex}"
+
+
+class _BoundedReadStream:
+    """Hard-caps total decompressed bytes read from a stream (including PAX/GNU/tar headers)."""
+
+    def __init__(self, stream: Any, max_bytes: int) -> None:
+        self._stream = stream
+        self._max_bytes = int(max_bytes)
+        self._total_read = 0
+
+    def read(self, size: int = -1) -> bytes:
+        remaining = self._max_bytes - self._total_read
+        if remaining < 0:
+            raise ValueError("R2_BUNDLE_EXTRACTED_SIZE_EXCEEDED:stream_limit")
+        if size is None or size < 0:
+            chunk = self._stream.read(remaining + 1)
+        else:
+            chunk = self._stream.read(min(int(size), remaining + 1))
+        self._total_read += len(chunk)
+        if self._total_read > self._max_bytes:
+            raise ValueError("R2_BUNDLE_EXTRACTED_SIZE_EXCEEDED:stream_limit")
+        return chunk
 
 
 class CloudStateIntegrityError(ValueError):
@@ -755,6 +802,28 @@ class R2CloudStateStore:
                 _PROCESS_LOCKS[scope] = lock_obj
             return lock_obj
 
+    @contextmanager
+    def _lock_critical_section(self, lock_key: str) -> Iterator[None]:
+        """Acquire in-process mutex plus OS-level fcntl.flock when 501 fallback is enabled."""
+        local_lock = self._local_lock_for(lock_key)
+        with local_lock:
+            if not self.allow_s3_501_lock_fallback or fcntl is None:
+                yield
+                return
+            scope_id = hashlib.sha256(
+                f"{self.config.endpoint_url.rstrip('/')}|{self.config.bucket.strip('/')}|{self._base_prefix}|{lock_key}".encode("utf-8")
+            ).hexdigest()[:32]
+            lock_path = Path(tempfile.gettempdir()) / f"cba_kb_r2_lock_{scope_id}.lock"
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
     def _put_lock_conditional(
         self,
         lock_key: str,
@@ -790,30 +859,36 @@ class R2CloudStateStore:
         ):
             # 1. Pre-check existing remote lock object before unconditional fallback PUT
             cur_existing, _ = self._get_json_with_etag(lock_key)
-            if isinstance(cur_existing, dict):
+            target_status = str(lock_doc.get("status") or "").strip().upper()
+            my_owner = str(lock_doc.get("owner_id") or "").strip()
+            my_token = lock_doc.get("fencing_token")
+            if target_status == "RELEASED":
+                if not isinstance(cur_existing, dict):
+                    raise R2LockContentionError(
+                        f"R2_LOCK_CONTENTION_501_FALLBACK:{lock_key}:missing_on_release"
+                    )
+                cur_owner = str(cur_existing.get("owner_id") or "").strip()
+                cur_token = cur_existing.get("fencing_token")
+                if cur_owner != my_owner or cur_token != my_token:
+                    raise R2LockContentionError(
+                        f"R2_LOCK_CONTENTION_501_FALLBACK:{lock_key}:owner_or_token_changed"
+                    )
+            elif isinstance(cur_existing, dict):
                 cur_status = str(cur_existing.get("status") or "").strip().upper()
                 check_now = now_utc if now_utc is not None else datetime.now(timezone.utc)
                 if check_now.tzinfo is None:
                     check_now = check_now.replace(tzinfo=timezone.utc)
                 else:
                     check_now = check_now.astimezone(timezone.utc)
-                target_status = str(lock_doc.get("status") or "").strip().upper()
                 cur_owner = str(cur_existing.get("owner_id") or "").strip()
-                my_owner = str(lock_doc.get("owner_id") or "").strip()
-                if target_status == "RELEASED":
-                    if cur_owner and cur_owner != my_owner:
-                        raise R2LockContentionError(
-                            f"R2_LOCK_CONTENTION_501_FALLBACK:{lock_key}:owner_changed"
-                        )
-                else:
-                    if (
-                        cur_status in _ACTIVE_LOCK_STATUSES
-                        and not _is_lock_expired(cur_existing, check_now, lock_ttl_seconds)
-                        and cur_owner != my_owner
-                    ):
-                        raise R2LockContentionError(
-                            f"R2_LOCK_CONTENTION_501_FALLBACK:{lock_key}:active_other_owner"
-                        )
+                if (
+                    cur_status in _ACTIVE_LOCK_STATUSES
+                    and not _is_lock_expired(cur_existing, check_now, lock_ttl_seconds)
+                    and cur_owner != my_owner
+                ):
+                    raise R2LockContentionError(
+                        f"R2_LOCK_CONTENTION_501_FALLBACK:{lock_key}:active_other_owner"
+                    )
 
             # 2. Unconditional fallback PUT with x-amz-meta-sha256 + fencing_token
             unconditional_headers = {
@@ -873,13 +948,17 @@ class R2CloudStateStore:
         else:
             now = now.astimezone(timezone.utc)
 
-        lock_doc: Dict[str, Any] = dict(extra) if isinstance(extra, Mapping) else {}
+        lock_doc: Dict[str, Any] = (
+            {k: v for k, v in extra.items() if k not in _RESERVED_LOCK_FIELDS}
+            if isinstance(extra, Mapping)
+            else {}
+        )
         lock_doc["job_id"] = str(job_id)
         lock_doc["owner_id"] = str(owner_id)
-        lock_doc["fencing_token"] = str(lock_doc.get("fencing_token") or uuid.uuid4().hex)
+        lock_doc["fencing_token"] = _next_fencing_token()
         lock_doc["person"] = str(person_key)
         lock_doc["season"] = str(season)
-        lock_doc["status"] = str(lock_doc.get("status") or "RUNNING")
+        lock_doc["status"] = "RUNNING"
         created_str = lock_doc.get("created_at_utc") or now.strftime("%Y-%m-%dT%H:%M:%SZ")
         lock_doc["created_at_utc"] = created_str
         created_dt = _parse_iso_utc(created_str) or now
@@ -888,7 +967,7 @@ class R2CloudStateStore:
         )
 
         lock_key = self._lock_key(person_key, season)
-        with self._local_lock_for(lock_key):
+        with self._lock_critical_section(lock_key):
             existing, existing_etag = self._get_json_with_etag(lock_key)
             if isinstance(existing, dict):
                 existing_status = str(existing.get("status") or "").strip().upper()
@@ -962,7 +1041,7 @@ class R2CloudStateStore:
         if not isinstance(owner_id, str) or not owner_id.strip():
             return False
         lock_key = self._lock_key(person_key, season)
-        with self._local_lock_for(lock_key):
+        with self._lock_critical_section(lock_key):
             current, etag = self._get_json_with_etag(lock_key)
             if not isinstance(current, dict):
                 return False
@@ -1175,59 +1254,63 @@ class R2CloudStateStore:
         total_extracted = 0
         member_count = 0
 
-        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tf:
-            for member in tf:
-                member_count += 1
-                if member_count > max_mem:
-                    raise ValueError("R2_BUNDLE_MAX_MEMBERS_EXCEEDED")
+        with gzip.GzipFile(fileobj=io.BytesIO(raw), mode="rb") as gz:
+            bounded_stream = _BoundedReadStream(gz, max_bytes=max_ext)
+            with tarfile.open(fileobj=bounded_stream, mode="r|") as tf:
+                for member in tf:
+                    member_count += 1
+                    if member_count > max_mem:
+                        raise ValueError("R2_BUNDLE_MAX_MEMBERS_EXCEEDED")
 
-                raw_name = member.name
-                if (
-                    not isinstance(raw_name, str)
-                    or not raw_name
-                    or "\x00" in raw_name
-                    or "\\" in raw_name
-                    or raw_name.startswith("/")
-                    or _WIN_DRIVE_RE.match(raw_name)
-                ):
-                    raise ValueError(f"R2_BUNDLE_PATH_TRAVERSAL:{raw_name}")
-                raw_parts = raw_name.split("/")
-                if ".." in raw_parts:
-                    raise ValueError(f"R2_BUNDLE_PATH_TRAVERSAL:{raw_name}")
+                    raw_name = member.name
+                    if (
+                        not isinstance(raw_name, str)
+                        or not raw_name
+                        or "\x00" in raw_name
+                        or "\\" in raw_name
+                        or raw_name.startswith("/")
+                        or _WIN_DRIVE_RE.match(raw_name)
+                    ):
+                        raise ValueError(f"R2_BUNDLE_PATH_TRAVERSAL:{raw_name}")
+                    raw_parts = raw_name.split("/")
+                    if ".." in raw_parts:
+                        raise ValueError(f"R2_BUNDLE_PATH_TRAVERSAL:{raw_name}")
 
-                if member.isdir():
-                    continue
-                if not member.isreg():
-                    raise ValueError(f"R2_BUNDLE_UNSAFE_MEMBER_TYPE:{raw_name}")
+                    if member.isdir():
+                        if member.size != 0:
+                            raise ValueError(f"R2_BUNDLE_INVALID_DIR_SIZE:{raw_name}")
+                        continue
+                    if not member.isreg():
+                        raise ValueError(f"R2_BUNDLE_UNSAFE_MEMBER_TYPE:{raw_name}")
 
-                clean_parts = [p for p in raw_parts if p and p != "."]
-                if not clean_parts:
-                    raise ValueError(f"R2_BUNDLE_PATH_TRAVERSAL:{raw_name}")
-                rel_norm = PurePosixPath(*clean_parts).as_posix()
-                if not _is_bundle_member_allowed(rel_norm, allowlisted_exact_names):
-                    raise ValueError(f"R2_BUNDLE_DISALLOWED_MEMBER:{rel_norm}")
+                    clean_parts = [p for p in raw_parts if p and p != "."]
+                    if not clean_parts:
+                        raise ValueError(f"R2_BUNDLE_PATH_TRAVERSAL:{raw_name}")
+                    rel_norm = PurePosixPath(*clean_parts).as_posix()
+                    if not _is_bundle_member_allowed(rel_norm, allowlisted_exact_names):
+                        raise ValueError(f"R2_BUNDLE_DISALLOWED_MEMBER:{rel_norm}")
 
-                target = (base / rel_norm).resolve()
-                if target == base or not target.is_relative_to(base):
-                    raise ValueError(f"R2_BUNDLE_PATH_TRAVERSAL:{raw_name}")
+                    target = (base / rel_norm).resolve()
+                    if target == base or not target.is_relative_to(base):
+                        raise ValueError(f"R2_BUNDLE_PATH_TRAVERSAL:{raw_name}")
 
-                # Pre-write lstat check: reject any pre-existing symlink along parent dirs or target
-                walk_p = base
-                for seg in clean_parts:
-                    walk_p = walk_p / seg
-                    if walk_p.is_symlink():
-                        raise ValueError(f"R2_BUNDLE_SYMLINK_TARGET:{rel_norm}")
+                    # Pre-write lstat check: reject any pre-existing symlink along parent dirs or target
+                    walk_p = base
+                    for seg in clean_parts:
+                        walk_p = walk_p / seg
+                        if walk_p.is_symlink():
+                            raise ValueError(f"R2_BUNDLE_SYMLINK_TARGET:{rel_norm}")
 
-                if member.size < 0 or (total_extracted + member.size) > max_ext:
-                    raise ValueError("R2_BUNDLE_EXTRACTED_SIZE_EXCEEDED")
+                    if member.size < 0 or (total_extracted + member.size) > max_ext:
+                        raise ValueError("R2_BUNDLE_EXTRACTED_SIZE_EXCEEDED")
 
-                remaining = max_ext - total_extracted
-                fobj = tf.extractfile(member)
-                content = fobj.read(remaining + 1) if fobj is not None else b""
-                if len(content) > remaining:
-                    raise ValueError("R2_BUNDLE_EXTRACTED_SIZE_EXCEEDED")
-                total_extracted += len(content)
-                staged.append((rel_norm, clean_parts, content))
+                    remaining = max_ext - total_extracted
+                    fobj = tf.extractfile(member)
+                    content = fobj.read(remaining + 1) if fobj is not None else b""
+                    if len(content) > remaining:
+                        raise ValueError("R2_BUNDLE_EXTRACTED_SIZE_EXCEEDED")
+                    total_extracted += len(content)
+                    staged.append((rel_norm, clean_parts, content))
 
         base.mkdir(parents=True, exist_ok=True)
         for _, clean_parts, content in staged:
