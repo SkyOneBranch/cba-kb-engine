@@ -25,6 +25,7 @@ from .consumer_surface import (
     CONSUMER_MASTER_FILENAME,
     FOREIGN_REGISTRATION_CSV_FILENAME,
     evaluate_league_coverage,
+    find_boundary_safe_name_spans,
     scrub_raw_drive_ids_for_consumer,
 )
 from .game_stats import summarize_recent_games
@@ -39,10 +40,110 @@ def _norm_key(value: Any) -> str:
 
 
 def _safe_id_for_filename(value: Any) -> str:
-    raw = str(value or "unassigned").strip()
+    raw = str(value or "").strip()
     if not raw:
-        return "unassigned"
-    return raw.replace(":", "_").replace("/", "_").replace("\\", "_")
+        return "待核俱乐部"
+    cleaned = raw.replace(":", "_").replace("/", "_").replace("\\", "_").replace("\x00", "")
+    cleaned = cleaned.replace("..", "_")
+    cleaned = "_".join(cleaned.split())
+    if not cleaned or "unassigned" in cleaned.lower():
+        return "待核俱乐部"
+    return cleaned
+
+
+def _resolve_filename_middle_segment(
+    person: Dict[str, Any],
+    *,
+    current_club: Optional[str] = None,
+) -> str:
+    """Derive consumer card filename middle segment without ever emitting `unassigned`.
+
+    Priority order (REQ-231 P0-2):
+    1. Sanitized current club name
+    2. Non-empty player_id (not `unassigned`)
+    3. Non-empty player_uid (not `unassigned`)
+    4. Literal `待核俱乐部`
+    """
+    for candidate in (
+        current_club,
+        person.get("current_club"),
+        person.get("player_id"),
+        person.get("player_uid"),
+    ):
+        raw = str(candidate or "").strip()
+        if not raw:
+            continue
+        cleaned = raw.replace(":", "_").replace("/", "_").replace("\\", "_").replace("\x00", "")
+        cleaned = cleaned.replace("..", "_")
+        cleaned = "_".join(cleaned.split())
+        if cleaned and "unassigned" not in cleaned.lower():
+            return cleaned
+    return "待核俱乐部"
+
+
+def _build_domestic_registration_blocks(
+    domestic_records: Sequence[Dict[str, Any]],
+    *,
+    target_season: str,
+) -> tuple[Optional[Dict[str, str]], List[Dict[str, str]]]:
+    """Build current-season domestic contract summary and up to 3-season descending history."""
+    by_season: Dict[str, Dict[str, str]] = {}
+    for rec in domestic_records or ():
+        if not isinstance(rec, dict):
+            continue
+        season_str = str(rec.get("season") or "").strip()
+        summary = {
+            "season": season_str,
+            "club_official": str(rec.get("club_official") or rec.get("club") or "").strip(),
+            "registration_stage": str(rec.get("registration_stage") or "").strip(),
+            "registration_method": str(rec.get("registration_method") or "").strip(),
+            "contract_category": str(rec.get("contract_category") or "").strip(),
+            "contract_term_official": str(rec.get("contract_term_official") or "").strip(),
+            "former_club": str(rec.get("former_club") or "").strip(),
+            "registration_status": str(rec.get("registration_status") or "").strip(),
+            "remarks": str(rec.get("remarks") or "").strip(),
+        }
+        by_season[season_str] = summary
+
+    if not by_season:
+        return None, []
+
+    sorted_desc = sorted(
+        by_season.values(),
+        key=lambda item: item["season"],
+        reverse=True,
+    )
+    target_key = str(target_season or "").strip()
+    domestic_current = by_season.get(target_key) or sorted_desc[0]
+    domestic_history = sorted_desc[:3]
+    return domestic_current, domestic_history
+
+
+def _build_foreign_registration_block(
+    foreign_records: Sequence[Dict[str, Any]],
+    *,
+    person: Dict[str, Any],
+    player_name: str,
+) -> Optional[Dict[str, str]]:
+    """Build structured foreign registration block from the latest snapshot record."""
+    valid = [r for r in (foreign_records or ()) if isinstance(r, dict)]
+    if not valid:
+        return None
+    latest = max(
+        enumerate(valid),
+        key=lambda pair: (str(pair[1].get("published_at") or ""), pair[0]),
+    )[1]
+    return {
+        "club": str(latest.get("club") or person.get("current_club") or "").strip(),
+        "player_en": str(latest.get("player_en") or person.get("player_name_en") or "").strip(),
+        "player_zh": str(latest.get("player_zh") or player_name or "").strip(),
+        "nationality": str(latest.get("nationality") or "").strip(),
+        "position": str(latest.get("position") or person.get("position") or "").strip(),
+        "jersey_number": str(latest.get("jersey_number") or person.get("jersey_number") or "").strip(),
+        "published_at": str(latest.get("published_at") or "").strip(),
+        "doc_id": str(latest.get("doc_id") or "").strip(),
+        "raw_sha256": str(latest.get("raw_sha256") or "").strip(),
+    }
 
 
 def _read_csv_rows(path: Path) -> List[Dict[str, Any]]:
@@ -763,11 +864,87 @@ def _match_game_stats(
     return matched
 
 
+def _is_club_adjacent_to_name(text: str, player_name: str, club: str) -> bool:
+    if not text or not player_name or not club:
+        return False
+    t_norm = _norm_key(text)
+    p_norm = _norm_key(player_name)
+    c_norm = _norm_key(club)
+    if not p_norm or not c_norm or c_norm not in t_norm:
+        return False
+    for pattern in (
+        f"{p_norm}（{c_norm}）",
+        f"{p_norm}({c_norm})",
+        f"{p_norm}（{c_norm}",
+        f"{p_norm}({c_norm}",
+        f"{c_norm}{p_norm}",
+        f"{c_norm} {p_norm}",
+    ):
+        if pattern in t_norm:
+            return True
+    return False
+
+
 def _match_document_bundles(
     person: Dict[str, Any],
     document_bundles: Sequence[Dict[str, Any]],
+    *,
+    roster_candidates: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     tokens = _person_match_tokens(person)
+    id_tokens = {
+        _norm_key(person.get("player_uid")),
+        _norm_key(person.get("player_id")),
+    }
+    id_tokens.discard("")
+
+    person_name_raw = str(person.get("player_name") or "").strip()
+    person_name_norm = _norm_key(person_name_raw)
+    person_clubs_raw: List[str] = []
+    for raw_c in (
+        person.get("current_club"),
+        *(person.get("clubs_history") or ()),
+    ):
+        sc = str(raw_c or "").strip()
+        if sc and sc not in person_clubs_raw:
+            person_clubs_raw.append(sc)
+    person_clubs_norm = {_norm_key(c) for c in person_clubs_raw} - {""}
+
+    is_homonym = False
+    other_homonym_clubs: List[str] = []
+    enrich_fn = None
+    if roster_candidates is not None:
+        from .consumer_surface import enrich_bundle_matched_persons
+
+        enrich_fn = enrich_bundle_matched_persons
+        if person_name_norm:
+            same_name = [
+                c
+                for c in roster_candidates
+                if isinstance(c, dict)
+                and _norm_key(c.get("player_name") or c.get("player")) == person_name_norm
+            ]
+            distinct_keys = {
+                (
+                    _norm_key(c.get("player_uid")),
+                    _norm_key(c.get("player_id")),
+                    _norm_key(c.get("current_club") or c.get("club_official") or c.get("club")),
+                )
+                for c in same_name
+            }
+            if len(distinct_keys) >= 2:
+                is_homonym = True
+                p_uid = _norm_key(person.get("player_uid"))
+                for c in same_name:
+                    c_club = str(
+                        c.get("current_club") or c.get("club_official") or c.get("club") or ""
+                    ).strip()
+                    c_uid = _norm_key(c.get("player_uid"))
+                    if c_club and _norm_key(c_club) not in person_clubs_norm:
+                        if not (p_uid and c_uid and p_uid == c_uid):
+                            if c_club not in other_homonym_clubs:
+                                other_homonym_clubs.append(c_club)
+
     matched: List[Dict[str, Any]] = []
     seen_ids: set[str] = set()
     for b in document_bundles or ():
@@ -776,12 +953,81 @@ def _match_document_bundles(
         doc_id = str(b.get("doc_id") or "").strip()
         if doc_id and doc_id in seen_ids:
             continue
-        mp = {_norm_key(x) for x in (b.get("matched_persons") or ()) if x}
-        hit = bool(mp & tokens)
-        if not hit:
-            title_norm = _norm_key(b.get("title"))
-            if any(len(tok) >= 2 and tok in title_norm for tok in tokens):
-                hit = True
+
+        effective_bundle = (
+            enrich_fn(b, roster_candidates=roster_candidates)
+            if enrich_fn is not None
+            else b
+        )
+        mp = {_norm_key(x) for x in (effective_bundle.get("matched_persons") or ()) if x}
+
+        if is_homonym:
+            hit = bool(id_tokens and (mp & id_tokens))
+            if not hit and (mp & tokens):
+                text = f"{b.get('title') or ''}\n{b.get('body') or ''}"
+                text_norm = _norm_key(text)
+                own_adjacent = any(
+                    _is_club_adjacent_to_name(text, person_name_raw, c)
+                    for c in person_clubs_raw
+                )
+                other_adjacent = any(
+                    _is_club_adjacent_to_name(text, person_name_raw, c)
+                    for c in other_homonym_clubs
+                )
+                if own_adjacent:
+                    hit = True
+                elif other_adjacent:
+                    hit = False
+                else:
+                    has_own = any(cn in text_norm for cn in person_clubs_norm)
+                    has_other = any(
+                        _norm_key(c) in text_norm
+                        for c in other_homonym_clubs
+                        if _norm_key(c)
+                    )
+                    hit = bool(has_own and not has_other)
+        else:
+            hit = bool(mp & tokens)
+            if not hit:
+                title_norm = _norm_key(b.get("title"))
+                candidate_names: List[str] = []
+                if roster_candidates:
+                    candidate_names = sorted(
+                        {
+                            _norm_key(
+                                c.get("player_name")
+                                or c.get("canonical_name")
+                                or c.get("player")
+                                or c.get("player_zh")
+                            )
+                            for c in roster_candidates
+                            if isinstance(c, dict)
+                        }
+                        - tokens
+                        - {""},
+                        key=lambda n: (-len(n), n),
+                    )
+                for tok in sorted(tokens, key=lambda t: (-len(t), t)):
+                    if len(tok) < 2:
+                        continue
+                    occupied_title_spans: List[tuple[int, int]] = []
+                    for lname in candidate_names:
+                        if len(lname) > len(tok):
+                            occupied_title_spans.extend(
+                                find_boundary_safe_name_spans(
+                                    title_norm,
+                                    lname,
+                                    occupied_spans=occupied_title_spans,
+                                )
+                            )
+                    if find_boundary_safe_name_spans(
+                        title_norm,
+                        tok,
+                        occupied_spans=occupied_title_spans,
+                    ):
+                        hit = True
+                        break
+
         if hit:
             if doc_id:
                 seen_ids.add(doc_id)
@@ -815,6 +1061,7 @@ def build_person_card(
     known_drive_ids: Sequence[str] = (),
     coverage_ledger: Optional[Dict[str, Any]] = None,
     observation_horizon: Optional[Dict[str, Any]] = None,
+    game_stats_degraded: bool = False,
 ) -> Dict[str, Any]:
     """Assemble and render an on-demand research card for any player in local KB.
 
@@ -890,10 +1137,33 @@ def build_person_card(
         if matched_games
         else None
     )
-    citations = _match_document_bundles(person, doc_bundles)
+    roster_pool = (
+        _build_candidate_pool(
+            master_rows=m_rows,
+            foreign_rows=f_rows,
+            identity_registry=id_reg,
+        )
+        if doc_bundles
+        else None
+    )
+    citations = _match_document_bundles(person, doc_bundles, roster_candidates=roster_pool)
 
     player_name = str(person.get("player_name") or query.strip())
     player_id = person.get("player_id") or person.get("player_uid") or "unassigned"
+    domestic_current, domestic_history = _build_domestic_registration_blocks(
+        person.get("domestic_records") or (),
+        target_season=season,
+    )
+    foreign_registration = _build_foreign_registration_block(
+        person.get("foreign_records") or (),
+        person=person,
+        player_name=player_name,
+    )
+    effective_club = (
+        (domestic_current or {}).get("club_official")
+        or (foreign_registration or {}).get("club")
+        or person.get("current_club")
+    )
 
     if matched_season:
         primary = matched_season[0]
@@ -961,19 +1231,32 @@ def build_person_card(
             },
         }
 
-    payload["registration_profile"] = {
+    reg_profile: Dict[str, Any] = {
         "player_name": player_name,
         "player_name_en": person.get("player_name_en"),
         "player_uid": person.get("player_uid"),
         "player_id": person.get("player_id"),
-        "current_club": person.get("current_club"),
+        "current_club": effective_club,
         "clubs_history": person.get("clubs_history") or [],
         "registration_type": person.get("registration_type"),
         "position": person.get("position"),
         "jersey_number": person.get("jersey_number"),
     }
+    if domestic_current is not None:
+        reg_profile["domestic_current"] = domestic_current
+    if domestic_history:
+        reg_profile["domestic_history"] = domestic_history
+    if foreign_registration is not None:
+        reg_profile["foreign_registration"] = foreign_registration
+    payload["registration_profile"] = reg_profile
+
     if recent_summary is not None:
         payload["recent_games_summary"] = recent_summary
+    else:
+        payload["single_game_stats_gap"] = {
+            "available": False,
+            "degraded": bool(game_stats_degraded),
+        }
     if citations:
         payload["external_citations"] = citations
     if obs_horizon is not None:
@@ -984,9 +1267,10 @@ def build_person_card(
     if not markdown.rstrip().endswith("end_marker: true"):
         markdown = markdown.rstrip() + "\n\nend_marker: true\n"
 
+    filename_middle = _resolve_filename_middle_segment(person, current_club=effective_club)
     filename = research_card_consumer_filename(
         player_name,
-        _safe_id_for_filename(player_id),
+        filename_middle,
         season,
     )
     card_bytes = markdown.encode("utf-8")

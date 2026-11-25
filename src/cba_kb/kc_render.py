@@ -320,6 +320,77 @@ def render_research_card(
         if reg_profile.get("jersey_number"):
             lines.append(f"- Jersey Number: {reg_profile['jersey_number']}")
 
+        # REQ-231 P0-2: Rich domestic contract & cross-season history block (optional, 0-byte diff when absent)
+        dom_cur = reg_profile.get("domestic_current")
+        if isinstance(dom_cur, dict) and dom_cur:
+            if dom_cur.get("club_official") and not reg_profile.get("current_club"):
+                lines.append(f"- Current Club: {dom_cur['club_official']}")
+            if dom_cur.get("registration_stage"):
+                lines.append(f"- Registration Stage: {dom_cur['registration_stage']}")
+            if dom_cur.get("registration_method"):
+                lines.append(f"- Registration Method: {dom_cur['registration_method']}")
+            contract_cat = str(dom_cur.get("contract_category") or "").strip() or "未公示 (UNKNOWN)"
+            contract_term = str(dom_cur.get("contract_term_official") or "").strip() or "未公示 (UNKNOWN)"
+            lines.append(f"- Contract Category: {contract_cat}")
+            lines.append(f"- Official Contract Term / Expiry: {contract_term}")
+            if dom_cur.get("former_club"):
+                lines.append(f"- Former Club: {dom_cur['former_club']}")
+            if dom_cur.get("registration_status"):
+                lines.append(f"- Registration Status: {dom_cur['registration_status']}")
+            if dom_cur.get("remarks"):
+                lines.append(f"- Remarks: {dom_cur['remarks']}")
+            lines.append(
+                "- Official Salary Disclosure: 官方仅公示合同类别与期限，个人实领薪资未公开 (Unknown != 0)"
+            )
+
+        dom_hist = reg_profile.get("domestic_history")
+        if isinstance(dom_hist, list) and dom_hist:
+            sorted_hist = sorted(
+                (h for h in dom_hist if isinstance(h, dict)),
+                key=lambda h: str(h.get("season") or ""),
+                reverse=True,
+            )[:3]
+            if sorted_hist:
+                lines.extend([
+                    "",
+                    "### Cross-Season Registration History",
+                ])
+                for h in sorted_hist:
+                    h_season = str(h.get("season") or "-")
+                    h_club = str(h.get("club_official") or "-")
+                    h_cat = str(h.get("contract_category") or "").strip() or "未公示 (UNKNOWN)"
+                    h_term = str(h.get("contract_term_official") or "").strip() or "未公示 (UNKNOWN)"
+                    h_method = str(h.get("registration_method") or "").strip() or "-"
+                    h_former = str(h.get("former_club") or "").strip() or "-"
+                    lines.append(
+                        f"- {h_season} | {h_club} | {h_cat} | {h_term} | {h_method} | {h_former}"
+                    )
+
+        # REQ-231 P0-2: Rich foreign registration block (optional, 0-byte diff when absent)
+        for_reg = reg_profile.get("foreign_registration")
+        if isinstance(for_reg, dict) and for_reg:
+            if for_reg.get("club") and not reg_profile.get("current_club"):
+                lines.append(f"- Current Club: {for_reg['club']}")
+            if for_reg.get("player_en") and not reg_profile.get("player_name_en"):
+                lines.append(f"- English Name: {for_reg['player_en']}")
+            if for_reg.get("player_zh"):
+                lines.append(f"- Chinese Name: {for_reg['player_zh']}")
+            if for_reg.get("nationality"):
+                lines.append(f"- Nationality: {for_reg['nationality']}")
+            if for_reg.get("position") and not reg_profile.get("position"):
+                lines.append(f"- Position: {for_reg['position']}")
+            if for_reg.get("jersey_number") and not reg_profile.get("jersey_number"):
+                lines.append(f"- Jersey Number: {for_reg['jersey_number']}")
+            if for_reg.get("published_at"):
+                lines.append(f"- Official Snapshot Published At: {for_reg['published_at']}")
+            if for_reg.get("doc_id"):
+                lines.append(f"- Snapshot doc_id: {for_reg['doc_id']}")
+            if for_reg.get("raw_sha256"):
+                lines.append(f"- Snapshot raw_sha256: {for_reg['raw_sha256']}")
+            lines.append(
+                "- Data Layer: evidence / candidate_observation (Statement != Fact)"
+            )
+
     # 7. Recent Single-Game Log Section (REQ-223 P0-4: PLAYER_GAME_STATS grain, lossless)
     recent_games = payload.get("recent_games_summary")
     if isinstance(recent_games, dict):
@@ -421,6 +492,23 @@ def render_research_card(
                     f"{grev.get('new_record_id')} supersedes {grev.get('prior_record_id')}"
                 )
                 lines.append(f"- [{g_posture}] {g_notice}")
+    elif (
+        isinstance(payload.get("single_game_stats_gap"), dict)
+        and payload["single_game_stats_gap"].get("available") is False
+    ):
+        has_v223_extension = True
+        degraded = bool(payload["single_game_stats_gap"].get("degraded"))
+        gap_line = (
+            "- Recent Single-Game Stats: NOT_AVAILABLE_IN_CURRENT_SNAPSHOT "
+            "(Unknown != 0; 严禁凭外部记忆编造单场得分)"
+        )
+        if degraded:
+            gap_line += " [云端单场数据源降级 / cloud single-game source degraded]"
+        lines.extend([
+            "",
+            "## Recent Single-Game Log (Player-Game Grain)",
+            gap_line,
+        ])
 
     if has_v223_extension:
         from .consumer_surface import scrub_raw_drive_ids_for_consumer

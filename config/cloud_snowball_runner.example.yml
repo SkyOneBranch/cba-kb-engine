@@ -45,15 +45,20 @@ jobs:
     permissions:
       contents: read
     env:
+      # Object storage endpoint (R2_ENDPOINT is also recognized as fallback for S3/Backblaze B2)
       CBA_KB_R2_ENDPOINT_URL: ${{ secrets.CBA_KB_R2_ENDPOINT_URL }}
       CBA_KB_R2_BUCKET: ${{ secrets.CBA_KB_R2_BUCKET }}
       CBA_KB_R2_ACCESS_KEY_ID: ${{ secrets.CBA_KB_R2_ACCESS_KEY_ID }}
       CBA_KB_R2_SECRET_ACCESS_KEY: ${{ secrets.CBA_KB_R2_SECRET_ACCESS_KEY }}
+      # Optional opt-in ("1") ONLY for S3-compatible providers (e.g. Backblaze B2) that return
+      # HTTP 501 NotImplemented on conditional lock PUT; default "0" is strictly fail-closed.
+      CBA_KB_S3_LOCK_501_FALLBACK: ${{ vars.CBA_KB_S3_LOCK_501_FALLBACK || '0' }}
       CBA_KB_DRIVE_TOKEN_JSON: ${{ secrets.CBA_KB_DRIVE_TOKEN_JSON }}
       CBA_KB_DRIVE_SNOWBALL_FOLDER_ID: ${{ secrets.CBA_KB_DRIVE_SNOWBALL_FOLDER_ID }}
       CBA_KB_DRIVE_PROTECTED_FOLDER_IDS: ${{ secrets.CBA_KB_DRIVE_PROTECTED_FOLDER_IDS }}
       COLLECTOR_CMD: ${{ vars.CBA_KB_COLLECTOR_CMD || 'cba-kb-collector collect' }}
       INSTANCE_ROOT: ./workspace/cloud_instance
+      BUNDLE_KEY: ${{ vars.CBA_KB_INSTANCE_BUNDLE_KEY || 'cloud_instance/cloud_instance_bundle.tar.gz' }}
       TARGET_PERSON: ${{ github.event.client_payload.person || inputs.person }}
       TARGET_SEASON: ${{ github.event.client_payload.season || inputs.season || '2026-2027' }}
       TARGET_JOB_ID: ${{ github.event.client_payload.job_id || inputs.job_id }}
@@ -73,11 +78,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e .
 
-      - name: Pull cloud state snapshot from R2
-        run: |
-          cba-kb cloud-state-pull --output-dir ./workspace/cloud_instance
-
-      - name: Execute on-demand snowball query and sync
+      - name: Execute cache-first snowball query with lazy single-bundle pull/push
         run: |
           EXTRA_FLAGS=""
           if [ "${FORCE_REFRESH}" = "true" ]; then
@@ -89,6 +90,8 @@ jobs:
             --job-id "${TARGET_JOB_ID}" \
             --owner-id "${TARGET_OWNER_ID}" \
             --instance-root "${INSTANCE_ROOT:-.}" \
+            --lazy-pull-bundle \
+            --bundle-key "${BUNDLE_KEY}" \
             --collector-cmd "${COLLECTOR_CMD}" \
             --snowball-folder-id "${CBA_KB_DRIVE_SNOWBALL_FOLDER_ID}" \
             ${EXTRA_FLAGS}

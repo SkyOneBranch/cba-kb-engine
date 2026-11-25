@@ -18,7 +18,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from .common import atomic
-from .consumer_surface import DEFAULT_MAX_EXTERNAL_CITATIONS_PER_CARD
+from .consumer_surface import (
+    DEFAULT_MAX_EXTERNAL_CITATIONS_PER_CARD,
+    enrich_bundle_matched_persons,
+)
 from .document_lane import DocumentLane
 from .document_mentions import compute_dirty_set
 from .game_stats import reconcile_game_stat_revisions, validate_player_game_stat_record
@@ -281,6 +284,7 @@ def run_operational_sync(
     game_logs_dir: Optional[str | Path] = None,
     coverage_ledger_path: Optional[str | Path] = None,
     negative_receipts_path: Optional[str | Path] = None,
+    roster_candidates: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Run local-first incremental operational sync and emit freshness_report.json.
 
@@ -291,6 +295,18 @@ def run_operational_sync(
     out_path = Path(output_dir)
     reg_snaps_path = Path(registration_snapshots_dir) if registration_snapshots_dir is not None else None
     game_logs_path = Path(game_logs_dir) if game_logs_dir is not None else None
+
+    identity_registry = _load_json_if_exists(
+        identity_registry_path,
+        {"schema_version": 1, "players": [], "aliases": []},
+    )
+    effective_roster_candidates: List[Dict[str, Any]] = []
+    if roster_candidates is not None:
+        effective_roster_candidates = [dict(c) for c in roster_candidates if isinstance(c, dict)]
+    elif isinstance(identity_registry, dict) and isinstance(identity_registry.get("players"), list):
+        effective_roster_candidates = [
+            dict(p) for p in identity_registry["players"] if isinstance(p, dict)
+        ]
 
     checkpoint_path = out_path / CHECKPOINT_FILENAME
     prev_checkpoint = _load_json_if_exists(checkpoint_path, {})
@@ -329,6 +345,15 @@ def run_operational_sync(
             continue
 
         parsed_meta, parsed_body = parse_acquisition_bundle_markdown(raw_bytes)
+        enriched_bundle = enrich_bundle_matched_persons(
+            {
+                "title": parsed_meta.get("title") or "",
+                "body": parsed_body,
+                "matched_persons": list(parsed_meta.get("matched_persons") or []),
+            },
+            roster_candidates=effective_roster_candidates,
+        )
+        matched_persons = list(enriched_bundle.get("matched_persons") or [])
         if dry_run:
             # Dry-run must not mutate archive or checkpoint; simulate doc_id in memory.
             sim_doc_id = "doc_" + _sha256_bytes(parsed_body.encode("utf-8"))[:24]
@@ -337,7 +362,7 @@ def run_operational_sync(
                 "doc_id": sim_doc_id,
                 "content_hash": sim_hash,
                 "text": parsed_body,
-                "matched_persons": list(parsed_meta.get("matched_persons") or []),
+                "matched_persons": matched_persons,
             })
             doc_hashes[sim_doc_id] = sim_hash
             consumed_bundles[rel_key] = {
@@ -349,7 +374,7 @@ def run_operational_sync(
                 "completeness": parsed_meta.get("completeness"),
                 "published_at": parsed_meta.get("published_at"),
                 "title": parsed_meta.get("title"),
-                "matched_persons": list(parsed_meta.get("matched_persons") or []),
+                "matched_persons": matched_persons,
             }
             continue
 
@@ -372,7 +397,7 @@ def run_operational_sync(
             "completeness": parsed_meta.get("completeness"),
             "published_at": parsed_meta.get("published_at"),
             "title": parsed_meta.get("title"),
-            "matched_persons": list(parsed_meta.get("matched_persons") or []),
+            "matched_persons": matched_persons,
             "disclosure_posture": (
                 rev_summary.get("disclosure_posture")
                 if isinstance(rev_summary, dict)
@@ -383,7 +408,7 @@ def run_operational_sync(
             "doc_id": doc_id,
             "content_hash": content_hash,
             "text": parsed_body,
-            "matched_persons": list(parsed_meta.get("matched_persons") or []),
+            "matched_persons": matched_persons,
         })
 
     # 2. Offline registration snapshot replay (optional)
@@ -457,10 +482,6 @@ def run_operational_sync(
         }
 
     # 3. Dirty-set computation
-    identity_registry = _load_json_if_exists(
-        identity_registry_path,
-        {"schema_version": 1, "players": [], "aliases": []},
-    )
     approved_mentions = _load_json_if_exists(approved_mentions_path, [])
     if not isinstance(approved_mentions, list):
         approved_mentions = []

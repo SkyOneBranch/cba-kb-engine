@@ -1017,6 +1017,7 @@ def merge_operational_docs_into_consumer_index(
     operational_checkpoint: Dict[str, Any],
     *,
     known_drive_ids: Sequence[str] = (),
+    roster_candidates: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> bytes:
     """Idempotently merge operational checkpoint consumed_bundles into the consumer document index."""
     if existing_index_bytes and existing_index_bytes.strip():
@@ -1050,6 +1051,10 @@ def merge_operational_docs_into_consumer_index(
         doc_id = str(bundle.get("doc_id") or "").strip()
         if not doc_id:
             continue
+        if roster_candidates:
+            bundle = enrich_bundle_matched_persons(
+                bundle, roster_candidates=roster_candidates
+            )
         raw_sha = bundle.get("raw_sha256") or bundle.get("file_sha256")
         persons = bundle.get("matched_persons")
         evidence_fields: Dict[str, Any] = {
@@ -1249,28 +1254,147 @@ def _ensure_statement_notice(notice: Optional[str]) -> str:
     return f"{text} Statement != Fact. Evidence != Fact. Unknown != 0."
 
 
+_CJK_CHAR_RE = re.compile(r"[\u4e00-\u9fff]")
+_ASCII_LETTER_RE = re.compile(r"[A-Za-z]")
+_CLAUSE_BREAK_RE = re.compile(r"[。！？；\n]")
+
+# CJK name-boundary delimiters: prevent 2-char Chinese names (e.g. 王一) from
+# matching as unseparated substrings inside longer personal names (e.g. 王一鸣, 小王一)
+# while allowing natural Chinese sports/official prose.
+_CJK_SAFE_BOTH_CHARS = frozenset(
+    "的得地与和及并等在从向对被把将为是也又都已曾于由给同跟携"
+)
+_CJK_SAFE_LEFT_CHARS = _CJK_SAFE_BOTH_CHARS | frozenset(
+    "约含括迎送贺谢布宣报称说请访员援队部"
+)
+_CJK_SAFE_RIGHT_CHARS = _CJK_SAFE_BOTH_CHARS | frozenset(
+    "回返复出转续认入缺受离告官签报称表训集完获砍拿送抢盖助打参赛战伤停休退赴抵留走"
+)
+_CJK_SAFE_LEFT_BIGRAMS = frozenset({
+    "签约", "官宣", "报道", "包含", "包括", "认领", "转会", "续约", "加盟",
+    "入选", "回归", "返回", "复出", "告别", "离队", "训练", "集训", "名单",
+    "球员", "外援", "前锋", "后卫", "中锋", "队长", "教练", "以及", "关于",
+    "针对", "涉及", "乐部", "男篮", "球队", "表示", "确认", "宣布", "公布",
+    "通报", "注册", "引进", "租借", "交易", "裁掉", "买断",
+})
+_CJK_SAFE_RIGHT_BIGRAMS = frozenset({
+    "回归", "返回", "复出", "加盟", "转会", "续约", "认领", "入选", "出战",
+    "缺席", "受伤", "离队", "告别", "官宣", "签约", "报道", "表示", "训练",
+    "集训", "名单", "球员", "外援", "前锋", "后卫", "中锋", "队长", "教练",
+    "以及", "完成", "正式", "确认", "注册", "参赛", "登场", "首发", "替补",
+    "砍下", "拿到", "贡献", "得到", "表现", "伤停", "休战", "退赛", "退役",
+    "离任", "解约", "买断", "租借", "交易", "效力", "宣布", "透露", "接受",
+    "参加", "代表", "前往", "抵达", "留队",
+})
+
+
+def _is_cjk_left_boundary_ok(text: str, start: int) -> bool:
+    if start <= 0:
+        return True
+    prev_ch = text[start - 1]
+    if not _CJK_CHAR_RE.match(prev_ch):
+        return True
+    if prev_ch in _CJK_SAFE_LEFT_CHARS:
+        return True
+    if start >= 2 and text[start - 2 : start] in _CJK_SAFE_LEFT_BIGRAMS:
+        return True
+    return False
+
+
+def _is_cjk_right_boundary_ok(text: str, end: int) -> bool:
+    if end >= len(text):
+        return True
+    next_ch = text[end]
+    if not _CJK_CHAR_RE.match(next_ch):
+        return True
+    if next_ch in _CJK_SAFE_RIGHT_CHARS:
+        return True
+    if end + 2 <= len(text) and text[end : end + 2] in _CJK_SAFE_RIGHT_BIGRAMS:
+        return True
+    return False
+
+
+def _is_latin_player_name(value: str) -> bool:
+    """Return True when value looks like a Latin/English player name (not a Chinese club name)."""
+    text = str(value or "").strip()
+    if not text:
+        return False
+    return bool(_ASCII_LETTER_RE.search(text)) and not bool(_CJK_CHAR_RE.search(text))
+
+
 def _parse_foreign_registration_rows(bundle: Dict[str, Any]) -> list[Dict[str, str]]:
-    """Extract structured foreign player registration rows from a markdown table body."""
+    """Extract structured foreign player registration rows from a markdown table body.
+
+    Handles both standard 6-column tables and real CBA markdown tables with secondary
+    header rows (``| 英文名 | 中文名 | ... |``) and HTML ``rowspan`` continuation rows.
+    Resets ``current_club`` across table boundaries (non-table lines, headings,
+    markdown table separators, and header rows) and fails closed with
+    ``ValueError("FOREIGN_ROW_ORPHAN_CONTINUATION")`` if a continuation row appears
+    without an active club in the current table.
+    """
     body = str(bundle.get("body") or "")
     rows: list[Dict[str, str]] = []
+    current_club: str = ""
     for raw_line in body.splitlines():
         line = raw_line.strip()
         if not line.startswith("|") or not line.endswith("|"):
+            current_club = ""
             continue
         cells = [cell.strip() for cell in line.strip("|").split("|")]
         if not cells or all(not c or _MD_SEP_CELL_RE.match(c) for c in cells):
+            if any(_MD_SEP_CELL_RE.match(c) for c in cells):
+                current_club = ""
             continue
         first = cells[0]
+        second = cells[1] if len(cells) > 1 else ""
         if first == "俱乐部" or "外籍球员" in cells:
+            current_club = ""
             continue
-        if len(cells) >= 6:
-            club, player_en, player_zh, nationality, position, jersey_number = cells[:6]
+        if first == "英文名" or second == "中文名":
+            current_club = ""
+            continue
+
+        if len(cells) == 6:
+            if cells[5] == "" and _is_latin_player_name(first):
+                if not any(cells[1:5]):
+                    continue
+                if not current_club:
+                    raise ValueError("FOREIGN_ROW_ORPHAN_CONTINUATION")
+                club = current_club
+                player_en, player_zh, nationality, position, jersey_number = cells[:5]
+            elif first == "":
+                if not _is_latin_player_name(second) or not cells[2]:
+                    current_club = ""
+                    raise ValueError("FOREIGN_ROW_MALFORMED_CONTINUATION")
+                if not current_club:
+                    raise ValueError("FOREIGN_ROW_ORPHAN_CONTINUATION")
+                club = current_club
+                player_en, player_zh, nationality, position, jersey_number = cells[1:6]
+            else:
+                club, player_en, player_zh, nationality, position, jersey_number = cells[:6]
+                if club:
+                    current_club = club
         elif len(cells) == 5:
-            club, player_en, nationality, position, jersey_number = cells[:5]
-            player_zh = ""
+            if _is_latin_player_name(first):
+                if not any(cells[1:5]):
+                    continue
+                if not current_club:
+                    raise ValueError("FOREIGN_ROW_ORPHAN_CONTINUATION")
+                club = current_club
+                player_en, player_zh, nationality, position, jersey_number = cells[:5]
+            elif first == "":
+                current_club = ""
+                raise ValueError("FOREIGN_ROW_MALFORMED_CONTINUATION")
+            else:
+                club, player_en, nationality, position, jersey_number = cells[:5]
+                player_zh = ""
+                if club:
+                    current_club = club
         else:
-            continue
-        if not club and not player_en and not player_zh:
+            current_club = ""
+            raise ValueError("FOREIGN_ROW_MALFORMED_COLUMNS")
+
+        if not club or (not player_en and not player_zh):
             continue
         rows.append({
             "club": club,
@@ -1281,6 +1405,191 @@ def _parse_foreign_registration_rows(bundle: Dict[str, Any]) -> list[Dict[str, s
             "jersey_number": jersey_number,
         })
     return rows
+
+
+def _extract_candidate_clubs(candidate: Mapping[str, Any]) -> set[str]:
+    clubs: set[str] = set()
+    for field in ("current_club", "club_official", "club"):
+        val = str(candidate.get(field) or "").strip()
+        if val:
+            clubs.add(val)
+    hist = candidate.get("clubs_history")
+    if isinstance(hist, (list, tuple, set)):
+        for item in hist:
+            val = str(item or "").strip()
+            if val:
+                clubs.add(val)
+    return clubs
+
+
+def find_boundary_safe_name_spans(
+    text: str,
+    name: str,
+    *,
+    occupied_spans: Sequence[tuple[int, int]] = (),
+) -> list[tuple[int, int]]:
+    """Find non-overlapping, boundary-safe occurrences of ``name`` in ``text``.
+
+    - ASCII/Latin names require non-alphanumeric boundaries.
+    - CJK names require non-overlap with ``occupied_spans`` (longest-match first)
+      and safe left/right CJK boundaries so shorter names (e.g. ``王一``) cannot
+      falsely match inside longer unseparated names (e.g. ``王一鸣``, ``小王一``).
+    """
+    if not text or not name:
+        return []
+
+    def _overlaps(start: int, end: int) -> bool:
+        return any(not (end <= s or start >= e) for s, e in occupied_spans)
+
+    if not _CJK_CHAR_RE.search(name) and _ASCII_LETTER_RE.search(name):
+        pattern = re.compile(r"(?<![A-Za-z0-9])" + re.escape(name) + r"(?![A-Za-z0-9])")
+        return [m.span() for m in pattern.finditer(text) if not _overlaps(*m.span())]
+
+    spans: list[tuple[int, int]] = []
+    start = 0
+    step = len(name)
+    while True:
+        idx = text.find(name, start)
+        if idx < 0:
+            break
+        end = idx + step
+        if (
+            not _overlaps(idx, end)
+            and _is_cjk_left_boundary_ok(text, idx)
+            and _is_cjk_right_boundary_ok(text, end)
+        ):
+            spans.append((idx, end))
+            start = end
+        else:
+            start = idx + 1
+    return spans
+
+
+def _find_name_spans(
+    text: str,
+    name: str,
+    *,
+    occupied_spans: Sequence[tuple[int, int]] = (),
+) -> list[tuple[int, int]]:
+    return find_boundary_safe_name_spans(text, name, occupied_spans=occupied_spans)
+
+
+def _adjacent_clause_window(text: str, start: int, end: int, radius: int = 24) -> str:
+    left = max(0, start - radius)
+    right = min(len(text), end + radius)
+    before = text[left:start]
+    after = text[end:right]
+    # Trim across hard sentence/clause boundaries
+    before_breaks = list(_CLAUSE_BREAK_RE.finditer(before))
+    if before_breaks:
+        before = before[before_breaks[-1].end():]
+    after_break = _CLAUSE_BREAK_RE.search(after)
+    if after_break:
+        after = after[:after_break.start()]
+    return before + text[start:end] + after
+
+
+def enrich_bundle_matched_persons(
+    bundle: Mapping[str, Any],
+    *,
+    roster_candidates: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Deterministically enrich a bundle's ``matched_persons`` across title + body.
+
+    - Scans ``title + "\\n" + body`` for roster candidate names of length >= 2.
+    - Preserves existing ``matched_persons`` order and deduplicates deterministically.
+    - Homonym safety (Fail-Closed): when a name maps to >= 2 distinct roster candidates,
+      refuses to auto-tag unless uniquely disambiguated by an adjacent club qualifier
+      matching exactly one candidate.
+    """
+    out = dict(bundle)
+    existing_raw = bundle.get("matched_persons")
+    merged: list[str] = []
+    seen: set[str] = set()
+    if isinstance(existing_raw, (list, tuple)):
+        for item in existing_raw:
+            name = str(item or "").strip()
+            if name and name not in seen:
+                seen.add(name)
+                merged.append(name)
+
+    if not roster_candidates:
+        out["matched_persons"] = merged
+        return out
+
+    title = str(bundle.get("title") or "")
+    body = str(bundle.get("body") or "")
+    text = f"{title}\n{body}"
+    if not text.strip():
+        out["matched_persons"] = merged
+        return out
+
+    # Group distinct candidates by player name (len >= 2)
+    by_name: Dict[str, Dict[tuple[str, ...], set[str]]] = {}
+    for cand in roster_candidates:
+        if not isinstance(cand, Mapping):
+            continue
+        name = str(
+            cand.get("player_name")
+            or cand.get("canonical_name")
+            or cand.get("player")
+            or cand.get("player_zh")
+            or ""
+        ).strip()
+        if len(name) < 2:
+            continue
+        uid = str(cand.get("player_uid") or "").strip()
+        pid = str(cand.get("player_id") or cand.get("provider_player_id") or "").strip()
+        clubs = _extract_candidate_clubs(cand)
+        if uid:
+            cand_key: tuple[str, ...] = ("uid", uid)
+        elif pid:
+            cand_key = ("pid", pid)
+        else:
+            primary_club = sorted(clubs)[0] if clubs else ""
+            cand_key = ("name_club", name, primary_club)
+        by_name.setdefault(name, {}).setdefault(cand_key, set()).update(clubs)
+
+    new_hits: list[tuple[int, str]] = []
+    occupied_spans: list[tuple[int, int]] = []
+    all_names_sorted = sorted(
+        set(by_name.keys()) | {n for n in seen if len(n) >= 2},
+        key=lambda n: (-len(n), n),
+    )
+    for name in all_names_sorted:
+        spans = find_boundary_safe_name_spans(
+            text, name, occupied_spans=occupied_spans
+        )
+        if not spans:
+            continue
+        occupied_spans.extend(spans)
+        if name in seen:
+            continue
+        cand_map = by_name[name]
+        if len(cand_map) == 1:
+            new_hits.append((spans[0][0], name))
+        else:
+            # Homonym safety (Fail-Closed): require unique club qualifier in adjacent context
+            matched_cand_keys: set[tuple[str, ...]] = set()
+            first_disambig_pos: Optional[int] = None
+            for start, end in spans:
+                window = _adjacent_clause_window(text, start, end)
+                for cand_key, clubs in cand_map.items():
+                    if any(club and club in window for club in clubs):
+                        matched_cand_keys.add(cand_key)
+                        if first_disambig_pos is None:
+                            first_disambig_pos = start
+            if len(matched_cand_keys) == 1 and first_disambig_pos is not None:
+                new_hits.append((first_disambig_pos, name))
+
+    new_hits.sort(key=lambda pair: (pair[0], pair[1]))
+    for _pos, name in new_hits:
+        if name not in seen:
+            seen.add(name)
+            merged.append(name)
+
+    out["matched_persons"] = merged
+    return out
 
 
 def export_foreign_players_registration_csv(
@@ -1601,6 +1910,132 @@ def filter_curated_operational_announcements(
     }
 
 
+def _truncate_utf8_bytes(text: str, max_bytes: int, suffix: str = "…") -> str:
+    raw = text.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return text
+    suffix_bytes = suffix.encode("utf-8")
+    if max_bytes <= len(suffix_bytes):
+        return suffix_bytes[: max(0, max_bytes)].decode("utf-8", errors="ignore")
+    budget = max_bytes - len(suffix_bytes)
+    trimmed = raw[:budget].decode("utf-8", errors="ignore").rstrip()
+    return trimmed + suffix
+
+
+def _render_compact_foreign_quick_index_lines(
+    foreign_bundles: Sequence[Dict[str, Any]],
+    *,
+    max_bytes: Optional[int] = None,
+) -> list[str]:
+    """Render one compact sorted line per club for v2.3.1+ collector digest Section 1.
+
+    When ``max_bytes`` is provided, deterministically compacts/truncates overly long
+    club/player entries so the quick index strictly stays within ``max_bytes``.
+    """
+    by_club: Dict[str, list[Dict[str, str]]] = {}
+    for b in foreign_bundles:
+        for row in _parse_foreign_registration_rows(b):
+            club = str(row.get("club") or "").strip()
+            if not club:
+                continue
+            by_club.setdefault(club, []).append(row)
+    if not by_club:
+        return []
+
+    header_lines = [
+        "### 1.1 各俱乐部外籍球员速查索引（按俱乐部排序）",
+        "",
+    ]
+    sorted_clubs = sorted(by_club)
+
+    def _build_lines(*, compact: bool) -> list[str]:
+        out_lines = list(header_lines)
+        for club in sorted_clubs:
+            club_rows = by_club[club]
+            club_label = _md_cell(club)
+            if compact and len(club_label) > 24:
+                club_label = club_label[:23].rstrip() + "…"
+            player_labels: list[str] = []
+            for r in club_rows:
+                zh_raw = str(r.get("player_zh") or "").strip()
+                en_raw = str(r.get("player_en") or "").strip()
+                zh = _md_cell(zh_raw) if zh_raw else ""
+                en = _md_cell(en_raw) if en_raw else ""
+                if compact:
+                    name_part = zh or en or "—"
+                    if len(name_part) > 24:
+                        name_part = name_part[:23].rstrip() + "…"
+                    player_labels.append(name_part)
+                else:
+                    if zh and en:
+                        name_part = f"{zh} / {en}"
+                    else:
+                        name_part = zh or en or "—"
+                    jersey = str(r.get("jersey_number") or "").strip()
+                    pos = str(r.get("position") or "").strip()
+                    meta_bits: list[str] = []
+                    if jersey:
+                        meta_bits.append(f"#{jersey}")
+                    if pos:
+                        meta_bits.append(pos)
+                    if meta_bits:
+                        player_labels.append(f"{name_part} ({' '.join(meta_bits)})")
+                    else:
+                        player_labels.append(name_part)
+            out_lines.append(
+                f"- **{club_label}（{len(club_rows)}人）**: {' · '.join(player_labels)}"
+            )
+        out_lines.append("")
+        return out_lines
+
+    def _lines_bytes(lines_seq: Sequence[str]) -> int:
+        return len(("\n".join(lines_seq) + "\n").encode("utf-8"))
+
+    full_lines = _build_lines(compact=False)
+    if max_bytes is None or _lines_bytes(full_lines) <= max_bytes:
+        return full_lines
+
+    compact_lines = _build_lines(compact=True)
+    if _lines_bytes(compact_lines) <= max_bytes:
+        return compact_lines
+
+    # Stage 2: Deterministic per-club byte-budgeted truncation
+    club_entries = compact_lines[len(header_lines) : -1]
+    base_overhead = _lines_bytes(header_lines + [""])
+    omission_template = (
+        f"- …（其余 {{n}} 家俱乐部详见 `{FOREIGN_REGISTRATION_CSV_FILENAME}`）"
+    )
+    omission_reserve = len(
+        (omission_template.format(n=len(club_entries)) + "\n").encode("utf-8")
+    )
+    avail = max_bytes - base_overhead - omission_reserve
+    if avail <= 0:
+        return []
+
+    per_club_cap = max(32, avail // max(1, len(club_entries)))
+    kept: list[str] = []
+    used = base_overhead
+    for entry in club_entries:
+        candidate = _truncate_utf8_bytes(entry, per_club_cap)
+        cand_bytes = len((candidate + "\n").encode("utf-8"))
+        if used + cand_bytes + omission_reserve > max_bytes:
+            break
+        kept.append(candidate)
+        used += cand_bytes
+
+    if not kept:
+        return []
+
+    result = list(header_lines) + kept
+    omitted = len(club_entries) - len(kept)
+    if omitted > 0:
+        note = omission_template.format(n=omitted)
+        if _lines_bytes(result + [note, ""]) <= max_bytes:
+            result.append(note)
+    result.append("")
+    return result
+
+
 def _render_compact_curated_digest_md(
     *,
     bundles: Sequence[Dict[str, Any]],
@@ -1612,6 +2047,8 @@ def _render_compact_curated_digest_md(
     active_window_start: str,
     profile: Dict[str, Any],
     observation_horizon: Optional[Mapping[str, Any]] = None,
+    include_foreign_quick_index: bool = False,
+    roster_candidates: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> bytes:
     """Render <25KB curated collector digest with CSV routing & fail-closed size gate."""
     filtered_res = filter_curated_operational_announcements(
@@ -1619,6 +2056,11 @@ def _render_compact_curated_digest_md(
     )
     excerpt_cap = int(profile["compact_announcement_excerpt_chars"])
     admitted = filtered_res["admitted"]
+    if roster_candidates:
+        admitted = [
+            enrich_bundle_matched_persons(b, roster_candidates=roster_candidates)
+            for b in admitted
+        ]
     total_count = filtered_res["total_count"]
     admitted_count = filtered_res["admitted_count"]
     filtered_count = filtered_res["filtered_count"]
@@ -1661,6 +2103,7 @@ def _render_compact_curated_digest_md(
         "",
     ])
 
+    quick_index_insert_at: Optional[int] = None
     if foreign_bundles:
         total_foreign_rows = 0
         for b in foreign_bundles:
@@ -1675,6 +2118,8 @@ def _render_compact_curated_digest_md(
             f"- 完整结构化外籍球员明细（共 **{total_foreign_rows}** 条）已拆分至 `{FOREIGN_REGISTRATION_CSV_FILENAME}`，请优先使用 Python CSV 直接读取。",
             "",
         ])
+        if include_foreign_quick_index:
+            quick_index_insert_at = len(lines)
     else:
         lines.extend(["- （本次采集未包含外籍球员注册快照）", ""])
 
@@ -1748,16 +2193,42 @@ def _render_compact_curated_digest_md(
     else:
         lines.extend(["- （降噪后暂无精选官方公告）", ""])
 
-    rendered = scrub_raw_drive_ids_for_consumer(
-        "\n".join(lines).rstrip() + "\n",
-        known_drive_ids=known_drive_ids,
-    )
-    if not rendered.endswith("\n"):
-        rendered += "\n"
-    rendered += "\nend_marker: true\n"
+    def _finalize(candidate_lines: Sequence[str]) -> tuple[str, bytes]:
+        text_out = scrub_raw_drive_ids_for_consumer(
+            "\n".join(candidate_lines).rstrip() + "\n",
+            known_drive_ids=known_drive_ids,
+        )
+        if not text_out.endswith("\n"):
+            text_out += "\n"
+        text_out += "\nend_marker: true\n"
+        return text_out, text_out.encode("utf-8")
+
+    if quick_index_insert_at is not None:
+        full_quick = _render_compact_foreign_quick_index_lines(foreign_bundles)
+        candidate_lines = (
+            lines[:quick_index_insert_at] + full_quick + lines[quick_index_insert_at:]
+        )
+        rendered, rendered_bytes = _finalize(candidate_lines)
+        if len(rendered_bytes) >= max_bytes:
+            base_rendered, base_bytes = _finalize(lines)
+            index_budget = max_bytes - 1 - len(base_bytes) - 16
+            if index_budget > 0:
+                budgeted_quick = _render_compact_foreign_quick_index_lines(
+                    foreign_bundles, max_bytes=index_budget
+                )
+                candidate_lines = (
+                    lines[:quick_index_insert_at]
+                    + budgeted_quick
+                    + lines[quick_index_insert_at:]
+                )
+                rendered, rendered_bytes = _finalize(candidate_lines)
+            else:
+                rendered, rendered_bytes = base_rendered, base_bytes
+    else:
+        rendered, rendered_bytes = _finalize(lines)
+
     if observation_horizon is not None:
         assert_no_exaggerated_coverage_claims(rendered, observation_horizon)
-    rendered_bytes = rendered.encode("utf-8")
     if len(rendered_bytes) >= max_bytes:
         raise ValueError(
             f"COLLECTOR_DIGEST_SIZE_LIMIT_EXCEEDED: {len(rendered_bytes)} >= {max_bytes}"
@@ -1779,6 +2250,8 @@ def render_collector_official_digest_md(
     curation_profile_path: Optional[str | Path] = None,
     instance: Any = None,
     observation_horizon: Optional[Mapping[str, Any]] = None,
+    include_foreign_quick_index: bool = False,
+    roster_candidates: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> bytes:
     """Deterministically render governed collector official digest Markdown in evidence layer."""
     if compact_curated:
@@ -1797,8 +2270,15 @@ def render_collector_official_digest_md(
             active_window_start=active_window_start,
             profile=profile,
             observation_horizon=observation_horizon,
+            include_foreign_quick_index=include_foreign_quick_index,
+            roster_candidates=roster_candidates,
         )
     sorted_bundles = sorted((dict(b) for b in (bundles or ()) if isinstance(b, dict)), key=_bundle_sort_key)
+    if roster_candidates:
+        sorted_bundles = [
+            enrich_bundle_matched_persons(b, roster_candidates=roster_candidates)
+            for b in sorted_bundles
+        ]
 
     foreign_bundles: list[Dict[str, Any]] = []
     domestic_bundles: list[Dict[str, Any]] = []

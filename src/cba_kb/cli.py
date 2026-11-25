@@ -428,13 +428,43 @@ def main():
     q.add_argument('--freshness-ttl-hours',type=float,default=24.0)
     q.add_argument('--snowball-folder-id',default=None)
     q.add_argument('--forbidden-folder-ids',default=None)
+    q.add_argument('--lazy-pull-bundle',action='store_true',default=False,help='Cache-first lazy pull of single cloud_instance_bundle.tar.gz only on cache miss')
+    q.add_argument('--bundle-key',default='cloud_instance/cloud_instance_bundle.tar.gz')
     q.add_argument('--format',choices=('json','markdown'),default='json')
     q=sub.add_parser('cloud-state-push')
     q.add_argument('--source-dir',type=Path,required=True)
     q.add_argument('--prefix',default='cloud_instance/')
+    q.add_argument('--bundle-key',default='cloud_instance/cloud_instance_bundle.tar.gz')
+    q.add_argument('--legacy-multifile',action='store_true',default=False,help='Use legacy per-file snapshot push instead of single-bundle tar.gz')
     q=sub.add_parser('cloud-state-pull')
     q.add_argument('--output-dir',type=Path,required=True)
     q.add_argument('--prefix',default='cloud_instance/')
+    q.add_argument('--bundle-key',default='cloud_instance/cloud_instance_bundle.tar.gz')
+    q.add_argument('--legacy-multifile',action='store_true',default=False,help='Use legacy per-file snapshot pull instead of single-bundle tar.gz')
+    q=sub.add_parser('compact-drive-archive')
+    q.add_argument('--history-folder-id',default=None)
+    q.add_argument('--active-asset-ids',default=None)
+    q.add_argument('--protected-folder-ids',default=None)
+    q.add_argument('--active-release-id',default=None)
+    q.add_argument('--previous-release-id',default=None)
+    q.add_argument('--keep-release-dirs',default=None)
+    q.add_argument('--tag',default='v231')
+    q.add_argument('--release-status-file',type=Path,default=None)
+    q.add_argument('--release-status-file-id',default=None)
+    q.add_argument('--manifest-file',type=Path,default=None)
+    mode_grp=q.add_mutually_exclusive_group()
+    mode_grp.add_argument('--plan-only',action='store_true',default=False,help='Read-only compaction plan (default; 0 remote writes)')
+    mode_grp.add_argument('--execute',action='store_true',default=False,help='Pack deterministic cold archive, verify remote sha256, and trash originals')
+    q=sub.add_parser('refresh-snowball-cards')
+    q.add_argument('--players',required=True,help='Comma-separated player names to rebuild')
+    q.add_argument('--season',default='2026-2027')
+    q.add_argument('--snowball-folder-id',default=None)
+    q.add_argument('--forbidden-folder-ids',default=None)
+    q.add_argument('--output-dir',type=Path,default=None)
+    q.add_argument('--game-stats-degraded',action='store_true',default=False)
+    ref_grp=q.add_mutually_exclusive_group()
+    ref_grp.add_argument('--plan-only',action='store_true',default=False,help='Build cards locally without Drive upsert (default)')
+    ref_grp.add_argument('--execute',action='store_true',default=False,help='Build cards and upsert to Drive snowball folder (retiring legacy _unassigned_ cards)')
     q=sub.add_parser('mcp-serve')
     q.add_argument('--season',default='2026-2027')
     q=sub.add_parser('plan'); q.add_argument('--entries',type=Path,required=True); q.add_argument('--release-id',required=True)
@@ -1888,11 +1918,37 @@ def main():
             store = R2CloudStateStore(R2Config.from_env())
             effective_instance_root = a.snowball_instance_root or a.instance_root
             configured = effective_instance_root is not None or bool(os.environ.get('CBA_KB_INSTANCE_ROOT'))
-            instance = load_instance(root, effective_instance_root) if configured else None
+            lazy_dir = None
+            ensure_local_instance_fn = None
+            on_state_mutated_fn = None
+            if a.lazy_pull_bundle:
+                if effective_instance_root is not None:
+                    lazy_dir = Path(effective_instance_root).expanduser().resolve()
+                elif os.environ.get('CBA_KB_INSTANCE_ROOT'):
+                    lazy_dir = Path(os.environ['CBA_KB_INSTANCE_ROOT']).expanduser().resolve()
+                else:
+                    lazy_dir = Path('./workspace/cloud_instance').resolve()
+                bundle_key = a.bundle_key
+                def _ensure_local_bundle() -> Path:
+                    store.pull_instance_bundle(lazy_dir, key=bundle_key)
+                    return lazy_dir
+                def _push_mutated_bundle(_res: dict) -> None:
+                    if lazy_dir.is_dir():
+                        store.push_instance_bundle(lazy_dir, key=bundle_key)
+                ensure_local_instance_fn = _ensure_local_bundle
+                on_state_mutated_fn = _push_mutated_bundle
+                instance = (
+                    load_instance(root, lazy_dir)
+                    if lazy_dir.is_dir() and (lazy_dir / 'config').is_dir()
+                    else None
+                )
+            else:
+                instance = load_instance(root, effective_instance_root) if configured else None
             collector_cmd = shlex.split(a.collector_cmd) if a.collector_cmd else None
             backend = LocalCliAcquisitionBackend(
                 collector_cmd=collector_cmd,
                 instance=instance,
+                instance_root=lazy_dir if (a.lazy_pull_bundle and instance is None) else None,
             )
             snowball_folder_id = a.snowball_folder_id or os.environ.get('CBA_KB_DRIVE_SNOWBALL_FOLDER_ID')
             raw_forbidden = a.forbidden_folder_ids or os.environ.get('CBA_KB_DRIVE_PROTECTED_FOLDER_IDS') or ''
@@ -1917,6 +1973,8 @@ def main():
                 snowball_folder_id=snowball_folder_id,
                 forbidden_folder_ids=forbidden_ids,
                 production_policy=production_policy,
+                ensure_local_instance_fn=ensure_local_instance_fn,
+                on_state_mutated_fn=on_state_mutated_fn,
             )
             explicit_job_id = a.job_id.strip() if isinstance(a.job_id, str) and a.job_id.strip() else None
             explicit_owner_id = a.owner_id.strip() if isinstance(a.owner_id, str) and a.owner_id.strip() else None
@@ -1938,11 +1996,126 @@ def main():
         elif a.command == 'cloud-state-push':
             from .cloud_state import R2CloudStateStore, R2Config
             store = R2CloudStateStore(R2Config.from_env())
-            result = store.push_instance_snapshot(a.source_dir, prefix=a.prefix)
+            if a.legacy_multifile:
+                result = store.push_instance_snapshot(a.source_dir, prefix=a.prefix)
+            else:
+                result = store.push_instance_bundle(a.source_dir, key=a.bundle_key)
         elif a.command == 'cloud-state-pull':
             from .cloud_state import R2CloudStateStore, R2Config
             store = R2CloudStateStore(R2Config.from_env())
-            result = store.pull_instance_snapshot(a.output_dir, prefix=a.prefix)
+            if a.legacy_multifile:
+                result = store.pull_instance_snapshot(a.output_dir, prefix=a.prefix)
+            else:
+                result = store.pull_instance_bundle(a.output_dir, key=a.bundle_key)
+        elif a.command == 'compact-drive-archive':
+            import csv
+            from .archive_compactor import DEFAULT_PROTECTED_BUNDLE_RELEASES, compact_drive_archive
+            configured = a.instance_root is not None or bool(os.environ.get('CBA_KB_INSTANCE_ROOT'))
+            instance = load_instance(root, a.instance_root) if configured else None
+            production_policy = None
+            if instance is not None:
+                try:
+                    production_policy = instance.read_json('production.json')
+                except FileNotFoundError:
+                    production_policy = None
+            history_folder_id = a.history_folder_id
+            if not history_folder_id and isinstance(production_policy, dict):
+                zones = production_policy.get('zones')
+                if isinstance(zones, dict):
+                    history_folder_id = zones.get('history')
+            active_asset_ids = [item.strip() for item in (a.active_asset_ids or '').split(',') if item.strip()]
+            protected_folder_ids = [item.strip() for item in (a.protected_folder_ids or '').split(',') if item.strip()]
+            keep_release_dirs = (
+                tuple(item.strip() for item in a.keep_release_dirs.split(',') if item.strip())
+                if a.keep_release_dirs
+                else DEFAULT_PROTECTED_BUNDLE_RELEASES
+            )
+            release_status = None
+            if a.release_status_file is not None:
+                release_status = json.loads(a.release_status_file.read_text(encoding='utf-8'))
+            manifest_rows = None
+            if a.manifest_file is not None:
+                raw_manifest = a.manifest_file.read_text(encoding='utf-8')
+                if a.manifest_file.suffix.lower() == '.json':
+                    parsed_m = json.loads(raw_manifest)
+                    manifest_rows = parsed_m if isinstance(parsed_m, list) else []
+                else:
+                    manifest_rows = list(csv.DictReader(raw_manifest.splitlines()))
+            drive = Drive(root, instance)
+            result = compact_drive_archive(
+                drive,
+                history_folder_id=history_folder_id or '',
+                active_asset_ids=active_asset_ids,
+                protected_folder_ids=protected_folder_ids,
+                active_release_id=a.active_release_id,
+                previous_release_id=a.previous_release_id,
+                keep_release_dirs=keep_release_dirs,
+                execute=bool(a.execute),
+                tag=a.tag,
+                release_status=release_status,
+                release_status_file_id=a.release_status_file_id,
+                manifest_rows=manifest_rows,
+                production_policy=production_policy,
+            )
+        elif a.command == 'refresh-snowball-cards':
+            from .drive import upsert_snowball_card_to_drive
+            from .person_card_builder import build_person_card
+            configured = a.instance_root is not None or bool(os.environ.get('CBA_KB_INSTANCE_ROOT'))
+            instance = load_instance(root, a.instance_root) if configured else None
+            players = [p.strip() for p in a.players.split(',') if p.strip()]
+            snowball_folder_id = a.snowball_folder_id or os.environ.get('CBA_KB_DRIVE_SNOWBALL_FOLDER_ID')
+            raw_forbidden = a.forbidden_folder_ids or os.environ.get('CBA_KB_DRIVE_PROTECTED_FOLDER_IDS') or ''
+            forbidden_ids = [item.strip() for item in raw_forbidden.split(',') if item.strip()]
+            production_policy = None
+            drive = None
+            if a.execute and snowball_folder_id:
+                if instance is not None:
+                    try:
+                        production_policy = instance.read_json('production.json')
+                    except FileNotFoundError:
+                        production_policy = None
+                    drive = Drive(root, instance)
+                elif os.environ.get('CBA_KB_DRIVE_TOKEN_JSON'):
+                    drive = Drive(root, None)
+            processed = []
+            built_count = 0
+            upserted_count = 0
+            for player in players:
+                card_res = build_person_card(
+                    player,
+                    season=a.season,
+                    instance=instance,
+                    output_dir=a.output_dir,
+                    game_stats_degraded=bool(a.game_stats_degraded),
+                )
+                entry = {
+                    'player': player,
+                    'status': card_res.get('status'),
+                    'filename': card_res.get('filename'),
+                }
+                if card_res.get('status') == 'BUILT' and card_res.get('markdown'):
+                    built_count += 1
+                    if a.execute and drive is not None and snowball_folder_id:
+                        receipt = upsert_snowball_card_to_drive(
+                            drive,
+                            folder_id=snowball_folder_id,
+                            filename=card_res['filename'],
+                            content_bytes=str(card_res['markdown']).encode('utf-8'),
+                            forbidden_folder_ids=forbidden_ids,
+                            production_policy=production_policy,
+                            player_name=player,
+                            season=a.season,
+                        )
+                        entry['drive_sync'] = receipt
+                        upserted_count += 1
+                processed.append(entry)
+            result = {
+                'mode': 'execute' if a.execute else 'plan_only',
+                'season': a.season,
+                'built_count': built_count,
+                'upserted_count': upserted_count,
+                'processed': processed,
+            }
         elif a.command == 'mcp-serve':
             from .cloud_state import R2CloudStateStore, R2Config
             from .mcp_server import SnowballMCPServer

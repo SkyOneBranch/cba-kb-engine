@@ -339,6 +339,8 @@ class SnowballOrchestrator:
         stale_after_hours: float = 48.0,
         lock_ttl_seconds: float = DEFAULT_LOCK_TTL_SECONDS,
         now_fn: Optional[Callable[[], datetime]] = None,
+        ensure_local_instance_fn: Optional[Callable[[], Any]] = None,
+        on_state_mutated_fn: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> None:
         self.state_store = state_store
         self.acquisition_backend = acquisition_backend
@@ -354,6 +356,8 @@ class SnowballOrchestrator:
         self.stale_after_hours = float(stale_after_hours)
         self.lock_ttl_seconds = float(lock_ttl_seconds)
         self.now_fn = now_fn
+        self.ensure_local_instance_fn = ensure_local_instance_fn
+        self.on_state_mutated_fn = on_state_mutated_fn
         self._inflight_locks_guard = threading.Lock()
         self._inflight_locks: Dict[Tuple[str, str], threading.Lock] = {}
 
@@ -833,6 +837,8 @@ class SnowballOrchestrator:
         self.state_store.put_job(resolved_job_id, job_doc)
 
         try:
+            if callable(self.ensure_local_instance_fn):
+                self.ensure_local_instance_fn()
             backend_result = self.acquisition_backend.acquire_person(
                 q_clean,
                 season=season,
@@ -951,13 +957,7 @@ class SnowballOrchestrator:
                     "drive_sync": drive_receipt,
                 },
             )
-            self._release_lock(
-                season=season,
-                person=q_clean,
-                owner_id=lock_owner_id,
-                job_id=resolved_job_id,
-            )
-            return {
+            result: Dict[str, Any] = {
                 "status": "ACQUIRED_AND_BUILT",
                 "job_id": resolved_job_id,
                 "person": q_clean,
@@ -970,6 +970,17 @@ class SnowballOrchestrator:
                 "drive_sync": drive_receipt,
                 "network_called": True,
             }
+            try:
+                if callable(self.on_state_mutated_fn):
+                    self.on_state_mutated_fn(result)
+            finally:
+                self._release_lock(
+                    season=season,
+                    person=q_clean,
+                    owner_id=lock_owner_id,
+                    job_id=resolved_job_id,
+                )
+            return result
 
         if backend_status == "UNKNOWN_AFTER_WHITELIST_CHECK":
             ttl_raw = backend_result.get("ttl_hours")
@@ -998,13 +1009,7 @@ class SnowballOrchestrator:
                     "negative_receipt": receipt,
                 },
             )
-            self._release_lock(
-                season=season,
-                person=q_clean,
-                owner_id=lock_owner_id,
-                job_id=resolved_job_id,
-            )
-            return {
+            result = {
                 "status": "UNKNOWN_AFTER_WHITELIST_CHECK",
                 "job_id": resolved_job_id,
                 "person": q_clean,
@@ -1013,6 +1018,17 @@ class SnowballOrchestrator:
                 "whitelist_sources_checked": whitelist_checked,
                 "network_called": True,
             }
+            try:
+                if callable(self.on_state_mutated_fn):
+                    self.on_state_mutated_fn(result)
+            finally:
+                self._release_lock(
+                    season=season,
+                    person=q_clean,
+                    owner_id=lock_owner_id,
+                    job_id=resolved_job_id,
+                )
+            return result
 
         if backend_status == "UNDECIDED":
             candidates = list(backend_result.get("candidates") or [])
