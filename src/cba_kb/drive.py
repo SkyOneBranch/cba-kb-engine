@@ -451,6 +451,16 @@ class Drive:
         return self.api.files().update(fileId=file_id,addParents=destination,removeParents=previous,
             fields=FIELDS,supportsAllDrives=True).execute(num_retries=0)
 
+    def trash(self, file_id):
+        """Move a Drive file or folder to Trash (trashed=True, never delete)."""
+        _assert_main_thread_writer(self, 'trash')
+        return self.api.files().update(
+            fileId=file_id,
+            body={'trashed': True},
+            fields=FIELDS,
+            supportsAllDrives=True,
+        ).execute(num_retries=0)
+
     def list(self, parent):
         items, page = [], None
         while True:
@@ -648,6 +658,53 @@ def _collect_protected_folder_ids(
     return protected
 
 
+_LEGACY_UNASSIGNED_CARD_RE = re.compile(
+    r'^研究卡_(.+)_unassigned_([^_]+)_CURRENT\.md$',
+    flags=re.IGNORECASE,
+)
+
+
+def _match_legacy_unassigned_card(new_filename: str, existing_name: str) -> bool:
+    """Return True iff existing_name is the legacy _unassigned_ twin of new_filename."""
+    if existing_name == new_filename:
+        return False
+    if not (new_filename.startswith('研究卡_') and new_filename.endswith('_CURRENT.md')):
+        return False
+    stem = new_filename[len('研究卡_'):-len('_CURRENT.md')]
+    if '_' not in stem:
+        return False
+    new_rest, new_season = stem.rsplit('_', 1)
+    if not new_rest or not new_season or new_rest.lower().endswith('_unassigned'):
+        return False
+    m = _LEGACY_UNASSIGNED_CARD_RE.match(existing_name)
+    if not m:
+        return False
+    legacy_player, legacy_season = m.group(1), m.group(2)
+    if legacy_season != new_season:
+        return False
+    prefix = f'{legacy_player}_'
+    if not new_rest.startswith(prefix):
+        return False
+    middle = new_rest[len(prefix):]
+    return bool(middle) and middle.lower() != 'unassigned'
+
+
+def _trash_drive_file(drive: Any, file_id: str) -> None:
+    """Move a Drive file to Trash via trashed=True; never calls delete()."""
+    trash_fn = getattr(drive, 'trash', None)
+    if callable(trash_fn):
+        trash_fn(file_id)
+        return
+    svc = getattr(drive, 'api', None) or getattr(drive, '_svc', None)
+    if svc is not None:
+        svc.files().update(
+            fileId=file_id,
+            body={'trashed': True},
+            fields=FIELDS,
+            supportsAllDrives=True,
+        ).execute(num_retries=0)
+
+
 def upsert_snowball_card_to_drive(
     drive,
     *,
@@ -687,29 +744,46 @@ def upsert_snowball_card_to_drive(
     from .current_state import clean
     clean(payload, clean_filename)
 
+    folder_items = [
+        item for item in drive.list(target_folder_id) if isinstance(item, Mapping)
+    ]
     existing_matches = [
-        item
-        for item in drive.list(target_folder_id)
-        if isinstance(item, Mapping) and item.get('name') == clean_filename
+        item for item in folder_items if item.get('name') == clean_filename
     ]
     if len(existing_matches) > 1:
         raise RuntimeError(f'SNOWBALL_DUPLICATE_FILENAME:{clean_filename}')
 
+    written_id: Optional[str] = None
     if existing_matches:
+        written_id = str(existing_matches[0].get('id') or '') or None
         drive.put(existing_matches[0]['id'], payload, mime_type)
         action = 'updated'
     else:
         if hasattr(drive, 'create_binary'):
-            drive.create_binary(target_folder_id, clean_filename, payload, mime_type)
+            created = drive.create_binary(target_folder_id, clean_filename, payload, mime_type)
+            if isinstance(created, Mapping):
+                written_id = str(created.get('id') or '') or None
         else:
-            drive.ensure(
+            created_id = drive.ensure(
                 target_folder_id,
                 f'snowball/{clean_filename}',
                 clean_filename,
                 mime_type,
                 payload,
             )
+            if isinstance(created_id, str) and created_id:
+                written_id = created_id
         action = 'created'
+
+    retired_legacy_files: list[str] = []
+    for item in folder_items:
+        item_name = str(item.get('name') or '')
+        item_id = str(item.get('id') or '').strip()
+        if not item_id or item_id == written_id:
+            continue
+        if _match_legacy_unassigned_card(clean_filename, item_name):
+            _trash_drive_file(drive, item_id)
+            retired_legacy_files.append(item_name)
 
     return {
         'action': action,
@@ -718,4 +792,5 @@ def upsert_snowball_card_to_drive(
         'size_bytes': len(payload),
         'folder_role': 'SNOWBALL_ON_DEMAND',
         'drive_id_redacted': True,
+        'retired_legacy_files': sorted(retired_legacy_files),
     }

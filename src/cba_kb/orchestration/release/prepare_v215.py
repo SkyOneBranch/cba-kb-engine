@@ -104,6 +104,7 @@ V220_1_BASELINE_SHA = "fa9793c6db76e15880610ced728a7b0d563da604"
 V221_1_BASELINE_SHA = "e58a2787a6176397a142abced682eed5d10f1289"
 V222_1_BASELINE_SHA = "29589e7d4d90a81a6507ecaa1ec73945a5eecfc1"
 V230_1_BASELINE_SHA = "3a7239361b2b81f763dce3477b3c3ad81f357b90"
+V231_1_BASELINE_SHA = "7afb18b1e867146ed99cc73fa16e53d990c54e95"
 
 V215_RELEASE_SPECS: dict[str, dict] = {
     "v2.1.5-1": {
@@ -137,6 +138,17 @@ V215_RELEASE_SPECS: dict[str, dict] = {
         "enable_curated_compact_surface_v222": True,
         "enable_observation_horizon_v230": True,
         "enable_on_demand_cards_v230": True,
+        "incremental_delta_only": True,
+        "archive_format": "bundle_v1",
+    },
+    "v2.3.1-1": {
+        "product_baseline_sha": V231_1_BASELINE_SHA,
+        "enable_consumer_surface_v215": True,
+        "enable_operational_kb_v220": True,
+        "enable_curated_compact_surface_v222": True,
+        "enable_observation_horizon_v230": True,
+        "enable_on_demand_cards_v230": True,
+        "enable_v231_surface_enhancements": True,
         "incremental_delta_only": True,
         "archive_format": "bundle_v1",
     },
@@ -1615,6 +1627,7 @@ def _build_instance_consumer_targets(
 
     include_collector_digest = bool(release_spec.get("enable_operational_kb_v220"))
     compact_curated = bool(release_spec.get("enable_curated_compact_surface_v222"))
+    enable_v231_surface = bool(release_spec.get("enable_v231_surface_enhancements"))
     observation_horizon = _load_instance_observation_horizon(instance, release_spec)
     collector_official_digest_bytes = None
     foreign_registration_csv_bytes = None
@@ -1628,8 +1641,16 @@ def _build_instance_consumer_targets(
     ops_checkpoint_path = ops_dir / "operational_checkpoint.json"
     if include_collector_digest and ops_checkpoint_path.is_file():
         checkpoint = json.loads(ops_checkpoint_path.read_text(encoding="utf-8"))
+        roster_candidates = None
+        if enable_v231_surface:
+            roster_candidates = [
+                dict(row)
+                for row in csv.DictReader(io.StringIO(master_bytes.decode("utf-8-sig")))
+            ]
         doc_idx_bytes = merge_operational_docs_into_consumer_index(
-            doc_idx_bytes, checkpoint
+            doc_idx_bytes,
+            checkpoint,
+            roster_candidates=roster_candidates,
         )
         reg_diff = None
         reg_diff_path = ops_dir / "reg_diff_2526_2627.json"
@@ -1643,6 +1664,8 @@ def _build_instance_consumer_targets(
             engine_sha=engine_sha,
             compact_curated=compact_curated,
             observation_horizon=observation_horizon,
+            include_foreign_quick_index=enable_v231_surface,
+            roster_candidates=roster_candidates,
         )
         if compact_curated:
             foreign_registration_csv_bytes = export_foreign_players_registration_csv(

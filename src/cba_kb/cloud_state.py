@@ -8,12 +8,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import gzip
 import hashlib
 import hmac
+import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
+import tarfile
 import threading
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
@@ -25,8 +28,21 @@ _SAFE_ASCII_RE = re.compile(r"^[a-z0-9._-]+$")
 _UNICODE_TRIM_RE = re.compile(r"^[\s\u001c-\u001f\u0085\ufeff]+|[\s\u001c-\u001f\u0085\ufeff]+$")
 _SAFE_JOB_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+_WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 _ACTIVE_LOCK_STATUSES = frozenset({"RUNNING", "QUEUED", "PENDING", "ACQUIRING_IN_CLOUD"})
 DEFAULT_LOCK_TTL_SECONDS = 900.0
+DEFAULT_INSTANCE_BUNDLE_KEY = "cloud_instance/cloud_instance_bundle.tar.gz"
+DEFAULT_MAX_BUNDLE_COMPRESSED_BYTES = 32 * 1024 * 1024
+DEFAULT_MAX_BUNDLE_EXTRACTED_BYTES = 128 * 1024 * 1024
+DEFAULT_MAX_BUNDLE_MEMBERS = 5000
+
+_BUNDLE_EXCLUDED_DIR_NAMES = frozenset({
+    "evidence",
+    "inbox",
+    ".credentials",
+    ".git",
+    "__pycache__",
+})
 
 _PROCESS_LOCKS_GUARD = threading.Lock()
 _PROCESS_LOCKS: Dict[Tuple[str, str, str, str], threading.Lock] = {}
@@ -38,7 +54,11 @@ class CloudStateIntegrityError(ValueError):
 
 __all__ = [
     "CloudStateIntegrityError",
+    "DEFAULT_INSTANCE_BUNDLE_KEY",
     "DEFAULT_LOCK_TTL_SECONDS",
+    "DEFAULT_MAX_BUNDLE_COMPRESSED_BYTES",
+    "DEFAULT_MAX_BUNDLE_EXTRACTED_BYTES",
+    "DEFAULT_MAX_BUNDLE_MEMBERS",
     "R2Config",
     "R2CloudStateStore",
     "sign_aws_sigv4_headers",
@@ -166,6 +186,7 @@ class R2Config:
             env.get("CBA_KB_R2_ENDPOINT_URL")
             or env.get("CBA_KB_R2_ENDPOINT")
             or env.get("R2_ENDPOINT_URL")
+            or env.get("R2_ENDPOINT")
             or ""
         ).strip()
         if not endpoint:
@@ -264,6 +285,38 @@ def _normalize_prefix(prefix: str) -> str:
     return cleaned
 
 
+def _parse_bool_env(raw: Optional[str]) -> bool:
+    return str(raw or "").strip().lower() in ("1", "true", "yes")
+
+
+def _is_bundle_member_allowed(rel_posix: str, allowlisted_exact_names: frozenset[str]) -> bool:
+    parts = [p for p in rel_posix.split("/") if p]
+    if not parts:
+        return False
+    name = parts[-1]
+
+    # Explicit exclusions (fail-closed)
+    if name == "production.json":
+        return False
+    if any(seg in _BUNDLE_EXCLUDED_DIR_NAMES for seg in parts[:-1]):
+        return False
+    if "document_lane" in parts and "archive" in parts and "raw" in parts:
+        return False
+
+    # Substrate allowlist
+    if name in allowlisted_exact_names:
+        return True
+    if name.startswith("season_stats"):
+        return True
+    if len(parts) >= 2 and parts[-2] == "game_logs" and (
+        name.endswith(".json") or name.endswith(".jsonl")
+    ):
+        return True
+    if len(parts) >= 2 and parts[-2] in ("cards", "on_demand_cards") and name.endswith(".md"):
+        return True
+    return False
+
+
 class R2CloudStateStore:
     """S3/R2-backed private cloud state store with SigV4 auth and SHA-256 verification."""
 
@@ -274,12 +327,19 @@ class R2CloudStateStore:
         session=None,
         transport: Optional[Callable[..., Tuple[int, Dict[str, str], bytes]]] = None,
         timeout_seconds: float = 30.0,
+        allow_s3_501_lock_fallback: Optional[bool] = None,
     ) -> None:
         self.config = config
         self._http_client = session
         self._transport = transport
         self._timeout_seconds = float(timeout_seconds)
         self._base_prefix = _normalize_prefix(config.prefix)
+        if allow_s3_501_lock_fallback is None:
+            self.allow_s3_501_lock_fallback = _parse_bool_env(
+                os.environ.get("CBA_KB_S3_LOCK_501_FALLBACK")
+            )
+        else:
+            self.allow_s3_501_lock_fallback = bool(allow_s3_501_lock_fallback)
 
     def _full_key(self, key: str) -> str:
         rel = str(key or "").lstrip("/")
@@ -626,6 +686,18 @@ class R2CloudStateStore:
         if if_match is not None:
             headers["If-Match"] = if_match
         status, _, _ = self._request("PUT", url, headers=headers, data=payload)
+        if (
+            status == 501
+            and self.allow_s3_501_lock_fallback
+            and (if_none_match is not None or if_match is not None)
+        ):
+            unconditional_headers = {
+                "Content-Type": "application/json; charset=utf-8",
+                "x-amz-meta-sha256": sha256_hex,
+            }
+            status, _, _ = self._request(
+                "PUT", url, headers=unconditional_headers, data=payload
+            )
         return status
 
     def acquire_active_job_lock(
@@ -842,4 +914,166 @@ class R2CloudStateStore:
             "downloaded_count": len(downloaded),
             "files": downloaded,
             "prefix": norm_prefix,
+        }
+
+    def push_instance_bundle(
+        self,
+        local_dir: Union[str, Path],
+        *,
+        key: str = DEFAULT_INSTANCE_BUNDLE_KEY,
+        max_compressed_bytes: int = DEFAULT_MAX_BUNDLE_COMPRESSED_BYTES,
+    ) -> Dict[str, Any]:
+        """Pack allowlisted substrate files into a deterministic .tar.gz and upload in 1 PUT."""
+        from .consumer_surface import (
+            CONSUMER_MASTER_FILENAME,
+            DOMESTIC_REG_DIFF_CSV_FILENAME,
+            FOREIGN_REGISTRATION_CSV_FILENAME,
+        )
+        from .current_state import clean
+
+        base = Path(local_dir).resolve()
+        if not base.is_dir():
+            raise ValueError(f"R2_SNAPSHOT_DIR_MISSING:{local_dir}")
+        max_comp = int(max_compressed_bytes)
+        if max_comp <= 0:
+            raise ValueError("R2_BUNDLE_MAX_COMPRESSED_BYTES_INVALID")
+
+        allowlisted_exact_names = frozenset({
+            CONSUMER_MASTER_FILENAME,
+            "MASTER.csv",
+            FOREIGN_REGISTRATION_CSV_FILENAME,
+            DOMESTIC_REG_DIFF_CSV_FILENAME,
+            "identity_registry.json",
+            "operational_checkpoint.json",
+            "coverage_ledger.json",
+            "negative_receipts.jsonl",
+            "snowball_receipts.jsonl",
+            "on_demand_cards_manifest.json",
+            "curation_profile.yaml",
+        })
+
+        all_files = sorted(
+            (p.relative_to(base).as_posix(), p)
+            for p in base.rglob("*")
+            if p.is_file() and not p.is_symlink()
+        )
+        included: List[Tuple[str, bytes]] = []
+        excluded_count = 0
+        for rel, path in all_files:
+            if not _is_bundle_member_allowed(rel, allowlisted_exact_names):
+                excluded_count += 1
+                continue
+            data = path.read_bytes()
+            clean(data, rel)
+            included.append((rel, data))
+
+        buf = io.BytesIO()
+        with gzip.GzipFile(filename="", mode="wb", fileobj=buf, mtime=0) as gz:
+            with tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tf:
+                for rel, data in included:
+                    ti = tarfile.TarInfo(name=rel)
+                    ti.size = len(data)
+                    ti.mtime = 0
+                    ti.uid = 0
+                    ti.gid = 0
+                    ti.uname = ""
+                    ti.gname = ""
+                    ti.mode = 0o644
+                    ti.type = tarfile.REGTYPE
+                    tf.addfile(ti, io.BytesIO(data))
+
+        payload = buf.getvalue()
+        if len(payload) > max_comp:
+            raise ValueError("R2_BUNDLE_COMPRESSED_SIZE_EXCEEDED")
+
+        put_res = self.put_bytes(key, payload, content_type="application/gzip")
+        members = [rel for rel, _ in included]
+        return {
+            "key": key,
+            "sha256": put_res["sha256"],
+            "size_bytes": len(payload),
+            "member_count": len(members),
+            "members": members,
+            "excluded_count": excluded_count,
+        }
+
+    def pull_instance_bundle(
+        self,
+        local_dir: Union[str, Path],
+        *,
+        key: str = DEFAULT_INSTANCE_BUNDLE_KEY,
+        expected_sha256: Optional[str] = None,
+        max_compressed_bytes: int = DEFAULT_MAX_BUNDLE_COMPRESSED_BYTES,
+        max_extracted_bytes: int = DEFAULT_MAX_BUNDLE_EXTRACTED_BYTES,
+        max_members: int = DEFAULT_MAX_BUNDLE_MEMBERS,
+    ) -> Dict[str, Any]:
+        """Download and verify a single .tar.gz bundle in 1 GET, failing closed before any write."""
+        max_comp = int(max_compressed_bytes)
+        max_ext = int(max_extracted_bytes)
+        max_mem = int(max_members)
+
+        raw = self.get_bytes(key, expected_sha256=expected_sha256)
+        if raw is None:
+            raise FileNotFoundError(f"R2_BUNDLE_NOT_FOUND:{key}")
+        if len(raw) > max_comp:
+            raise ValueError("R2_BUNDLE_COMPRESSED_SIZE_EXCEEDED")
+
+        base = Path(local_dir).resolve()
+        staged: List[Tuple[str, Path, bytes]] = []
+        total_extracted = 0
+
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tf:
+            members = tf.getmembers()
+            if len(members) > max_mem:
+                raise ValueError("R2_BUNDLE_MAX_MEMBERS_EXCEEDED")
+
+            for member in members:
+                raw_name = member.name
+                if (
+                    not isinstance(raw_name, str)
+                    or not raw_name
+                    or "\x00" in raw_name
+                    or "\\" in raw_name
+                    or raw_name.startswith("/")
+                    or _WIN_DRIVE_RE.match(raw_name)
+                ):
+                    raise ValueError(f"R2_BUNDLE_PATH_TRAVERSAL:{raw_name}")
+                raw_parts = raw_name.split("/")
+                if ".." in raw_parts:
+                    raise ValueError(f"R2_BUNDLE_PATH_TRAVERSAL:{raw_name}")
+
+                if member.isdir():
+                    continue
+                if not member.isreg():
+                    raise ValueError(f"R2_BUNDLE_UNSAFE_MEMBER_TYPE:{raw_name}")
+
+                clean_parts = [p for p in raw_parts if p and p != "."]
+                if not clean_parts:
+                    raise ValueError(f"R2_BUNDLE_PATH_TRAVERSAL:{raw_name}")
+                rel_norm = PurePosixPath(*clean_parts).as_posix()
+                target = (base / rel_norm).resolve()
+                if target == base or not target.is_relative_to(base):
+                    raise ValueError(f"R2_BUNDLE_PATH_TRAVERSAL:{raw_name}")
+
+                if member.size < 0 or (total_extracted + member.size) > max_ext:
+                    raise ValueError("R2_BUNDLE_EXTRACTED_SIZE_EXCEEDED")
+
+                remaining = max_ext - total_extracted
+                fobj = tf.extractfile(member)
+                content = fobj.read(remaining + 1) if fobj is not None else b""
+                if len(content) > remaining:
+                    raise ValueError("R2_BUNDLE_EXTRACTED_SIZE_EXCEEDED")
+                total_extracted += len(content)
+                staged.append((rel_norm, target, content))
+
+        base.mkdir(parents=True, exist_ok=True)
+        for _, target, content in staged:
+            atomic(target, content)
+
+        return {
+            "key": key,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "size_bytes": len(raw),
+            "extracted_count": len(staged),
+            "files": [rel for rel, _, _ in staged],
         }
