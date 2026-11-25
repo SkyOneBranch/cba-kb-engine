@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import threading
+from typing import Any, Dict, Mapping, Optional, Sequence
 from .common import atomic, digest
 from .drive_http import build_requests_service
 from .transport import record_api_call, retry_read
@@ -14,12 +15,66 @@ SCOPES = ['https://www.googleapis.com/auth/drive']
 FIELDS = 'id,name,mimeType,parents,version,modifiedTime,headRevisionId,md5Checksum,sha256Checksum,size,webViewLink'
 MAX_READ_WORKERS = 8
 _HEX64_RE = re.compile(r'^[0-9a-f]{64}$')
+_PROTECTED_POLICY_ZONES = ('current', 'history', 'staging', 'evidence')
 
 
-def credentials(root, interactive=False, credentials_store=None):
+def _parse_headless_token_info(raw_token: Any) -> Dict[str, Any]:
+    """Parse headless OAuth token payload and fail closed on Service Accounts."""
+    if isinstance(raw_token, Mapping):
+        info: Dict[str, Any] = dict(raw_token)
+    elif isinstance(raw_token, (str, bytes, bytearray)):
+        text = raw_token.decode('utf-8') if isinstance(raw_token, (bytes, bytearray)) else raw_token
+        try:
+            parsed = json.loads(text)
+        except (ValueError, TypeError) as exc:
+            raise ValueError('INVALID_DRIVE_TOKEN_JSON') from exc
+        if not isinstance(parsed, dict):
+            raise ValueError('INVALID_DRIVE_TOKEN_JSON')
+        info = parsed
+    else:
+        raise ValueError('INVALID_DRIVE_TOKEN_JSON')
+
+    cred_type = str(info.get('type') or '').strip().lower()
+    client_email = str(info.get('client_email') or '').strip().lower()
+    if (
+        cred_type == 'service_account'
+        or 'private_key' in info
+        or 'private_key_id' in info
+        or client_email.endswith('.gserviceaccount.com')
+    ):
+        raise RuntimeError(
+            'SERVICE_ACCOUNT_CREDENTIALS_FORBIDDEN: personal OAuth authorized_user token required'
+        )
+
+    refresh_tok = info.get('refresh_token')
+    if not isinstance(refresh_tok, str) or not refresh_tok.strip():
+        raise RuntimeError(
+            'DRIVE_OAUTH_REFRESH_TOKEN_MISSING: headless token JSON requires refresh_token'
+        )
+    return info
+
+
+def credentials(root, interactive=False, credentials_store=None, *, token_json=None, environ=None):
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
     from .oauth import authorize
+
+    headless_source = token_json
+    if headless_source is None:
+        env = os.environ if environ is None else environ
+        env_val = env.get('CBA_KB_DRIVE_TOKEN_JSON')
+        if isinstance(env_val, str) and env_val.strip():
+            headless_source = env_val
+
+    if headless_source is not None:
+        info = _parse_headless_token_info(headless_source)
+        creds = Credentials.from_authorized_user_info(info, scopes=SCOPES)
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        if not creds.valid or not creds.has_scopes(SCOPES):
+            raise RuntimeError('Drive headless authorization invalid or missing required scopes')
+        return creds
+
     if credentials_store is None:
         from .instance import load_instance
         credentials_store = load_instance(root).credentials_store
@@ -434,3 +489,233 @@ class Drive:
         index[key] = {'id': result, 'mimeType': mime, 'parents': [parent],
                       'appProperties': {'cba_key': key}}
         return result
+
+    def create_binary(self, parent, name, content, mime):
+        _assert_main_thread_writer(self, 'create_binary')
+        from googleapiclient.http import MediaIoBaseUpload
+        body = {'name': name, 'parents': [parent], 'mimeType': mime}
+        record_api_call('upload_calls')
+        return self.api.files().create(
+            body=body,
+            media_body=MediaIoBaseUpload(io.BytesIO(content), mimetype=mime),
+            fields=FIELDS,
+            supportsAllDrives=True,
+        ).execute(num_retries=0)
+
+    def get_parents(self, file_id):
+        """Return parent folder IDs for a Drive file or folder."""
+        meta = self.meta(file_id)
+        if not isinstance(meta, Mapping):
+            raise RuntimeError(f'DRIVE_PARENTS_UNAVAILABLE:{file_id}')
+        parents = meta.get('parents')
+        if parents is None:
+            return []
+        if not isinstance(parents, list):
+            raise RuntimeError(f'DRIVE_PARENTS_INVALID:{file_id}')
+        return [str(p).strip() for p in parents if isinstance(p, str) and p.strip()]
+
+
+_MAX_ANCESTOR_WALK_DEPTH = 64
+
+
+def _normalize_parent_ids(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        val = raw.strip()
+        return [val] if val else []
+    if isinstance(raw, (list, tuple, set)):
+        return [str(item).strip() for item in raw if isinstance(item, str) and item.strip()]
+    raise ValueError('DRIVE_PARENTS_INVALID')
+
+
+def _resolve_folder_parents(drive: Any, folder_id: str) -> list[str]:
+    """Resolve direct parent folder IDs for real Drive or fake Drive instances.
+
+    For real Drive (or objects exposing ``_svc``/``api``/``get_parents``/``get_file_metadata``/``meta``),
+    any lookup failure fails closed with ``SNOWBALL_FOLDER_IN_PROTECTED_ZONE``.
+    For minimal in-memory fakes that do not track folder hierarchy, returns ``[]``.
+    """
+    get_parents_fn = getattr(drive, 'get_parents', None)
+    if callable(get_parents_fn):
+        try:
+            return _normalize_parent_ids(get_parents_fn(folder_id))
+        except Exception as exc:
+            raise ValueError(
+                f'SNOWBALL_FOLDER_IN_PROTECTED_ZONE:ancestor_lookup_failed:{folder_id}'
+            ) from exc
+
+    get_meta_fn = getattr(drive, 'get_file_metadata', None)
+    if callable(get_meta_fn):
+        try:
+            meta = get_meta_fn(folder_id)
+            return _normalize_parent_ids(meta.get('parents') if isinstance(meta, Mapping) else None)
+        except Exception as exc:
+            raise ValueError(
+                f'SNOWBALL_FOLDER_IN_PROTECTED_ZONE:ancestor_lookup_failed:{folder_id}'
+            ) from exc
+
+    meta_fn = getattr(drive, 'meta', None)
+    if callable(meta_fn):
+        try:
+            meta = meta_fn(folder_id)
+            return _normalize_parent_ids(meta.get('parents') if isinstance(meta, Mapping) else None)
+        except Exception as exc:
+            raise ValueError(
+                f'SNOWBALL_FOLDER_IN_PROTECTED_ZONE:ancestor_lookup_failed:{folder_id}'
+            ) from exc
+
+    for mapping_attr in ('folder_parents', 'parents_by_id'):
+        mapping = getattr(drive, mapping_attr, None)
+        if isinstance(mapping, Mapping):
+            return _normalize_parent_ids(mapping.get(folder_id))
+
+    svc = getattr(drive, '_svc', None) or getattr(drive, 'api', None)
+    if svc is not None or isinstance(drive, Drive):
+        if svc is None:
+            raise ValueError(
+                f'SNOWBALL_FOLDER_IN_PROTECTED_ZONE:ancestor_lookup_unavailable:{folder_id}'
+            )
+        try:
+            resp = svc.files().get(
+                fileId=folder_id,
+                fields='id,parents',
+                supportsAllDrives=True,
+            ).execute()
+            return _normalize_parent_ids(resp.get('parents') if isinstance(resp, Mapping) else None)
+        except Exception as exc:
+            raise ValueError(
+                f'SNOWBALL_FOLDER_IN_PROTECTED_ZONE:ancestor_lookup_failed:{folder_id}'
+            ) from exc
+
+    files_map = getattr(drive, 'files', None)
+    if isinstance(files_map, Mapping) and folder_id in files_map:
+        entry = files_map[folder_id]
+        if isinstance(entry, Mapping):
+            return _normalize_parent_ids(entry.get('parents'))
+
+    return []
+
+
+def _assert_folder_not_in_protected_zone(
+    drive: Any,
+    target_folder_id: str,
+    protected_ids: set[str],
+) -> None:
+    if not protected_ids:
+        raise ValueError(
+            'SNOWBALL_PROTECTED_ZONE_UNCONFIGURED: protected zone folder IDs required before Drive write'
+        )
+    if target_folder_id in protected_ids:
+        raise ValueError('SNOWBALL_FOLDER_IN_PROTECTED_ZONE')
+
+    visited: set[str] = {target_folder_id}
+    queue: list[tuple[str, int]] = [(target_folder_id, 0)]
+    while queue:
+        current_id, depth = queue.pop(0)
+        if depth >= _MAX_ANCESTOR_WALK_DEPTH:
+            raise ValueError('SNOWBALL_FOLDER_IN_PROTECTED_ZONE:max_ancestor_depth_exceeded')
+        for parent_id in _resolve_folder_parents(drive, current_id):
+            if parent_id in protected_ids:
+                raise ValueError(f'SNOWBALL_FOLDER_IN_PROTECTED_ZONE:ancestor={parent_id}')
+            if parent_id not in visited:
+                visited.add(parent_id)
+                queue.append((parent_id, depth + 1))
+
+
+def _collect_protected_folder_ids(
+    forbidden_folder_ids: Sequence[str] = (),
+    production_policy: Optional[Mapping[str, Any]] = None,
+) -> set[str]:
+    protected: set[str] = set()
+    for fid in forbidden_folder_ids or ():
+        if isinstance(fid, str) and fid.strip():
+            protected.add(fid.strip())
+    if isinstance(production_policy, Mapping):
+        root_id = production_policy.get('root_folder_id')
+        if isinstance(root_id, str) and root_id.strip():
+            protected.add(root_id.strip())
+        zones = production_policy.get('zones')
+        if isinstance(zones, Mapping):
+            for zone_key in (*_PROTECTED_POLICY_ZONES, 'root', 'root_folder_id'):
+                val = zones.get(zone_key)
+                if isinstance(val, str) and val.strip():
+                    protected.add(val.strip())
+                elif isinstance(val, (list, tuple, set)):
+                    for item in val:
+                        if isinstance(item, str) and item.strip():
+                            protected.add(item.strip())
+    return protected
+
+
+def upsert_snowball_card_to_drive(
+    drive,
+    *,
+    folder_id: str,
+    filename: str,
+    content_bytes: bytes,
+    forbidden_folder_ids: Sequence[str] = (),
+    production_policy: Optional[Mapping[str, Any]] = None,
+    mime_type: str = 'text/markdown',
+) -> Dict[str, Any]:
+    """Topology-safe single-card Drive upserter for isolated snowball folder."""
+    _assert_main_thread_writer(drive, 'upsert_snowball_card_to_drive')
+
+    if not isinstance(folder_id, str) or not folder_id.strip():
+        raise ValueError('SNOWBALL_FOLDER_ID_REQUIRED')
+    target_folder_id = folder_id.strip()
+
+    if (
+        not isinstance(filename, str)
+        or not filename.strip()
+        or '/' in filename
+        or '\\' in filename
+    ):
+        raise ValueError('SNOWBALL_FILENAME_INVALID')
+    clean_filename = filename.strip()
+
+    if not isinstance(content_bytes, (bytes, bytearray)):
+        raise TypeError('SNOWBALL_CONTENT_MUST_BE_BYTES')
+    payload = bytes(content_bytes)
+
+    protected_ids = _collect_protected_folder_ids(
+        forbidden_folder_ids=forbidden_folder_ids,
+        production_policy=production_policy,
+    )
+    _assert_folder_not_in_protected_zone(drive, target_folder_id, protected_ids)
+
+    from .current_state import clean
+    clean(payload, clean_filename)
+
+    existing_matches = [
+        item
+        for item in drive.list(target_folder_id)
+        if isinstance(item, Mapping) and item.get('name') == clean_filename
+    ]
+    if len(existing_matches) > 1:
+        raise RuntimeError(f'SNOWBALL_DUPLICATE_FILENAME:{clean_filename}')
+
+    if existing_matches:
+        drive.put(existing_matches[0]['id'], payload, mime_type)
+        action = 'updated'
+    else:
+        if hasattr(drive, 'create_binary'):
+            drive.create_binary(target_folder_id, clean_filename, payload, mime_type)
+        else:
+            drive.ensure(
+                target_folder_id,
+                f'snowball/{clean_filename}',
+                clean_filename,
+                mime_type,
+                payload,
+            )
+        action = 'created'
+
+    return {
+        'action': action,
+        'filename': clean_filename,
+        'sha256': digest(payload),
+        'size_bytes': len(payload),
+        'folder_role': 'SNOWBALL_ON_DEMAND',
+        'drive_id_redacted': True,
+    }

@@ -6,8 +6,9 @@ import hashlib
 import io
 import json
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence
 import yaml
 
 from .kc_consume import ConsumeSession, _content_digest
@@ -48,6 +49,304 @@ COLLECTOR_DIGEST_FILENAME = "CBA_官方采集动态与注册增量摘要_CURRENT
 FOREIGN_REGISTRATION_CSV_FILENAME = "CBA_外籍球员注册官方快照_CURRENT.csv"
 DOMESTIC_REG_DIFF_CSV_FILENAME = "CBA_跨季国内球员注册增量观测_2025-2027_CURRENT.csv"
 COLLECTOR_DIGEST_MAX_BYTES = 25 * 1024
+
+COVERAGE_STATUSES = ("COMPLETE", "PARTIAL", "STALE", "UNKNOWN")
+EXAGGERATED_COMPLETENESS_PHRASES = (
+    "全联盟完整",
+    "最新全量",
+    "全量完整",
+    "100%完整",
+    "完整无缺",
+)
+_LEAGUE_COVERAGE_DOMAINS: tuple[tuple[str, str], ...] = (
+    ("domestic_registration", "国内球员注册"),
+    ("foreign_registration", "外籍球员注册"),
+    ("club_announcements", "俱乐部官方公告"),
+    ("league_rules", "联赛规程与规则"),
+    ("game_stats", "官方比赛技术统计"),
+)
+
+
+def _parse_utc_timestamp(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def evaluate_league_coverage(
+    coverage_ledger: Optional[Mapping[str, Any]],
+    *,
+    now_utc: Optional[datetime] = None,
+    stale_after_hours: float = 48.0,
+) -> Dict[str, Any]:
+    """Evaluate observation horizon & coverage status across the 5 CBA proposition domains."""
+    if now_utc is None:
+        now = datetime.now(timezone.utc)
+    elif now_utc.tzinfo is None:
+        now = now_utc.replace(tzinfo=timezone.utc)
+    else:
+        now = now_utc.astimezone(timezone.utc)
+
+    stale_delta = timedelta(hours=float(stale_after_hours))
+    domains_out: Dict[str, Dict[str, Any]] = {}
+
+    if not isinstance(coverage_ledger, Mapping) or not coverage_ledger:
+        for dom_key, label in _LEAGUE_COVERAGE_DOMAINS:
+            domains_out[dom_key] = {
+                "domain": dom_key,
+                "label": label,
+                "observed_until": None,
+                "coverage_status": "UNKNOWN",
+                "missing_items": [],
+                "source_count": 0,
+                "honest_disclosure": f"{label}缺少覆盖账本（status=UNKNOWN）。",
+            }
+        return {
+            "overall_status": "UNKNOWN",
+            "observed_until": None,
+            "domains": domains_out,
+            "missing_items": [],
+            "honest_disclosure": (
+                "未提供有效覆盖账本（coverage_ledger），当前各命题域覆盖状态均为 UNKNOWN。"
+                " Statement != Fact. Evidence != Fact. Unknown != 0."
+            ),
+        }
+
+    grouped: Dict[str, list[Dict[str, Any]]] = {}
+    raw_sources = coverage_ledger.get("sources")
+    if isinstance(raw_sources, (list, tuple)):
+        for src in raw_sources:
+            if not isinstance(src, Mapping):
+                continue
+            dom = str(src.get("domain") or "").strip()
+            if dom:
+                grouped.setdefault(dom, []).append(dict(src))
+
+    all_missing: list[str] = []
+    seen_missing: set[str] = set()
+    overall_obs_candidates: list[tuple[datetime, str]] = []
+
+    for dom_key, label in _LEAGUE_COVERAGE_DOMAINS:
+        dom_sources = grouped.get(dom_key, [])
+        if not dom_sources:
+            domains_out[dom_key] = {
+                "domain": dom_key,
+                "label": label,
+                "observed_until": None,
+                "coverage_status": "UNKNOWN",
+                "missing_items": [],
+                "source_count": 0,
+                "honest_disclosure": f"{label}尚未记录有效观测来源（status=UNKNOWN）。",
+            }
+            continue
+
+        dom_missing: list[str] = []
+        seen_dom_missing: set[str] = set()
+        dom_obs_candidates: list[tuple[datetime, str]] = []
+        raw_statuses: list[str] = []
+
+        for src in dom_sources:
+            raw_st = str(src.get("status") or src.get("coverage_status") or "UNKNOWN").strip().upper()
+            if raw_st not in COVERAGE_STATUSES:
+                raw_st = "UNKNOWN"
+            raw_statuses.append(raw_st)
+
+            obs_raw = src.get("observed_until")
+            obs_dt = _parse_utc_timestamp(obs_raw)
+            if obs_dt is not None and isinstance(obs_raw, str):
+                obs_clean = obs_raw.strip()
+                dom_obs_candidates.append((obs_dt, obs_clean))
+                overall_obs_candidates.append((obs_dt, obs_clean))
+
+            m_list = src.get("missing") if src.get("missing") is not None else src.get("missing_items")
+            if isinstance(m_list, (list, tuple)):
+                for m_item in m_list:
+                    m_str = str(m_item or "").strip()
+                    if m_str:
+                        if m_str not in seen_dom_missing:
+                            seen_dom_missing.add(m_str)
+                            dom_missing.append(m_str)
+                        if m_str not in seen_missing:
+                            seen_missing.add(m_str)
+                            all_missing.append(m_str)
+
+        dom_obs_dt: Optional[datetime] = None
+        dom_obs_str: Optional[str] = None
+        if dom_obs_candidates:
+            dom_obs_dt, dom_obs_str = max(dom_obs_candidates, key=lambda pair: pair[0])
+
+        if all(st == "UNKNOWN" for st in raw_statuses):
+            dom_status = "UNKNOWN"
+        elif any(st == "PARTIAL" for st in raw_statuses) or dom_missing or any(st == "UNKNOWN" for st in raw_statuses):
+            dom_status = "PARTIAL"
+        elif any(st == "STALE" for st in raw_statuses):
+            dom_status = "STALE"
+        else:
+            dom_status = "COMPLETE"
+            if dom_obs_dt is not None and (now - dom_obs_dt) > stale_delta:
+                dom_status = "STALE"
+
+        if dom_status == "COMPLETE":
+            dom_disclosure = f"{label}已覆盖至 {dom_obs_str or 'UNKNOWN'}（status=COMPLETE）。"
+        elif dom_status == "PARTIAL":
+            miss_txt = ", ".join(dom_missing) if dom_missing else "未列明细"
+            dom_disclosure = (
+                f"{label}当前为部分覆盖（status=PARTIAL，observed_until={dom_obs_str or 'UNKNOWN'}），"
+                f"缺口项：{miss_txt}。"
+            )
+        elif dom_status == "STALE":
+            dom_disclosure = (
+                f"{label}观测已过期（status=STALE，observed_until={dom_obs_str or 'UNKNOWN'}，"
+                f"超过 {stale_after_hours:g}h 保鲜窗口）。"
+            )
+        else:
+            dom_disclosure = f"{label}覆盖状态未知（status=UNKNOWN）。"
+
+        domains_out[dom_key] = {
+            "domain": dom_key,
+            "label": label,
+            "observed_until": dom_obs_str,
+            "coverage_status": dom_status,
+            "missing_items": dom_missing,
+            "source_count": len(dom_sources),
+            "honest_disclosure": dom_disclosure,
+        }
+
+    dom_statuses = [d["coverage_status"] for d in domains_out.values()]
+    if all(st == "UNKNOWN" for st in dom_statuses):
+        overall_status = "UNKNOWN"
+    elif all(st == "COMPLETE" for st in dom_statuses):
+        overall_status = "COMPLETE"
+    elif any(st in ("PARTIAL", "UNKNOWN") for st in dom_statuses):
+        overall_status = "PARTIAL"
+    else:
+        overall_status = "STALE"
+
+    overall_obs: Optional[str] = None
+    if overall_obs_candidates:
+        overall_obs = max(overall_obs_candidates, key=lambda pair: pair[0])[1]
+    elif isinstance(coverage_ledger.get("generated_at_utc"), str) and coverage_ledger["generated_at_utc"].strip():
+        overall_obs = coverage_ledger["generated_at_utc"].strip()
+
+    if overall_status == "COMPLETE":
+        overall_disclosure = (
+            f"已评估 5 个命题域（observed_until={overall_obs or 'UNKNOWN'}），当前覆盖状态为 COMPLETE。"
+            " Statement != Fact. Evidence != Fact. Unknown != 0."
+        )
+    elif overall_status == "PARTIAL":
+        miss_txt = ", ".join(all_missing) if all_missing else "部分命题域存在缺口"
+        overall_disclosure = (
+            f"当前覆盖状态为 PARTIAL（observed_until={overall_obs or 'UNKNOWN'}），"
+            f"存在未覆盖缺口：{miss_txt}。Statement != Fact. Evidence != Fact. Unknown != 0."
+        )
+    elif overall_status == "STALE":
+        overall_disclosure = (
+            f"当前覆盖状态为 STALE（observed_until={overall_obs or 'UNKNOWN'}），"
+            f"部分命题域已超过 {stale_after_hours:g}h 保鲜窗口。Statement != Fact. Evidence != Fact. Unknown != 0."
+        )
+    else:
+        overall_disclosure = (
+            "当前覆盖状态为 UNKNOWN，缺少有效命题域覆盖观测。"
+            " Statement != Fact. Evidence != Fact. Unknown != 0."
+        )
+
+    return {
+        "overall_status": overall_status,
+        "observed_until": overall_obs,
+        "domains": domains_out,
+        "missing_items": all_missing,
+        "honest_disclosure": overall_disclosure,
+    }
+
+
+def assert_no_exaggerated_coverage_claims(
+    text: str, coverage_eval: Mapping[str, Any]
+) -> None:
+    """Fail-closed guard forbidding exaggerated completeness phrases unless coverage is COMPLETE."""
+    if not isinstance(text, str) or not text:
+        return
+    if not isinstance(coverage_eval, Mapping):
+        is_complete = False
+    else:
+        overall = str(
+            coverage_eval.get("overall_status")
+            or coverage_eval.get("coverage_status")
+            or "UNKNOWN"
+        ).strip().upper()
+        domains = coverage_eval.get("domains")
+        all_domains_complete = True
+        if isinstance(domains, Mapping) and domains:
+            all_domains_complete = all(
+                isinstance(d, Mapping)
+                and str(d.get("coverage_status") or "UNKNOWN").strip().upper() == "COMPLETE"
+                for d in domains.values()
+            )
+        is_complete = (overall == "COMPLETE") and all_domains_complete
+    if is_complete:
+        return
+    hits = [phrase for phrase in EXAGGERATED_COMPLETENESS_PHRASES if phrase in text]
+    if hits:
+        raise ValueError("EXAGGERATED_COVERAGE_CLAIM_FORBIDDEN:" + ",".join(hits))
+
+
+def render_observation_horizon_header(
+    coverage_eval: Mapping[str, Any], *, domain: Optional[str] = None
+) -> str:
+    """Render concise observation horizon header block validated against exaggerated claims."""
+    target: Mapping[str, Any] = coverage_eval
+    if domain and isinstance(coverage_eval.get("domains"), Mapping):
+        dom_entry = coverage_eval["domains"].get(domain)
+        if isinstance(dom_entry, Mapping):
+            target = dom_entry
+
+    obs_until = target.get("observed_until") or coverage_eval.get("observed_until") or "UNKNOWN"
+    cov_status = (
+        target.get("coverage_status")
+        or target.get("overall_status")
+        or coverage_eval.get("overall_status")
+        or "UNKNOWN"
+    )
+    missing = list(target.get("missing_items") or [])
+    disclosure = str(target.get("honest_disclosure") or coverage_eval.get("honest_disclosure") or "").strip()
+
+    lines = [
+        f"- **Observation Horizon (`observed_until`)**: `{obs_until}`",
+        f"- **Coverage Status (`coverage_status`)**: `{cov_status}`",
+    ]
+    if missing:
+        lines.append(f"- **Missing Items (`missing_items`)**: {', '.join(str(x) for x in missing)}")
+    if disclosure:
+        lines.append(f"- **Honest Disclosure**: {disclosure}")
+    rendered = "\n".join(lines)
+    assert_no_exaggerated_coverage_claims(rendered, coverage_eval)
+    return rendered
+
+
+def _extract_horizon_csv_fields(
+    observation_horizon: Mapping[str, Any], *, domain: Optional[str] = None
+) -> tuple[str, str]:
+    target: Mapping[str, Any] = observation_horizon
+    if domain and isinstance(observation_horizon.get("domains"), Mapping):
+        dom_entry = observation_horizon["domains"].get(domain)
+        if isinstance(dom_entry, Mapping):
+            target = dom_entry
+    obs_until = str(target.get("observed_until") or observation_horizon.get("observed_until") or "UNKNOWN")
+    cov_status = str(
+        target.get("coverage_status")
+        or target.get("overall_status")
+        or observation_horizon.get("overall_status")
+        or "UNKNOWN"
+    )
+    return obs_until, cov_status
 
 _EVIDENCE_LAYER_LABEL = "evidence / candidate_observation"
 _DEFAULT_STATEMENT_NOTICE = (
@@ -412,6 +711,7 @@ def render_consumer_surface_guide_section(
     master_row_count: int,
     include_collector_digest: Optional[bool] = None,
     include_curated_csvs: Optional[bool] = None,
+    observation_horizon: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """Render standardized consumer-surface guide block with exact dynamic MASTER count."""
     exact_count = _require_positive_master_row_count(master_row_count)
@@ -421,11 +721,15 @@ def render_consumer_surface_guide_section(
         "",
         f"- 权威发布标识：`{release_id}`（仅读取处于 `COMPLETE` 状态且位于 `current` 消费区的 `CURRENT` / 权威产物；`90_archive_历史归档`、回收站与关闭沙盒绝非当前真值）。",
         f"- 当前 `MASTER` 国内球员注册总表数据行数：**{count_label}**（由构建期自动统计；历史迁移文档中提及的 `3,451` / `3451` 仅为 `2026-09-10` 早期 v1.1 载体对照基线，已由当前动态行数取代）。",
+    ]
+    if observation_horizon is not None:
+        lines.extend(render_observation_horizon_header(observation_horizon).splitlines())
+    lines.extend([
         "- **自描述核心消费主表与字典**（面向全盘中文检索优先读取）：",
         f"  - `{CONSUMER_MASTER_FILENAME}`（对应底层 `derived/MASTER.csv` / `input/MASTER.xlsx`，全量国内球员注册权威总表）",
         f"  - `{CONSUMER_DICTIONARY_FILENAME}`（核心数据表字段字典、缩写释义与权威口径说明）",
         f"  - `{CONSUMER_SOURCE_REGISTRY_FILENAME}`（来源文件注册脱敏索引，隐去底层物理 `drive_file_id`，保留逻辑 `source_id` 与可读文件名）",
-    ]
+    ])
     if _should_include_collector_digest(release_id, include_collector_digest):
         lines.extend([
             f"  - `{CONSUMER_DOC_INDEX_FILENAME}`（已合并最新受控采集文档索引的脱敏视图，隐去物理 Drive ID、`file_id` 与本地路径）",
@@ -442,7 +746,10 @@ def render_consumer_surface_guide_section(
         "  - `date_year_inferred` 属于事件表 `facts/CBA_球员注册_EVENTS.xlsx`（工作表 `registration_status_events`）的**事件行级布尔字段**：仅在跨季中段“取消注册”等仅写月日、年份由赛季边界推导时为 `True`。",
         "  - `source_registry`（及脱敏索引 `CBA_来源注册索引_脱敏视图_CURRENT.csv`）中的 `season`、`source_title` 与 `discovered_at_utc` 属于**来源文件级元数据**，与事件行级 `date_year_inferred` 相互独立，不得用来源文件字段替代或否定事件行级推导标记。",
     ])
-    return "\n".join(lines)
+    rendered = "\n".join(lines)
+    if observation_horizon is not None:
+        assert_no_exaggerated_coverage_claims(rendered, observation_horizon)
+    return rendered
 
 
 def render_consumer_field_dictionary_md(
@@ -452,6 +759,7 @@ def render_consumer_field_dictionary_md(
     master_row_count: int,
     include_collector_digest: Optional[bool] = None,
     include_curated_csvs: Optional[bool] = None,
+    observation_horizon: Optional[Mapping[str, Any]] = None,
 ) -> bytes:
     """Generate the self-describing CURRENT consumer field dictionary Markdown document."""
     exact_count = _require_positive_master_row_count(master_row_count)
@@ -464,6 +772,10 @@ def render_consumer_field_dictionary_md(
         f"- **代码基线 Commit**: `{engine_sha}`",
         f"- **国内球员注册权威总表 (`MASTER`) 动态构建行数**: **{exact_count:,} 条**（历史文档中的 `3,451` 仅指 `2026-09-10` v1.1 迁移对照基线，非当前实时行数）。",
         "- **核心原则**: `Statement != Fact. Evidence != Fact. Unknown != 0.`",
+    ]
+    if observation_horizon is not None:
+        lines.extend(render_observation_horizon_header(observation_horizon).splitlines())
+    lines.extend([
         "",
         "## 1. 权威产物路由与命名规范（CURRENT Canonical Surface）",
         "",
@@ -474,7 +786,7 @@ def render_consumer_field_dictionary_md(
         "| `facts/CBA_球员注册_EVENTS.xlsx` | `canonical` | 全量注册状态变更与跨季事件表（`registration_status_events`） |",
         "| `facts/CBA_外籍球员注册_SNAPSHOTS.xlsx` | `canonical` | 外籍球员官方注册快照 |",
         f"| `{CONSUMER_SOURCE_REGISTRY_FILENAME}` | `control / metadata` | 来源文件注册脱敏索引（隐藏原始物理 Drive ID，保留逻辑 `source_id` 与可读标题） |",
-    ]
+    ])
     if include_digest:
         lines.extend([
             f"| `{CONSUMER_DOC_INDEX_FILENAME}` | `control / metadata` | 官方文档脱敏索引（含 `consumed_bundles` 合并视图，隐去原始 Drive ID、`file_id` 与本地路径） |",
@@ -514,11 +826,17 @@ def render_consumer_field_dictionary_md(
         "",
         "end_marker: true",
     ])
-    return ("\n".join(lines) + "\n").encode("utf-8")
+    rendered_text = "\n".join(lines) + "\n"
+    if observation_horizon is not None:
+        assert_no_exaggerated_coverage_claims(rendered_text, observation_horizon)
+    return rendered_text.encode("utf-8")
 
 
 def export_consumer_master_csv(
-    raw_csv_bytes: bytes, *, known_drive_ids: Sequence[str] = ()
+    raw_csv_bytes: bytes,
+    *,
+    known_drive_ids: Sequence[str] = (),
+    observation_horizon: Optional[Mapping[str, Any]] = None,
 ) -> bytes:
     """Create self-describing CURRENT MASTER CSV copy with provenance-based ID redaction."""
     text = raw_csv_bytes.decode("utf-8-sig")
@@ -526,6 +844,14 @@ def export_consumer_master_csv(
     if not reader.fieldnames:
         raise ValueError("MASTER_CSV_HEADER_REQUIRED")
     fieldnames = list(reader.fieldnames)
+    horizon_vals: Optional[tuple[str, str]] = None
+    if observation_horizon is not None:
+        horizon_vals = _extract_horizon_csv_fields(
+            observation_horizon, domain="domestic_registration"
+        )
+        for hcol in ("observed_until", "coverage_status"):
+            if hcol not in fieldnames:
+                fieldnames.append(hcol)
     rows = list(reader)
     provenance_ids: set[str] = set(known_drive_ids or ())
     for row in rows:
@@ -543,6 +869,12 @@ def export_consumer_master_csv(
     for row in rows:
         cleaned_row: Dict[str, Any] = {}
         for col in fieldnames:
+            if horizon_vals is not None and col == "observed_until":
+                cleaned_row[col] = horizon_vals[0]
+                continue
+            if horizon_vals is not None and col == "coverage_status":
+                cleaned_row[col] = horizon_vals[1]
+                continue
             val = row.get(col, "")
             if col == "source_file_id" and isinstance(val, str) and val.strip():
                 raw_sfid = val.strip()
@@ -955,6 +1287,7 @@ def export_foreign_players_registration_csv(
     *,
     bundles: Sequence[Dict[str, Any]],
     known_drive_ids: Sequence[str] = (),
+    observation_horizon: Optional[Mapping[str, Any]] = None,
 ) -> bytes:
     """Deterministically export foreign player registration snapshots to UTF-8-SIG CSV."""
     fieldnames = [
@@ -972,6 +1305,12 @@ def export_foreign_players_registration_csv(
         "source_tier",
         "raw_sha256",
     ]
+    horizon_vals: Optional[tuple[str, str]] = None
+    if observation_horizon is not None:
+        horizon_vals = _extract_horizon_csv_fields(
+            observation_horizon, domain="foreign_registration"
+        )
+        fieldnames.extend(["observed_until", "coverage_status"])
     prov_re = _compile_provenance_pattern(known_drive_ids)
     sorted_bundles = sorted(
         (dict(b) for b in (bundles or ()) if isinstance(b, dict)),
@@ -1005,6 +1344,9 @@ def export_foreign_players_registration_csv(
                 "source_tier": _scrub_with_pattern(source_tier, prov_re),
                 "raw_sha256": _scrub_with_pattern(raw_sha256, prov_re),
             }
+            if horizon_vals is not None:
+                row["observed_until"] = horizon_vals[0]
+                row["coverage_status"] = horizon_vals[1]
             writer.writerow(row)
     return out.getvalue().encode("utf-8-sig")
 
@@ -1013,6 +1355,7 @@ def export_domestic_registration_diff_csv(
     *,
     reg_diff: Optional[Dict[str, Any]],
     known_drive_ids: Sequence[str] = (),
+    observation_horizon: Optional[Mapping[str, Any]] = None,
 ) -> bytes:
     """Deterministically export cross-season domestic registration diff to UTF-8-SIG CSV."""
     fieldnames = [
@@ -1028,6 +1371,12 @@ def export_domestic_registration_diff_csv(
         "old_snapshot_sha256",
         "new_snapshot_sha256",
     ]
+    horizon_vals: Optional[tuple[str, str]] = None
+    if observation_horizon is not None:
+        horizon_vals = _extract_horizon_csv_fields(
+            observation_horizon, domain="domestic_registration"
+        )
+        fieldnames.extend(["observed_until", "coverage_status"])
     prov_re = _compile_provenance_pattern(known_drive_ids)
     diff = reg_diff if isinstance(reg_diff, dict) else {}
     notice = _ensure_statement_notice(diff.get("statement_notice"))
@@ -1121,7 +1470,7 @@ def export_domestic_registration_diff_csv(
     writer = csv.DictWriter(out, fieldnames=fieldnames, lineterminator="\n")
     writer.writeheader()
     for r in rows:
-        writer.writerow({
+        out_row = {
             "layer": _EVIDENCE_LAYER_LABEL,
             "statement_notice": _scrub_with_pattern(notice, prov_re),
             "change_type": r["change_type"],
@@ -1133,7 +1482,11 @@ def export_domestic_registration_diff_csv(
             "change_details": _scrub_with_pattern(r["change_details"], prov_re),
             "old_snapshot_sha256": _scrub_with_pattern(old_sha, prov_re),
             "new_snapshot_sha256": _scrub_with_pattern(new_sha, prov_re),
-        })
+        }
+        if horizon_vals is not None:
+            out_row["observed_until"] = horizon_vals[0]
+            out_row["coverage_status"] = horizon_vals[1]
+        writer.writerow(out_row)
     return out.getvalue().encode("utf-8-sig")
 
 
@@ -1258,6 +1611,7 @@ def _render_compact_curated_digest_md(
     max_bytes: int,
     active_window_start: str,
     profile: Dict[str, Any],
+    observation_horizon: Optional[Mapping[str, Any]] = None,
 ) -> bytes:
     """Render <25KB curated collector digest with CSV routing & fail-closed size gate."""
     filtered_res = filter_curated_operational_announcements(
@@ -1288,6 +1642,10 @@ def _render_compact_curated_digest_md(
         f"- **代码基线 Commit**: `{engine_sha or 'unknown'}`",
         f"- **数据层级声明**: `{_EVIDENCE_LAYER_LABEL}`（来源自受控官方采集束 `acquisition_bundle_v1` 与跨季增量比对，**非**已晋升的 `canonical` 事实表）",
         "- **核心原则**: `Statement != Fact. Evidence != Fact. Unknown != 0.`",
+    ]
+    if observation_horizon is not None:
+        lines.extend(render_observation_horizon_header(observation_horizon).splitlines())
+    lines.extend([
         (
             f"- **采集文档入池与降噪统计**: 总计 **{total_count}** 份，"
             f"精华摘要准入 **{admitted_count}** 份"
@@ -1301,7 +1659,7 @@ def _render_compact_curated_digest_md(
         "",
         "## 1. 2026-2027 外籍球员注册官方快照概览",
         "",
-    ]
+    ])
 
     if foreign_bundles:
         total_foreign_rows = 0
@@ -1397,6 +1755,8 @@ def _render_compact_curated_digest_md(
     if not rendered.endswith("\n"):
         rendered += "\n"
     rendered += "\nend_marker: true\n"
+    if observation_horizon is not None:
+        assert_no_exaggerated_coverage_claims(rendered, observation_horizon)
     rendered_bytes = rendered.encode("utf-8")
     if len(rendered_bytes) >= max_bytes:
         raise ValueError(
@@ -1418,6 +1778,7 @@ def render_collector_official_digest_md(
     curation_profile: Optional[Dict[str, Any]] = None,
     curation_profile_path: Optional[str | Path] = None,
     instance: Any = None,
+    observation_horizon: Optional[Mapping[str, Any]] = None,
 ) -> bytes:
     """Deterministically render governed collector official digest Markdown in evidence layer."""
     if compact_curated:
@@ -1435,6 +1796,7 @@ def render_collector_official_digest_md(
             max_bytes=max_bytes,
             active_window_start=active_window_start,
             profile=profile,
+            observation_horizon=observation_horizon,
         )
     sorted_bundles = sorted((dict(b) for b in (bundles or ()) if isinstance(b, dict)), key=_bundle_sort_key)
 
@@ -1457,11 +1819,15 @@ def render_collector_official_digest_md(
         f"- **代码基线 Commit**: `{engine_sha or 'unknown'}`",
         "- **数据层级声明**: `evidence / candidate_observation`（来源自受控官方采集束 `acquisition_bundle_v1` 与跨季增量比对，**非**已晋升的 `canonical` 事实表）",
         "- **核心原则**: `Statement != Fact. Evidence != Fact. Unknown != 0.`",
+    ]
+    if observation_horizon is not None:
+        lines.extend(render_observation_horizon_header(observation_horizon).splitlines())
+    lines.extend([
         f"- **纳入采集文档总数**: **{len(sorted_bundles)}** 份（外籍注册快照 {len(foreign_bundles)} 份、国内注册快照 {len(domestic_bundles)} 份、官方公告与赛事动态 {len(announcement_bundles)} 份）",
         "",
         "## 1. 2026-2027 外籍球员注册官方快照",
         "",
-    ]
+    ])
 
     if foreign_bundles:
         for b in foreign_bundles:
@@ -1549,6 +1915,8 @@ def render_collector_official_digest_md(
     if not rendered.endswith("\n"):
         rendered += "\n"
     rendered += "\nend_marker: true\n"
+    if observation_horizon is not None:
+        assert_no_exaggerated_coverage_claims(rendered, observation_horizon)
     return rendered.encode("utf-8")
 
 
@@ -1773,6 +2141,7 @@ def build_consumer_surface_targets_spec(
     domestic_reg_diff_csv_bytes: Optional[bytes] = None,
     include_curated_csvs: Optional[bool] = None,
     promoted_research_artifacts: Optional[Dict[str, Dict[str, Any]]] = None,
+    observation_horizon: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Build declared consumer-surface target contents keyed by logical_key for Stage 4."""
     row_count = compute_master_row_count(master_csv_bytes)
@@ -1782,7 +2151,10 @@ def build_consumer_surface_targets_spec(
             "mime": "text/csv",
             "mode": "binary",
             "parent_role": "data",
-            "content": export_consumer_master_csv(master_csv_bytes),
+            "content": export_consumer_master_csv(
+                master_csv_bytes,
+                observation_horizon=observation_horizon,
+            ),
         },
         "consumer/field_dictionary_current.md": {
             "name": CONSUMER_DICTIONARY_FILENAME,
@@ -1795,6 +2167,7 @@ def build_consumer_surface_targets_spec(
                 master_row_count=row_count,
                 include_collector_digest=include_collector_digest,
                 include_curated_csvs=include_curated_csvs,
+                observation_horizon=observation_horizon,
             ),
         },
         "consumer/source_registry_index_current.csv": {

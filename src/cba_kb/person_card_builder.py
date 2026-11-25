@@ -24,6 +24,7 @@ from .common import atomic
 from .consumer_surface import (
     CONSUMER_MASTER_FILENAME,
     FOREIGN_REGISTRATION_CSV_FILENAME,
+    evaluate_league_coverage,
     scrub_raw_drive_ids_for_consumer,
 )
 from .game_stats import summarize_recent_games
@@ -177,6 +178,17 @@ def _discover_instance_inputs(instance: Instance) -> Dict[str, Any]:
             negative_receipts = _read_json_or_jsonl(nr_candidate)
             break
 
+    # 8. Coverage ledger (REQ-230 P0-1)
+    coverage_ledger: Optional[Dict[str, Any]] = None
+    ledger_candidate = instance.data_root / "coverage_ledger.json"
+    if ledger_candidate.is_file():
+        try:
+            loaded_ledger = json.loads(ledger_candidate.read_text(encoding="utf-8"))
+            if isinstance(loaded_ledger, dict):
+                coverage_ledger = loaded_ledger
+        except (OSError, ValueError):
+            pass
+
     return {
         "master_rows": master_rows,
         "foreign_rows": foreign_rows,
@@ -186,6 +198,7 @@ def _discover_instance_inputs(instance: Instance) -> Dict[str, Any]:
         "document_bundles": document_bundles,
         "negative_receipts": negative_receipts,
         "data_cutoff": data_cutoff,
+        "coverage_ledger": coverage_ledger,
     }
 
 
@@ -339,10 +352,10 @@ def _build_candidate_pool(
     for row in master_rows or ():
         if not isinstance(row, dict):
             continue
-        pname = str(row.get("player") or "").strip()
+        pname = str(row.get("player") or row.get("player_name") or "").strip()
         if not pname:
             continue
-        club_official = str(row.get("club_official") or "").strip()
+        club_official = str(row.get("club_official") or row.get("club") or "").strip()
         club_id = str(row.get("club_id") or "").strip()
         club = club_official or club_id
         row_clubs_norm = {_norm_key(club_official), _norm_key(club_id)}
@@ -443,6 +456,10 @@ def _build_candidate_pool(
         target["domestic_records"].append(dict(row))
         if not target.get("registration_type"):
             target["registration_type"] = "DOMESTIC"
+        if row.get("position") and not target.get("position"):
+            target["position"] = str(row.get("position")).strip() or None
+        if row.get("jersey_number") and not target.get("jersey_number"):
+            target["jersey_number"] = str(row.get("jersey_number")).strip() or None
         if club:
             if club not in target["clubs_history"]:
                 target["clubs_history"].append(club)
@@ -796,12 +813,21 @@ def build_person_card(
     output_dir: Optional[str | Path] = None,
     register_for_sync: bool = False,
     known_drive_ids: Sequence[str] = (),
+    coverage_ledger: Optional[Dict[str, Any]] = None,
+    observation_horizon: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Assemble and render an on-demand research card for any player in local KB.
 
     Zero network calls, zero Google Drive API calls.
     """
     discovered = _discover_instance_inputs(instance) if instance is not None else {}
+    obs_horizon: Optional[Dict[str, Any]] = None
+    if isinstance(observation_horizon, dict):
+        obs_horizon = dict(observation_horizon)
+    elif isinstance(coverage_ledger, dict):
+        obs_horizon = evaluate_league_coverage(coverage_ledger)
+    elif isinstance(discovered.get("coverage_ledger"), dict):
+        obs_horizon = evaluate_league_coverage(discovered["coverage_ledger"])
     m_rows = list(master_rows) if master_rows is not None else list(discovered.get("master_rows") or [])
     f_rows = list(foreign_rows) if foreign_rows is not None else list(discovered.get("foreign_rows") or [])
     id_reg = identity_registry if identity_registry is not None else discovered.get("identity_registry")
@@ -950,6 +976,8 @@ def build_person_card(
         payload["recent_games_summary"] = recent_summary
     if citations:
         payload["external_citations"] = citations
+    if obs_horizon is not None:
+        payload["observation_horizon"] = obs_horizon
 
     raw_markdown = render_research_card(payload, evidence_verified=True)
     markdown = scrub_raw_drive_ids_for_consumer(raw_markdown, known_drive_ids=known_drive_ids)
@@ -999,7 +1027,7 @@ def build_person_card(
                 (json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"),
             )
 
-    return {
+    result: Dict[str, Any] = {
         "status": "BUILT",
         "query": resolution["query"],
         "season": season,
@@ -1015,3 +1043,6 @@ def build_person_card(
         "drive_api_called": False,
         "network_called": False,
     }
+    if obs_horizon is not None:
+        result["observation_horizon"] = obs_horizon
+    return result

@@ -105,6 +105,29 @@ def render_research_card(
         "",
     ]
 
+    # 0. Observation Horizon Section (REQ-230 P0-1: optional, 0-byte diff when absent)
+    obs_horizon = payload.get("observation_horizon")
+    has_obs_horizon = isinstance(obs_horizon, dict) and bool(obs_horizon)
+    if has_obs_horizon:
+        obs_until = obs_horizon.get("observed_until") or "UNKNOWN"
+        cov_status = (
+            obs_horizon.get("overall_status")
+            or obs_horizon.get("coverage_status")
+            or "UNKNOWN"
+        )
+        missing_items = obs_horizon.get("missing_items") or []
+        honest_disclosure = str(obs_horizon.get("honest_disclosure") or "").strip()
+        lines.append("## Observation Horizon")
+        lines.append(f"- observed_until: {obs_until}")
+        lines.append(f"- coverage_status: {cov_status}")
+        if missing_items:
+            lines.append(f"- missing_items: {', '.join(str(x) for x in missing_items)}")
+        else:
+            lines.append("- missing_items: []")
+        if honest_disclosure:
+            lines.append(f"- honest_disclosure: {honest_disclosure}")
+        lines.append("")
+
     # 1. Stats & Scope Section
     lines.append("## Statistical Evidence")
     match_type = scope_meta.get("match_type") or stats_layer.get("match_type", "-")
@@ -403,13 +426,20 @@ def render_research_card(
         from .consumer_surface import scrub_raw_drive_ids_for_consumer
 
         body_text = scrub_raw_drive_ids_for_consumer("\n".join(lines))
-        return body_text + "\n\nend_marker: true\n"
+        final_text = body_text + "\n\nend_marker: true\n"
+    else:
+        lines.extend([
+            "",
+            "end_marker: true",
+        ])
+        final_text = "\n".join(lines) + "\n"
 
-    lines.extend([
-        "",
-        "end_marker: true",
-    ])
-    return "\n".join(lines) + "\n"
+    if has_obs_horizon:
+        from .consumer_surface import assert_no_exaggerated_coverage_claims
+
+        assert_no_exaggerated_coverage_claims(final_text, obs_horizon)
+
+    return final_text
 
 
 MEASUREMENT_PROTOCOL = (
