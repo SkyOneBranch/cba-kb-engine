@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import gzip
 import io
+import json
 import re
 import tarfile
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
@@ -318,6 +319,7 @@ def compact_drive_archive(
     execute: bool = False,
     tag: str = "v231",
     release_status: Optional[Mapping[str, Any]] = None,
+    release_status_file_id: Optional[str] = None,
     manifest_rows: Optional[Sequence[Mapping[str, Any]]] = None,
     production_policy: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -331,10 +333,64 @@ def compact_drive_archive(
     if execute:
         _assert_main_thread_writer(drive, "compact_drive_archive")
 
+    effective_release_status: Optional[Mapping[str, Any]] = release_status
+    extra_protected_ids: List[str] = list(active_asset_ids or ())
+    if release_status_file_id is not None and str(release_status_file_id).strip():
+        rs_fid = str(release_status_file_id).strip()
+        extra_protected_ids.append(rs_fid)
+        try:
+            raw_rs = drive.get(rs_fid)
+            live_rs = json.loads(raw_rs.decode("utf-8"))
+        except Exception as exc:
+            raise ArchiveCompactionError(
+                f"ARCHIVE_COMPACT_INVALID_RELEASE_STATE:live_fetch_failed={rs_fid}"
+            ) from exc
+        if not isinstance(live_rs, Mapping):
+            raise ArchiveCompactionError("ARCHIVE_COMPACT_INVALID_RELEASE_STATE:live_not_mapping")
+        _validate_authoritative_release_state(release_status=live_rs)
+        live_rel = ""
+        for key in ("release_id", "active_release_id", "current_release_id"):
+            val = live_rs.get(key)
+            if isinstance(val, str) and val.strip():
+                live_rel = val.strip()
+                break
+        live_prev = (
+            live_rs.get("previous_release_id").strip()
+            if isinstance(live_rs.get("previous_release_id"), str)
+            else ""
+        )
+        if release_status is not None:
+            if not isinstance(release_status, Mapping):
+                raise ArchiveCompactionError("ARCHIVE_COMPACT_INVALID_RELEASE_STATE:not_mapping")
+            caller_rel = ""
+            for key in ("release_id", "active_release_id", "current_release_id"):
+                val = release_status.get(key)
+                if isinstance(val, str) and val.strip():
+                    caller_rel = val.strip()
+                    break
+            if caller_rel and caller_rel != live_rel:
+                raise ArchiveCompactionError(
+                    f"ARCHIVE_COMPACT_RELEASE_STATE_MISMATCH:caller={caller_rel}:live={live_rel}"
+                )
+            caller_prev = (
+                release_status.get("previous_release_id").strip()
+                if isinstance(release_status.get("previous_release_id"), str)
+                else ""
+            )
+            if caller_prev and live_prev and caller_prev != live_prev:
+                raise ArchiveCompactionError(
+                    f"ARCHIVE_COMPACT_RELEASE_STATE_MISMATCH:caller_prev={caller_prev}:live_prev={live_prev}"
+                )
+        if active_release_id is not None and active_release_id.strip() != live_rel:
+            raise ArchiveCompactionError(
+                f"ARCHIVE_COMPACT_RELEASE_STATE_MISMATCH:active_release_id={active_release_id}:live={live_rel}"
+            )
+        effective_release_status = live_rs
+
     protected_ids = _collect_protected_ids(
-        active_asset_ids=active_asset_ids,
+        active_asset_ids=extra_protected_ids,
         protected_folder_ids=protected_folder_ids,
-        release_status=release_status,
+        release_status=effective_release_status,
         manifest_rows=manifest_rows,
         production_policy=production_policy,
     )
@@ -347,7 +403,7 @@ def compact_drive_archive(
         keep_release_dirs=keep_release_dirs,
         active_release_id=active_release_id,
         previous_release_id=previous_release_id,
-        release_status=release_status,
+        release_status=effective_release_status,
     )
 
     candidate_files: List[Dict[str, Any]] = []
@@ -464,7 +520,7 @@ def compact_drive_archive(
         has_verified_anchor = _validate_authoritative_release_state(
             active_release_id=active_release_id,
             previous_release_id=previous_release_id,
-            release_status=release_status,
+            release_status=effective_release_status,
         )
         if not has_verified_anchor:
             missing_default_protected = sorted(

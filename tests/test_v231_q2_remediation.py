@@ -827,3 +827,108 @@ def test_r2_6_p0_4_twenty_club_sixty_player_foreign_quick_index_completeness_und
     for zh in expected_players:
         assert zh in text
 
+
+# ---------------------------------------------------------------------------
+# Round 3 Option A Surgical Micro-Fixes Regression Tests
+# ---------------------------------------------------------------------------
+
+
+def test_r3_1_lock_created_at_utc_cannot_be_backdated_via_extra() -> None:
+    from datetime import datetime, timezone
+
+    objs: Dict[str, Tuple[bytes, Dict[str, str], str]] = {}
+
+    def _transport(method: str, url: str, *, headers: Dict[str, str], data: bytes = b""):
+        key = urlparse(url).path.lstrip("/").split("/", 1)[1]
+        lh = {k.lower(): v for k, v in headers.items()}
+        if method == "GET":
+            if key not in objs:
+                return 404, {}, b"NotFound"
+            p, m, e = objs[key]
+            return 200, {**m, "ETag": e}, p
+        if method == "PUT":
+            meta = {k: v for k, v in lh.items() if k.startswith("x-amz-meta-")}
+            etag = f'"{hashlib.md5(data).hexdigest()}"'
+            objs[key] = (bytes(data), meta, etag)
+            return 200, {"ETag": etag}, b""
+        return 405, {}, b""
+
+    store = R2CloudStateStore(_r2_cfg(), transport=_transport)
+    trusted_now = datetime(2026, 11, 25, 12, 0, 0, tzinfo=timezone.utc)
+    ok, doc = store.acquire_active_job_lock(
+        "2026-2027",
+        "合成时钟甲",
+        job_id="job_clock",
+        owner_id="owner_clock",
+        extra={"created_at_utc": "2000-01-01T00:00:00Z", "expires_at_utc": "2000-01-01T00:01:00Z"},
+        lock_ttl_seconds=900.0,
+        now_utc=trusted_now,
+    )
+    assert ok is True
+    assert doc["created_at_utc"] == "2026-11-25T12:00:00Z"
+    assert doc["expires_at_utc"] == "2026-11-25T12:15:00Z"
+
+
+def test_r3_2_foreign_table_7col_and_5col_empty_first_rejected_fail_closed() -> None:
+    # 1. 7-column data/continuation row -> FOREIGN_ROW_MALFORMED_COLUMNS
+    seven_col = "\n".join([
+        "| 俱乐部 | 外籍球员 |  | 国籍 | 位置 | 球衣号 |",
+        "| --- | --- | --- | --- | --- | --- |",
+        "| 合成首钢 | SYNTH ONE | 外援一 | 合成国 | PG | 1 |",
+        "| 合成首钢 | SYNTH TWO | 外援二 | 合成国 | SG | 2 | 多余列 |",
+    ])
+    with pytest.raises(ValueError, match="FOREIGN_ROW_MALFORMED_COLUMNS"):
+        _parse_foreign_registration_rows({"body": seven_col})
+
+    # 2. 5-column row with empty first column -> FOREIGN_ROW_MALFORMED_CONTINUATION
+    five_col_empty_first = "\n".join([
+        "| 俱乐部 | 外籍球员 |  | 国籍 | 位置 | 球衣号 |",
+        "| --- | --- | --- | --- | --- | --- |",
+        "| 合成首钢 | SYNTH ONE | 外援一 | 合成国 | PG | 1 |",
+        "|  | SYNTH TWO | 外援二 | 合成国 | SG |",
+    ])
+    with pytest.raises(ValueError, match="FOREIGN_ROW_MALFORMED_CONTINUATION"):
+        _parse_foreign_registration_rows({"body": five_col_empty_first})
+
+
+def test_r3_3_archive_compactor_live_release_status_file_id_mismatch_fail_closed() -> None:
+    drive = _FakeDrive()
+    drive.add_folder("hist_root", "90_archive_历史归档")
+    drive.add_folder("current_root", "00_current")
+    rs_fid = drive.add_file(
+        "live_rs_id",
+        "release_status.json",
+        "current_root",
+        json.dumps(
+            {"release_id": "v2.3.1-1", "previous_release_id": "v2.3.0-1", "status": "COMPLETE"}
+        ).encode("utf-8"),
+        "application/json",
+    )
+    drive.add_file("loose_1", "before_old.json", "hist_root", b"{}", "application/json")
+
+    # Caller supplies registered-but-stale release_status (v2.2.1-1) while live Drive says v2.3.1-1 -> fail closed
+    with pytest.raises(ArchiveCompactionError, match="ARCHIVE_COMPACT_RELEASE_STATE_MISMATCH"):
+        compact_drive_archive(
+            drive,
+            history_folder_id="hist_root",
+            release_status={"release_id": "v2.2.1-1", "status": "COMPLETE"},
+            release_status_file_id=rs_fid,
+            execute=True,
+        )
+    assert drive.upload_calls == 0
+    assert drive.trashed_ids == []
+
+    # Matching live release_status_file_id alone succeeds cleanly and protects v2.3.1-1
+    res = compact_drive_archive(
+        drive,
+        history_folder_id="hist_root",
+        release_status_file_id=rs_fid,
+        execute=True,
+        tag="r3live",
+    )
+    assert res["mode"] == "execute"
+    assert drive.upload_calls == 1
+    assert "loose_1" in drive.trashed_ids
+    assert rs_fid not in drive.trashed_ids
+
+

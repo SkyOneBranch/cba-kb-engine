@@ -56,8 +56,10 @@ _RESERVED_LOCK_FIELDS = frozenset({
     "fencing_token",
     "owner_id",
     "status",
+    "created_at_utc",
     "acquired_at",
     "expires_at",
+    "expires_at_utc",
     "lease_ttl_seconds",
     "lock_mode",
 })
@@ -959,10 +961,9 @@ class R2CloudStateStore:
         lock_doc["person"] = str(person_key)
         lock_doc["season"] = str(season)
         lock_doc["status"] = "RUNNING"
-        created_str = lock_doc.get("created_at_utc") or now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        created_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         lock_doc["created_at_utc"] = created_str
-        created_dt = _parse_iso_utc(created_str) or now
-        lock_doc["expires_at_utc"] = (created_dt + timedelta(seconds=ttl)).strftime(
+        lock_doc["expires_at_utc"] = (now + timedelta(seconds=ttl)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
 

@@ -1354,7 +1354,7 @@ def _parse_foreign_registration_rows(bundle: Dict[str, Any]) -> list[Dict[str, s
             current_club = ""
             continue
 
-        if len(cells) >= 6:
+        if len(cells) == 6:
             if cells[5] == "" and _is_latin_player_name(first):
                 if not any(cells[1:5]):
                     continue

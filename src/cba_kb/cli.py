@@ -450,6 +450,7 @@ def main():
     q.add_argument('--keep-release-dirs',default=None)
     q.add_argument('--tag',default='v231')
     q.add_argument('--release-status-file',type=Path,default=None)
+    q.add_argument('--release-status-file-id',default=None)
     q.add_argument('--manifest-file',type=Path,default=None)
     mode_grp=q.add_mutually_exclusive_group()
     mode_grp.add_argument('--plan-only',action='store_true',default=False,help='Read-only compaction plan (default; 0 remote writes)')
@@ -2052,6 +2053,7 @@ def main():
                 execute=bool(a.execute),
                 tag=a.tag,
                 release_status=release_status,
+                release_status_file_id=a.release_status_file_id,
                 manifest_rows=manifest_rows,
                 production_policy=production_policy,
             )
