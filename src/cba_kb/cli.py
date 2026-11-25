@@ -445,6 +445,7 @@ def main():
     q.add_argument('--history-folder-id',default=None)
     q.add_argument('--active-asset-ids',default=None)
     q.add_argument('--protected-folder-ids',default=None)
+    q.add_argument('--active-release-id',default=None)
     q.add_argument('--previous-release-id',default=None)
     q.add_argument('--keep-release-dirs',default=None)
     q.add_argument('--tag',default='v231')
@@ -2045,6 +2046,7 @@ def main():
                 history_folder_id=history_folder_id or '',
                 active_asset_ids=active_asset_ids,
                 protected_folder_ids=protected_folder_ids,
+                active_release_id=a.active_release_id,
                 previous_release_id=a.previous_release_id,
                 keep_release_dirs=keep_release_dirs,
                 execute=bool(a.execute),
@@ -2099,6 +2101,8 @@ def main():
                             content_bytes=str(card_res['markdown']).encode('utf-8'),
                             forbidden_folder_ids=forbidden_ids,
                             production_policy=production_policy,
+                            player_name=player,
+                            season=a.season,
                         )
                         entry['drive_sync'] = receipt
                         upserted_count += 1

@@ -16,10 +16,12 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import stat
 import tarfile
 import threading
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
+import uuid
 import xml.etree.ElementTree as ET
 
 from .common import atomic
@@ -52,6 +54,10 @@ class CloudStateIntegrityError(ValueError):
     """Raised fail-closed when an R2/S3 object fails SHA-256 verification."""
 
 
+class R2LockContentionError(RuntimeError):
+    """Raised fail-closed when 501 fallback lock verification detects contention or drift."""
+
+
 __all__ = [
     "CloudStateIntegrityError",
     "DEFAULT_INSTANCE_BUNDLE_KEY",
@@ -61,6 +67,7 @@ __all__ = [
     "DEFAULT_MAX_BUNDLE_MEMBERS",
     "R2Config",
     "R2CloudStateStore",
+    "R2LockContentionError",
     "sign_aws_sigv4_headers",
     "safe_key",
     "_safe_key",
@@ -287,6 +294,94 @@ def _normalize_prefix(prefix: str) -> str:
 
 def _parse_bool_env(raw: Optional[str]) -> bool:
     return str(raw or "").strip().lower() in ("1", "true", "yes")
+
+
+def _bundle_allowlisted_exact_names() -> frozenset[str]:
+    from .consumer_surface import (
+        CONSUMER_MASTER_FILENAME,
+        DOMESTIC_REG_DIFF_CSV_FILENAME,
+        FOREIGN_REGISTRATION_CSV_FILENAME,
+    )
+
+    return frozenset({
+        CONSUMER_MASTER_FILENAME,
+        "MASTER.csv",
+        FOREIGN_REGISTRATION_CSV_FILENAME,
+        DOMESTIC_REG_DIFF_CSV_FILENAME,
+        "identity_registry.json",
+        "operational_checkpoint.json",
+        "coverage_ledger.json",
+        "negative_receipts.jsonl",
+        "snowball_receipts.jsonl",
+        "on_demand_cards_manifest.json",
+        "curation_profile.yaml",
+    })
+
+
+def _atomic_write_nofollow(base: Path, rel_parts: Sequence[str], content: bytes) -> None:
+    """Create parent dirs and atomically write a file using dir_fd + O_NOFOLLOW."""
+    rel_display = "/".join(rel_parts)
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    nofollow_flag = getattr(os, "O_NOFOLLOW", 0)
+
+    try:
+        cur_fd = os.open(str(base), dir_flags)
+    except OSError as exc:
+        raise ValueError(f"R2_BUNDLE_SYMLINK_TARGET:{rel_display}") from exc
+
+    try:
+        for seg in rel_parts[:-1]:
+            try:
+                os.mkdir(seg, 0o755, dir_fd=cur_fd)
+            except FileExistsError:
+                pass
+            try:
+                next_fd = os.open(seg, dir_flags, dir_fd=cur_fd)
+            except OSError as exc:
+                raise ValueError(f"R2_BUNDLE_SYMLINK_TARGET:{rel_display}") from exc
+            os.close(cur_fd)
+            cur_fd = next_fd
+
+        fname = rel_parts[-1]
+        try:
+            st = os.lstat(fname, dir_fd=cur_fd)
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                raise ValueError(f"R2_BUNDLE_SYMLINK_TARGET:{rel_display}")
+        except FileNotFoundError:
+            pass
+
+        tmp_name = f".{fname}.{uuid.uuid4().hex[:12]}.tmp"
+        file_fd = os.open(
+            tmp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow_flag,
+            0o644,
+            dir_fd=cur_fd,
+        )
+        try:
+            view = memoryview(content)
+            written = 0
+            while written < len(view):
+                written += os.write(file_fd, view[written:])
+            os.fsync(file_fd)
+        except Exception:
+            os.close(file_fd)
+            try:
+                os.unlink(tmp_name, dir_fd=cur_fd)
+            except OSError:
+                pass
+            raise
+        os.close(file_fd)
+
+        try:
+            os.replace(tmp_name, fname, src_dir_fd=cur_fd, dst_dir_fd=cur_fd)
+        except Exception:
+            try:
+                os.unlink(tmp_name, dir_fd=cur_fd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(cur_fd)
 
 
 def _is_bundle_member_allowed(rel_posix: str, allowlisted_exact_names: frozenset[str]) -> bool:
@@ -667,6 +762,8 @@ class R2CloudStateStore:
         *,
         if_none_match: Optional[str] = None,
         if_match: Optional[str] = None,
+        now_utc: Optional[datetime] = None,
+        lock_ttl_seconds: float = DEFAULT_LOCK_TTL_SECONDS,
     ) -> int:
         payload = json.dumps(
             dict(lock_doc),
@@ -691,6 +788,34 @@ class R2CloudStateStore:
             and self.allow_s3_501_lock_fallback
             and (if_none_match is not None or if_match is not None)
         ):
+            # 1. Pre-check existing remote lock object before unconditional fallback PUT
+            cur_existing, _ = self._get_json_with_etag(lock_key)
+            if isinstance(cur_existing, dict):
+                cur_status = str(cur_existing.get("status") or "").strip().upper()
+                check_now = now_utc if now_utc is not None else datetime.now(timezone.utc)
+                if check_now.tzinfo is None:
+                    check_now = check_now.replace(tzinfo=timezone.utc)
+                else:
+                    check_now = check_now.astimezone(timezone.utc)
+                target_status = str(lock_doc.get("status") or "").strip().upper()
+                cur_owner = str(cur_existing.get("owner_id") or "").strip()
+                my_owner = str(lock_doc.get("owner_id") or "").strip()
+                if target_status == "RELEASED":
+                    if cur_owner and cur_owner != my_owner:
+                        raise R2LockContentionError(
+                            f"R2_LOCK_CONTENTION_501_FALLBACK:{lock_key}:owner_changed"
+                        )
+                else:
+                    if (
+                        cur_status in _ACTIVE_LOCK_STATUSES
+                        and not _is_lock_expired(cur_existing, check_now, lock_ttl_seconds)
+                        and cur_owner != my_owner
+                    ):
+                        raise R2LockContentionError(
+                            f"R2_LOCK_CONTENTION_501_FALLBACK:{lock_key}:active_other_owner"
+                        )
+
+            # 2. Unconditional fallback PUT with x-amz-meta-sha256 + fencing_token
             unconditional_headers = {
                 "Content-Type": "application/json; charset=utf-8",
                 "x-amz-meta-sha256": sha256_hex,
@@ -698,6 +823,33 @@ class R2CloudStateStore:
             status, _, _ = self._request(
                 "PUT", url, headers=unconditional_headers, data=payload
             )
+            if status not in (200, 201, 204):
+                return status
+
+            # 3. Mandatory post-PUT read-back verification (SHA-256 + owner_id + fencing_token)
+            try:
+                rb_raw, _ = self._get_bytes_with_etag(lock_key, expected_sha256=sha256_hex)
+            except CloudStateIntegrityError as exc:
+                raise R2LockContentionError(
+                    f"R2_LOCK_READBACK_MISMATCH:{lock_key}"
+                ) from exc
+            if rb_raw is None or hashlib.sha256(rb_raw).hexdigest() != sha256_hex:
+                raise R2LockContentionError(f"R2_LOCK_READBACK_MISMATCH:{lock_key}")
+            try:
+                rb_doc = json.loads(rb_raw.decode("utf-8"))
+            except Exception as exc:
+                raise R2LockContentionError(
+                    f"R2_LOCK_READBACK_INVALID_JSON:{lock_key}"
+                ) from exc
+            if (
+                not isinstance(rb_doc, dict)
+                or rb_doc.get("owner_id") != lock_doc.get("owner_id")
+                or rb_doc.get("fencing_token") != lock_doc.get("fencing_token")
+                or rb_doc.get("status") != lock_doc.get("status")
+            ):
+                raise R2LockContentionError(
+                    f"R2_LOCK_READBACK_CONTENTION:{lock_key}"
+                )
         return status
 
     def acquire_active_job_lock(
@@ -724,6 +876,7 @@ class R2CloudStateStore:
         lock_doc: Dict[str, Any] = dict(extra) if isinstance(extra, Mapping) else {}
         lock_doc["job_id"] = str(job_id)
         lock_doc["owner_id"] = str(owner_id)
+        lock_doc["fencing_token"] = str(lock_doc.get("fencing_token") or uuid.uuid4().hex)
         lock_doc["person"] = str(person_key)
         lock_doc["season"] = str(season)
         lock_doc["status"] = str(lock_doc.get("status") or "RUNNING")
@@ -748,7 +901,11 @@ class R2CloudStateStore:
                 if not existing_etag:
                     raise RuntimeError(f"R2_LOCK_ETAG_MISSING:{lock_key}")
                 status = self._put_lock_conditional(
-                    lock_key, lock_doc, if_match=existing_etag
+                    lock_key,
+                    lock_doc,
+                    if_match=existing_etag,
+                    now_utc=now,
+                    lock_ttl_seconds=ttl,
                 )
                 if status in (200, 201, 204):
                     return True, lock_doc
@@ -758,7 +915,11 @@ class R2CloudStateStore:
                 raise RuntimeError(f"R2_LOCK_PUT_FAILED:{status}:{lock_key}")
 
             status = self._put_lock_conditional(
-                lock_key, lock_doc, if_none_match="*"
+                lock_key,
+                lock_doc,
+                if_none_match="*",
+                now_utc=now,
+                lock_ttl_seconds=ttl,
             )
             if status in (200, 201, 204):
                 return True, lock_doc
@@ -774,7 +935,11 @@ class R2CloudStateStore:
                     if not winner_etag:
                         raise RuntimeError(f"R2_LOCK_ETAG_MISSING:{lock_key}")
                     takeover_status = self._put_lock_conditional(
-                        lock_key, lock_doc, if_match=winner_etag
+                        lock_key,
+                        lock_doc,
+                        if_match=winner_etag,
+                        now_utc=now,
+                        lock_ttl_seconds=ttl,
                     )
                     if takeover_status in (200, 201, 204):
                         return True, lock_doc
@@ -924,11 +1089,6 @@ class R2CloudStateStore:
         max_compressed_bytes: int = DEFAULT_MAX_BUNDLE_COMPRESSED_BYTES,
     ) -> Dict[str, Any]:
         """Pack allowlisted substrate files into a deterministic .tar.gz and upload in 1 PUT."""
-        from .consumer_surface import (
-            CONSUMER_MASTER_FILENAME,
-            DOMESTIC_REG_DIFF_CSV_FILENAME,
-            FOREIGN_REGISTRATION_CSV_FILENAME,
-        )
         from .current_state import clean
 
         base = Path(local_dir).resolve()
@@ -938,19 +1098,7 @@ class R2CloudStateStore:
         if max_comp <= 0:
             raise ValueError("R2_BUNDLE_MAX_COMPRESSED_BYTES_INVALID")
 
-        allowlisted_exact_names = frozenset({
-            CONSUMER_MASTER_FILENAME,
-            "MASTER.csv",
-            FOREIGN_REGISTRATION_CSV_FILENAME,
-            DOMESTIC_REG_DIFF_CSV_FILENAME,
-            "identity_registry.json",
-            "operational_checkpoint.json",
-            "coverage_ledger.json",
-            "negative_receipts.jsonl",
-            "snowball_receipts.jsonl",
-            "on_demand_cards_manifest.json",
-            "curation_profile.yaml",
-        })
+        allowlisted_exact_names = _bundle_allowlisted_exact_names()
 
         all_files = sorted(
             (p.relative_to(base).as_posix(), p)
@@ -1018,16 +1166,21 @@ class R2CloudStateStore:
         if len(raw) > max_comp:
             raise ValueError("R2_BUNDLE_COMPRESSED_SIZE_EXCEEDED")
 
-        base = Path(local_dir).resolve()
-        staged: List[Tuple[str, Path, bytes]] = []
+        raw_local_dir = Path(local_dir)
+        if raw_local_dir.is_symlink():
+            raise ValueError(f"R2_BUNDLE_SYMLINK_TARGET:{local_dir}")
+        base = raw_local_dir.resolve()
+        allowlisted_exact_names = _bundle_allowlisted_exact_names()
+        staged: List[Tuple[str, List[str], bytes]] = []
         total_extracted = 0
+        member_count = 0
 
         with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tf:
-            members = tf.getmembers()
-            if len(members) > max_mem:
-                raise ValueError("R2_BUNDLE_MAX_MEMBERS_EXCEEDED")
+            for member in tf:
+                member_count += 1
+                if member_count > max_mem:
+                    raise ValueError("R2_BUNDLE_MAX_MEMBERS_EXCEEDED")
 
-            for member in members:
                 raw_name = member.name
                 if (
                     not isinstance(raw_name, str)
@@ -1051,9 +1204,19 @@ class R2CloudStateStore:
                 if not clean_parts:
                     raise ValueError(f"R2_BUNDLE_PATH_TRAVERSAL:{raw_name}")
                 rel_norm = PurePosixPath(*clean_parts).as_posix()
+                if not _is_bundle_member_allowed(rel_norm, allowlisted_exact_names):
+                    raise ValueError(f"R2_BUNDLE_DISALLOWED_MEMBER:{rel_norm}")
+
                 target = (base / rel_norm).resolve()
                 if target == base or not target.is_relative_to(base):
                     raise ValueError(f"R2_BUNDLE_PATH_TRAVERSAL:{raw_name}")
+
+                # Pre-write lstat check: reject any pre-existing symlink along parent dirs or target
+                walk_p = base
+                for seg in clean_parts:
+                    walk_p = walk_p / seg
+                    if walk_p.is_symlink():
+                        raise ValueError(f"R2_BUNDLE_SYMLINK_TARGET:{rel_norm}")
 
                 if member.size < 0 or (total_extracted + member.size) > max_ext:
                     raise ValueError("R2_BUNDLE_EXTRACTED_SIZE_EXCEEDED")
@@ -1064,11 +1227,11 @@ class R2CloudStateStore:
                 if len(content) > remaining:
                     raise ValueError("R2_BUNDLE_EXTRACTED_SIZE_EXCEEDED")
                 total_extracted += len(content)
-                staged.append((rel_norm, target, content))
+                staged.append((rel_norm, clean_parts, content))
 
         base.mkdir(parents=True, exist_ok=True)
-        for _, target, content in staged:
-            atomic(target, content)
+        for _, clean_parts, content in staged:
+            _atomic_write_nofollow(base, clean_parts, content)
 
         return {
             "key": key,

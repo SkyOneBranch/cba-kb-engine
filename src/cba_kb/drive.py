@@ -658,35 +658,96 @@ def _collect_protected_folder_ids(
     return protected
 
 
-_LEGACY_UNASSIGNED_CARD_RE = re.compile(
-    r'^研究卡_(.+)_unassigned_([^_]+)_CURRENT\.md$',
-    flags=re.IGNORECASE,
-)
+_SNOWBALL_CARD_PREFIX = '研究卡_'
+_SNOWBALL_CARD_SUFFIX = '_CURRENT.md'
 
 
-def _match_legacy_unassigned_card(new_filename: str, existing_name: str) -> bool:
-    """Return True iff existing_name is the legacy _unassigned_ twin of new_filename."""
+def _parse_snowball_card_filename(filename: str) -> Optional[tuple[str, str, str]]:
+    """Parse ``研究卡_<player_name>_<middle>_<season>_CURRENT.md`` structurally.
+
+    Uses ``rsplit('_', 2)`` so underscores inside ``<player_name>`` are preserved
+    while ``<middle>`` (club/id/``unassigned``) and ``<season>`` are extracted
+    exact-segment-wise without prefix collisions.
+    """
+    if not (
+        isinstance(filename, str)
+        and filename.startswith(_SNOWBALL_CARD_PREFIX)
+        and filename.endswith(_SNOWBALL_CARD_SUFFIX)
+    ):
+        return None
+    stem = filename[len(_SNOWBALL_CARD_PREFIX):-len(_SNOWBALL_CARD_SUFFIX)]
+    parts = stem.rsplit('_', 2)
+    if len(parts) != 3:
+        return None
+    player_part, middle_part, season_part = parts
+    if not player_part or not middle_part or not season_part:
+        return None
+    return player_part, middle_part, season_part
+
+
+def _match_legacy_unassigned_card(
+    new_filename: str,
+    existing_name: str,
+    *,
+    player_name: Optional[str] = None,
+    season: Optional[str] = None,
+) -> bool:
+    """Return True iff ``existing_name`` is the exact legacy ``_unassigned_`` twin of ``new_filename``."""
     if existing_name == new_filename:
         return False
-    if not (new_filename.startswith('研究卡_') and new_filename.endswith('_CURRENT.md')):
+
+    existing_parsed = _parse_snowball_card_filename(existing_name)
+    if existing_parsed is None:
         return False
-    stem = new_filename[len('研究卡_'):-len('_CURRENT.md')]
-    if '_' not in stem:
+    legacy_player, legacy_middle, legacy_season = existing_parsed
+    if legacy_middle.lower() != 'unassigned':
         return False
-    new_rest, new_season = stem.rsplit('_', 1)
-    if not new_rest or not new_season or new_rest.lower().endswith('_unassigned'):
-        return False
-    m = _LEGACY_UNASSIGNED_CARD_RE.match(existing_name)
-    if not m:
-        return False
-    legacy_player, legacy_season = m.group(1), m.group(2)
-    if legacy_season != new_season:
-        return False
-    prefix = f'{legacy_player}_'
-    if not new_rest.startswith(prefix):
-        return False
-    middle = new_rest[len(prefix):]
-    return bool(middle) and middle.lower() != 'unassigned'
+
+    explicit_player = (
+        '_'.join(player_name.strip().split())
+        if isinstance(player_name, str) and player_name.strip()
+        else None
+    )
+    explicit_season = (
+        '_'.join(season.strip().split())
+        if isinstance(season, str) and season.strip()
+        else None
+    )
+
+    if explicit_player is not None and explicit_season is not None:
+        expected_prefix = f'{_SNOWBALL_CARD_PREFIX}{explicit_player}_'
+        expected_suffix = f'_{explicit_season}{_SNOWBALL_CARD_SUFFIX}'
+        if not (
+            new_filename.startswith(expected_prefix)
+            and new_filename.endswith(expected_suffix)
+            and len(new_filename) > len(expected_prefix) + len(expected_suffix)
+        ):
+            return False
+        new_middle = new_filename[len(expected_prefix):-len(expected_suffix)]
+        if not new_middle or new_middle.lower() == 'unassigned':
+            return False
+        target_player = explicit_player
+        target_season = explicit_season
+    else:
+        new_parsed = _parse_snowball_card_filename(new_filename)
+        if new_parsed is None:
+            return False
+        new_player, new_middle, new_season = new_parsed
+        if new_middle.lower() == 'unassigned':
+            return False
+        if explicit_player is not None and new_player != explicit_player:
+            return False
+        if explicit_season is not None and new_season != explicit_season:
+            return False
+        target_player = new_player
+        target_season = new_season
+
+    return (
+        legacy_player == target_player
+        and legacy_season == target_season
+        and existing_name.lower()
+        == f'{_SNOWBALL_CARD_PREFIX}{target_player}_unassigned_{target_season}{_SNOWBALL_CARD_SUFFIX}'.lower()
+    )
 
 
 def _trash_drive_file(drive: Any, file_id: str) -> None:
@@ -714,6 +775,8 @@ def upsert_snowball_card_to_drive(
     forbidden_folder_ids: Sequence[str] = (),
     production_policy: Optional[Mapping[str, Any]] = None,
     mime_type: str = 'text/markdown',
+    player_name: Optional[str] = None,
+    season: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Topology-safe single-card Drive upserter for isolated snowball folder."""
     _assert_main_thread_writer(drive, 'upsert_snowball_card_to_drive')
@@ -781,7 +844,12 @@ def upsert_snowball_card_to_drive(
         item_id = str(item.get('id') or '').strip()
         if not item_id or item_id == written_id:
             continue
-        if _match_legacy_unassigned_card(clean_filename, item_name):
+        if _match_legacy_unassigned_card(
+            clean_filename,
+            item_name,
+            player_name=player_name,
+            season=season,
+        ):
             _trash_drive_file(drive, item_id)
             retired_legacy_files.append(item_name)
 

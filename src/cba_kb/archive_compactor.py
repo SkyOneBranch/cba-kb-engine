@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import gzip
 import io
+import re
 import tarfile
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -21,7 +22,42 @@ from .common import canonical_json_bytes, digest
 from .drive import FIELDS, _assert_main_thread_writer
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
-DEFAULT_PROTECTED_BUNDLE_RELEASES = ("v2.2.1-1", "v2.2.2-1", "v2.3.0-1")
+_FALLBACK_PROTECTED_BUNDLE_RELEASES = ("v2.2.1-1", "v2.2.2-1", "v2.3.0-1", "v2.3.1-1")
+_LEGACY_NON_BUNDLE_RELEASE_RE = re.compile(
+    r"^v(?:1\.\d+(?:\.\d+)*(?:-\d+)?|2\.[01]\.\d+(?:-\d+)?|2\.2\.0(?:-\d+)?)$"
+)
+
+
+def _load_release_specs() -> Mapping[str, Any]:
+    try:
+        from .orchestration.release.prepare_v215 import V215_RELEASE_SPECS
+    except Exception:
+        return {}
+    return V215_RELEASE_SPECS if isinstance(V215_RELEASE_SPECS, Mapping) else {}
+
+
+def _default_protected_bundle_releases() -> Tuple[str, ...]:
+    protected: Set[str] = set(_FALLBACK_PROTECTED_BUNDLE_RELEASES)
+    for rel_id, spec in _load_release_specs().items():
+        if isinstance(spec, Mapping) and spec.get("archive_format") == "bundle_v1":
+            rel_str = str(rel_id).strip()
+            if rel_str:
+                protected.add(rel_str)
+    return tuple(sorted(protected))
+
+
+def _is_known_legacy_non_bundle_release_dir(name: str) -> bool:
+    clean = name.strip()
+    if not clean:
+        return False
+    specs = _load_release_specs()
+    if clean in specs:
+        spec = specs[clean]
+        return not (isinstance(spec, Mapping) and spec.get("archive_format") == "bundle_v1")
+    return bool(_LEGACY_NON_BUNDLE_RELEASE_RE.match(clean))
+
+
+DEFAULT_PROTECTED_BUNDLE_RELEASES: Tuple[str, ...] = _default_protected_bundle_releases()
 
 _COMPRESSED_SUFFIXES = (".tar.gz", ".tgz", ".zip")
 _PROTECTED_POLICY_ZONES = ("current", "evidence", "staging", "snowball", "root", "root_folder_id")
@@ -138,21 +174,42 @@ def _collect_protected_ids(
 def _collect_protected_release_names(
     *,
     keep_release_dirs: Sequence[str],
-    previous_release_id: Optional[str],
-    release_status: Optional[Mapping[str, Any]],
+    active_release_id: Optional[str] = None,
+    previous_release_id: Optional[str] = None,
+    release_status: Optional[Mapping[str, Any]] = None,
 ) -> Set[str]:
     names: Set[str] = set()
     for rel in keep_release_dirs or ():
         if isinstance(rel, str) and rel.strip():
             names.add(rel.strip())
+    if isinstance(active_release_id, str) and active_release_id.strip():
+        names.add(active_release_id.strip())
     if isinstance(previous_release_id, str) and previous_release_id.strip():
         names.add(previous_release_id.strip())
     if isinstance(release_status, Mapping):
-        for key in ("previous_release_id", "release_id"):
+        for key in ("previous_release_id", "release_id", "active_release_id", "current_release_id"):
             val = release_status.get(key)
             if isinstance(val, str) and val.strip():
                 names.add(val.strip())
     return names
+
+
+def _has_authoritative_release_state(
+    *,
+    active_release_id: Optional[str] = None,
+    previous_release_id: Optional[str] = None,
+    release_status: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    if isinstance(active_release_id, str) and active_release_id.strip():
+        return True
+    if isinstance(previous_release_id, str) and previous_release_id.strip():
+        return True
+    if isinstance(release_status, Mapping):
+        for key in ("release_id", "active_release_id", "current_release_id", "previous_release_id"):
+            val = release_status.get(key)
+            if isinstance(val, str) and val.strip():
+                return True
+    return False
 
 
 def _is_compressed_archive_name(name: str) -> bool:
@@ -201,6 +258,7 @@ def compact_drive_archive(
     history_folder_id: str,
     active_asset_ids: Sequence[str] = (),
     protected_folder_ids: Sequence[str] = (),
+    active_release_id: Optional[str] = None,
     previous_release_id: Optional[str] = None,
     keep_release_dirs: Sequence[str] = DEFAULT_PROTECTED_BUNDLE_RELEASES,
     execute: bool = False,
@@ -233,18 +291,26 @@ def compact_drive_archive(
 
     protected_release_names = _collect_protected_release_names(
         keep_release_dirs=keep_release_dirs,
+        active_release_id=active_release_id,
         previous_release_id=previous_release_id,
         release_status=release_status,
     )
 
     candidate_files: List[Dict[str, Any]] = []
     candidate_dirs: List[Dict[str, Any]] = []
+    top_level_candidate_dirs: List[Dict[str, Any]] = []
     top_level_trash_targets: List[str] = []
     skipped_compressed: List[str] = []
     skipped_protected_dirs: List[str] = []
     visited_dirs: Set[str] = {root_history_id}
 
-    def _walk_legacy_dir(folder_id: str, prefix: str) -> None:
+    def _walk_legacy_dir(folder_id: str, prefix: str) -> Tuple[bool, List[str]]:
+        """Recursively scan a legacy directory, skipping nested compressed archives.
+
+        Returns ``(had_skipped_compressed, packed_file_ids)``.
+        """
+        had_skipped = False
+        packed_file_ids: List[str] = []
         children = sorted(
             (item for item in drive.list(folder_id) if isinstance(item, Mapping)),
             key=lambda m: (str(m.get("name") or ""), str(m.get("id") or "")),
@@ -263,8 +329,15 @@ def compact_drive_archive(
                     continue
                 visited_dirs.add(cid)
                 candidate_dirs.append({"id": cid, "name": cname, "logical_path": rel_path})
-                _walk_legacy_dir(cid, rel_path)
+                sub_skipped, sub_packed = _walk_legacy_dir(cid, rel_path)
+                if sub_skipped:
+                    had_skipped = True
+                packed_file_ids.extend(sub_packed)
             else:
+                if _is_compressed_archive_name(cname):
+                    skipped_compressed.append(rel_path)
+                    had_skipped = True
+                    continue
                 candidate_files.append(
                     {
                         "id": cid,
@@ -275,6 +348,8 @@ def compact_drive_archive(
                         "sha256Checksum": child.get("sha256Checksum"),
                     }
                 )
+                packed_file_ids.append(cid)
+        return had_skipped, packed_file_ids
 
     top_items = sorted(
         (item for item in drive.list(root_history_id) if isinstance(item, Mapping)),
@@ -293,9 +368,16 @@ def compact_drive_archive(
                 skipped_protected_dirs.append(name)
                 continue
             visited_dirs.add(fid)
-            candidate_dirs.append({"id": fid, "name": name, "logical_path": name})
-            top_level_trash_targets.append(fid)
-            _walk_legacy_dir(fid, name)
+            dir_entry = {"id": fid, "name": name, "logical_path": name}
+            candidate_dirs.append(dir_entry)
+            top_level_candidate_dirs.append(dir_entry)
+            dir_had_skipped, dir_packed_file_ids = _walk_legacy_dir(fid, name)
+            if dir_had_skipped:
+                # Never trash a folder containing skipped nested compressed archives;
+                # only trash the non-compressed files that were actually packed.
+                top_level_trash_targets.extend(dir_packed_file_ids)
+            else:
+                top_level_trash_targets.append(fid)
         else:
             if _is_compressed_archive_name(name):
                 skipped_compressed.append(name)
@@ -323,6 +405,31 @@ def compact_drive_archive(
             f"ARCHIVE_COMPACT_ACTIVE_OVERLAP:count={len(overlap)}:ids={','.join(overlap[:5])}"
         )
 
+    # Lock 1b: Fail-Closed Release-State Anchor Check on execute=True (0 writes)
+    if execute and not _has_authoritative_release_state(
+        active_release_id=active_release_id,
+        previous_release_id=previous_release_id,
+        release_status=release_status,
+    ):
+        missing_default_protected = sorted(
+            set(DEFAULT_PROTECTED_BUNDLE_RELEASES) - protected_release_names
+        )
+        if missing_default_protected:
+            raise ArchiveCompactionError(
+                "ARCHIVE_COMPACT_MISSING_RELEASE_STATE:"
+                f"unprotected_bundle_releases={','.join(missing_default_protected[:5])}"
+            )
+        unverified_dirs = sorted(
+            d["name"]
+            for d in top_level_candidate_dirs
+            if not _is_known_legacy_non_bundle_release_dir(d["name"])
+        )
+        if unverified_dirs:
+            raise ArchiveCompactionError(
+                "ARCHIVE_COMPACT_MISSING_RELEASE_STATE:"
+                f"unverified_dirs={','.join(unverified_dirs[:5])}"
+            )
+
     plan_result: Dict[str, Any] = {
         "mode": "execute" if execute else "plan_only",
         "tag": clean_tag,
@@ -340,7 +447,7 @@ def compact_drive_archive(
     if not execute:
         return plan_result
 
-    if not candidate_files and not candidate_dirs:
+    if not candidate_files and not top_level_trash_targets:
         return plan_result
 
     # Lock 2: Deterministic Pack + Internal archive_index.json + Remote sha256Checksum Verify

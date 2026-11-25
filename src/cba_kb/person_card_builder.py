@@ -25,6 +25,7 @@ from .consumer_surface import (
     CONSUMER_MASTER_FILENAME,
     FOREIGN_REGISTRATION_CSV_FILENAME,
     evaluate_league_coverage,
+    find_boundary_safe_name_spans,
     scrub_raw_drive_ids_for_consumer,
 )
 from .game_stats import summarize_recent_games
@@ -989,8 +990,43 @@ def _match_document_bundles(
             hit = bool(mp & tokens)
             if not hit:
                 title_norm = _norm_key(b.get("title"))
-                if any(len(tok) >= 2 and tok in title_norm for tok in tokens):
-                    hit = True
+                candidate_names: List[str] = []
+                if roster_candidates:
+                    candidate_names = sorted(
+                        {
+                            _norm_key(
+                                c.get("player_name")
+                                or c.get("canonical_name")
+                                or c.get("player")
+                                or c.get("player_zh")
+                            )
+                            for c in roster_candidates
+                            if isinstance(c, dict)
+                        }
+                        - tokens
+                        - {""},
+                        key=lambda n: (-len(n), n),
+                    )
+                for tok in sorted(tokens, key=lambda t: (-len(t), t)):
+                    if len(tok) < 2:
+                        continue
+                    occupied_title_spans: List[tuple[int, int]] = []
+                    for lname in candidate_names:
+                        if len(lname) > len(tok):
+                            occupied_title_spans.extend(
+                                find_boundary_safe_name_spans(
+                                    title_norm,
+                                    lname,
+                                    occupied_spans=occupied_title_spans,
+                                )
+                            )
+                    if find_boundary_safe_name_spans(
+                        title_norm,
+                        tok,
+                        occupied_spans=occupied_title_spans,
+                    ):
+                        hit = True
+                        break
 
         if hit:
             if doc_id:
