@@ -16,12 +16,12 @@
 const DEFAULT_SEASON = "2026-2027";
 const DEFAULT_FRESHNESS_TTL_HOURS = 24;
 const DEFAULT_STALE_AFTER_HOURS = 48;
-const DEFAULT_LOCK_TTL_SECONDS = 300;
+export const DEFAULT_LOCK_TTL_SECONDS = 900;
 const WAIT_TIMEOUT_MS = 28000;
 const POLL_INTERVAL_MS = 2000;
 const AUTH_SCHEME = "bearer";
 const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
-const UNICODE_TRIM_RE = /^[\s\u001c-\u001f\u0085]+|[\s\u001c-\u001f\u0085]+$/g;
+const UNICODE_TRIM_RE = /^[\s\u001c-\u001f\u0085\ufeff]+|[\s\u001c-\u001f\u0085\ufeff]+$/g;
 const ACTIVE_LOCK_STATUSES = new Set(["RUNNING", "PENDING", "ACQUIRING_IN_CLOUD"]);
 const VALID_COVERAGE_STATUSES = new Set(["COMPLETE", "PARTIAL", "STALE", "UNKNOWN"]);
 const LEAGUE_COVERAGE_DOMAINS = [
@@ -233,20 +233,22 @@ export async function acquireLockAtomic(
     const status = String(exDoc.status || "").trim().toUpperCase();
     const expMs = exDoc.expires_at_utc ? Date.parse(exDoc.expires_at_utc) : NaN;
     const isExpired = Number.isFinite(expMs) && nowMs >= expMs;
-    if (ACTIVE_LOCK_STATUSES.has(status) && !isExpired && exDoc.job_id) {
+    const isReleased = status === "RELEASED";
+    if (!isReleased && ACTIVE_LOCK_STATUSES.has(status) && !isExpired && exDoc.job_id) {
       return { acquired: false, jobDoc: exDoc };
     }
 
-    // Expired or non-active lock: atomic takeover via etagMatches
+    // Fail-closed if ETag is missing on existing lock (cannot perform CAS takeover safely)
+    if (!existing.etag) {
+      return { acquired: false, jobDoc: exDoc };
+    }
+
+    // Released, expired, or non-active lock: atomic takeover via etagMatches
     const takeoverOpts = {
+      onlyIf: { etagMatches: existing.etag },
       httpMetadata: { contentType: "application/json; charset=utf-8" },
       customMetadata: { sha256: lockSha },
     };
-    if (existing.etag) {
-      takeoverOpts.onlyIf = { etagMatches: existing.etag };
-    } else {
-      takeoverOpts.onlyIf = { etagDoesNotMatch: "*" };
-    }
     const takeoverRes = await bucket.put(lockKey, encoded, takeoverOpts);
     if (takeoverRes !== null && takeoverRes !== undefined) {
       return { acquired: true, jobDoc: lockDoc };

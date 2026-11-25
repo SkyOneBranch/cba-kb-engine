@@ -94,11 +94,9 @@ class _AtomicFakeR2Transport:
                 return 200, resp_hdrs, payload
 
             if method == "DELETE":
-                if_match = lower_headers.get("if-match")
-                if if_match is not None:
-                    cur = self.objects.get(key)
-                    if cur is None or cur[2].strip('"') != if_match.strip('"'):
-                        return 412, {}, b"PreconditionFailed"
+                # Real Cloudflare R2 does NOT support If-Match on DeleteObject; fail loudly if used.
+                if "if-match" in lower_headers:
+                    return 501, {}, b"NotImplemented:R2DeleteIfMatchUnsupported"
                 self.objects.pop(key, None)
                 return 204, {}, b""
 
@@ -388,9 +386,21 @@ Path(out_path).write_text(json.dumps({"result": res, "backend_calls": len(calls)
         loser = r0["result"] if r0["backend_calls"] == 0 else r1["result"]
         assert loser.get("deduplicated") is True
 
-        # Part B: Stale/crashed lease expiry recovery + conditional If-Match release
+        # Part B: Default 900s lease TTL, stale/crashed lease recovery, conditional PUT RELEASED, missing ETag fail-closed
         store = R2CloudStateStore(R2Config(base_url, "cba-kb-private", "SYN_K", "SYN_S"))
         t0 = datetime(2026, 11, 24, 13, 0, 0, tzinfo=timezone.utc)
+        ok_def, lock_def = store.acquire_active_job_lock(
+            "2026-2027",
+            "默认租约球员",
+            job_id="job_def_ttl",
+            owner_id="owner_def_ttl",
+            now_utc=t0,
+        )
+        assert ok_def is True
+        dt_created = datetime.fromisoformat(lock_def["created_at_utc"].replace("Z", "+00:00"))
+        dt_expires = datetime.fromisoformat(lock_def["expires_at_utc"].replace("Z", "+00:00"))
+        assert (dt_expires - dt_created).total_seconds() == 900.0
+
         ok1, lock1 = store.acquire_active_job_lock(
             "2026-2027",
             "租约恢复球员",
@@ -433,7 +443,7 @@ Path(out_path).write_text(json.dumps({"result": res, "backend_calls": len(calls)
             )
             is False
         )
-        # New owner releases cleanly
+        # New owner releases cleanly via conditional PUT (status="RELEASED", never DELETE If-Match)
         assert (
             store.release_active_job_lock(
                 "2026-2027",
@@ -443,6 +453,34 @@ Path(out_path).write_text(json.dumps({"result": res, "backend_calls": len(calls)
             )
             is True
         )
+        lock_key = store._lock_key("租约恢复球员", "2026-2027")
+        released_doc = store.get_json(lock_key)
+        assert released_doc is not None and released_doc.get("status") == "RELEASED"
+        assert store.find_active_job_for_person("租约恢复球员", "2026-2027") is None
+
+        # Subsequent acquisition takes over RELEASED lock cleanly via conditional PUT If-Match
+        ok_takeover, lock3 = store.acquire_active_job_lock(
+            "2026-2027",
+            "租约恢复球员",
+            job_id="job_after_release_3",
+            owner_id="owner_after_release_3",
+            now_utc=t0 + timedelta(seconds=130),
+        )
+        assert ok_takeover is True and lock3["job_id"] == "job_after_release_3"
+
+        # Missing ETag on GET must fail closed on release_active_job_lock (never unconditionally delete)
+        raw_bytes, raw_meta, _ = transport.objects[lock_key]
+        transport.objects[lock_key] = (raw_bytes, raw_meta, "")
+        assert (
+            store.release_active_job_lock(
+                "2026-2027",
+                "租约恢复球员",
+                owner_id="owner_after_release_3",
+                job_id="job_after_release_3",
+            )
+            is False
+        )
+        assert lock_key in transport.objects
     finally:
         server.shutdown()
         server.server_close()
@@ -507,6 +545,12 @@ const { pathToFileURL } = require('url');
   if (dispatchCount !== 1) throw new Error('EXPECTED_1_DISPATCH_GOT_' + dispatchCount);
   if (j1.job_id !== j2.job_id) throw new Error('JOB_ID_MISMATCH:' + JSON.stringify({ j1, j2 }));
   if (!(j1.deduplicated || j2.deduplicated)) throw new Error('NO_DEDUP_FLAG');
+  // Verify Worker default lock lease TTL is 900s (> 10min Runner timeout)
+  const lockEntry = Array.from(bucketMap.entries()).find(([k]) => k.startsWith('locks/'));
+  if (!lockEntry) throw new Error('MISSING_WORKER_LOCK');
+  const lockJson = await lockEntry[1].json();
+  const ttlSec = Math.round((Date.parse(lockJson.expires_at_utc) - Date.parse(lockJson.created_at_utc)) / 1000);
+  if (ttlSec !== 900) throw new Error('EXPECTED_900S_WORKER_TTL_GOT_' + ttlSec);
   console.log('WORKER_CONDITIONAL_RACE_OK');
 })().catch((e) => { console.error(e); process.exit(1); });
 """
@@ -538,6 +582,8 @@ def test_worker_js_key_parity_unicode_embedded_card_tamper_and_five_domain_cover
     py_ascii_key = py_store._card_key("2026-2027", "SYN_P001")
     py_nel_key = py_store._card_key("2026-2027", "\u0085A\u0085")
     py_fs_key = py_store._card_key("2026-2027", "\u001cA\u001f")
+    py_bom_key = py_store._card_key("2026-2027", "\ufeffA\ufeff")
+    assert py_nel_key == py_fs_key == py_bom_key == "cards/2026-2027/a.json"
 
     node_bin = shutil.which("node")
     if node_bin is None:
@@ -545,6 +591,7 @@ def test_worker_js_key_parity_unicode_embedded_card_tamper_and_five_domain_cover
         assert "crypto.subtle.digest" in worker_src
         assert "R2_OBJECT_SHA256_MISMATCH" in worker_src
         assert "\\u0085" in worker_src
+        assert "\\ufeff" in worker_src.lower()
         return
 
     js_driver = r"""
@@ -554,7 +601,7 @@ const { pathToFileURL } = require('url');
 (async () => {
   const mod = await import(pathToFileURL(process.argv[1]).href);
   const worker = mod.default;
-  const [pyZhKey, pyAsciiKey, pyNelKey, pyFsKey] = process.argv.slice(2, 6);
+  const [pyZhKey, pyAsciiKey, pyNelKey, pyFsKey, pyBomKey] = process.argv.slice(2, 7);
 
   const secret = 'syn_worker_' + 'secret_v230';
   const authHeader = 'Bear' + 'er ' + secret;
@@ -592,13 +639,14 @@ const { pathToFileURL } = require('url');
     bucketMap.set(key, makeObj(payload, { sha256: sha256(payload) }));
   };
 
-  // 1. Key parity across Chinese, ASCII, U+0085 (NEL), and U+001C/U+001F
+  // 1. Key parity across Chinese, ASCII, U+0085 (NEL), U+001C/U+001F, and U+FEFF (BOM)
   putCard(pyZhKey, '测试球员甲');
   putCard(pyAsciiKey, 'SYN_P001');
   putCard(pyNelKey, '\u0085A\u0085');
   putCard(pyFsKey, '\u001cA\u001f');
+  putCard(pyBomKey, '\ufeffA\ufeff');
 
-  for (const person of ['测试球员甲', 'SYN_P001', '\u0085A\u0085', '\u001cA\u001f']) {
+  for (const person of ['测试球员甲', 'SYN_P001', '\u0085A\u0085', '\u001cA\u001f', '\ufeffA\ufeff']) {
     const resp = await worker.fetch(new Request('https://worker.example.invalid/v1/person', {
       method: 'POST',
       headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
@@ -609,6 +657,25 @@ const { pathToFileURL } = require('url');
       throw new Error('KEY_PARITY_FAILED_FOR_' + JSON.stringify(person) + ':' + JSON.stringify(body));
     }
   }
+
+  // 1b. Missing or malformed R2 customMetadata.sha256 MUST fail closed with 500 R2_OBJECT_SHA256_MISMATCH
+  const validCardJson = JSON.stringify({
+    player_name: '测试球员甲', season: '2026-2027', markdown: md, card_markdown: md,
+    card_sha256: mdSha, updated_at_utc: new Date().toISOString(),
+  });
+  for (const badMeta of [{}, { sha256: 'not-a-valid-64-hex' }]) {
+    bucketMap.set(pyZhKey, makeObj(validCardJson, badMeta));
+    const badMetaResp = await worker.fetch(new Request('https://worker.example.invalid/v1/person', {
+      method: 'POST',
+      headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ person: '测试球员甲', season: '2026-2027' }),
+    }), env);
+    const badMetaBody = await badMetaResp.json();
+    if (badMetaResp.status !== 500 || badMetaBody.error !== 'R2_OBJECT_SHA256_MISMATCH') {
+      throw new Error('BAD_META_NOT_REJECTED:' + badMetaResp.status + ':' + JSON.stringify(badMetaBody));
+    }
+  }
+  putCard(pyZhKey, '测试球员甲');
 
   // 2. Embedded tampered job.card_markdown in jobs/<id>.json MUST fail closed on GET /v1/jobs/<id>
   const tamperedJob = JSON.stringify({
@@ -676,7 +743,7 @@ const { pathToFileURL } = require('url');
 })().catch((e) => { console.error(e); process.exit(1); });
 """
     proc = subprocess.run(
-        [node_bin, "-e", js_driver, str(worker_path), py_card_key, py_ascii_key, py_nel_key, py_fs_key],
+        [node_bin, "-e", js_driver, str(worker_path), py_card_key, py_ascii_key, py_nel_key, py_fs_key, py_bom_key],
         capture_output=True,
         text=True,
         check=False,

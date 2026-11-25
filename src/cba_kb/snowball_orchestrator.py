@@ -39,6 +39,7 @@ from .person_card_builder import (
 )
 
 NEGATIVE_RECEIPT_SCHEMA = "cba-kb.negative-receipt.v1"
+DEFAULT_LOCK_TTL_SECONDS = 900.0
 _ACTIVE_LOCK_STATUSES = frozenset({"RUNNING", "PENDING", "ACQUIRING_IN_CLOUD"})
 
 
@@ -336,7 +337,7 @@ class SnowballOrchestrator:
         instance: Optional[Any] = None,
         default_negative_ttl_hours: float = 24.0,
         stale_after_hours: float = 48.0,
-        lock_ttl_seconds: float = 300.0,
+        lock_ttl_seconds: float = DEFAULT_LOCK_TTL_SECONDS,
         now_fn: Optional[Callable[[], datetime]] = None,
     ) -> None:
         self.state_store = state_store
@@ -460,7 +461,8 @@ class SnowballOrchestrator:
                 lock_status = str(active_lock.get("status") or "").upper()
                 lock_job_id = str(active_lock.get("job_id") or "").strip()
                 if (
-                    lock_status in _ACTIVE_LOCK_STATUSES
+                    lock_status != "RELEASED"
+                    and lock_status in _ACTIVE_LOCK_STATUSES
                     and lock_job_id
                     and not self._is_lock_expired(active_lock, now_utc=now_utc)
                 ):
@@ -769,7 +771,8 @@ class SnowballOrchestrator:
                 lock_status = str(active_lock.get("status") or "").upper()
                 lock_job_id = str(active_lock.get("job_id") or "").strip()
                 if (
-                    lock_status in _ACTIVE_LOCK_STATUSES
+                    lock_status != "RELEASED"
+                    and lock_status in _ACTIVE_LOCK_STATUSES
                     and lock_job_id
                     and not self._is_lock_expired(active_lock, now_utc=now)
                 ):
@@ -1087,6 +1090,7 @@ class SnowballOrchestrator:
 __all__ = [
     "AcquisitionBackend",
     "AsyncDispatchAcquisitionBackend",
+    "DEFAULT_LOCK_TTL_SECONDS",
     "LocalCliAcquisitionBackend",
     "NEGATIVE_RECEIPT_SCHEMA",
     "SnowballOrchestrator",

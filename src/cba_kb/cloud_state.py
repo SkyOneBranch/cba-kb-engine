@@ -22,9 +22,11 @@ import xml.etree.ElementTree as ET
 from .common import atomic
 
 _SAFE_ASCII_RE = re.compile(r"^[a-z0-9._-]+$")
+_UNICODE_TRIM_RE = re.compile(r"^[\s\u001c-\u001f\u0085\ufeff]+|[\s\u001c-\u001f\u0085\ufeff]+$")
 _SAFE_JOB_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _ACTIVE_LOCK_STATUSES = frozenset({"RUNNING", "QUEUED", "PENDING", "ACQUIRING_IN_CLOUD"})
+DEFAULT_LOCK_TTL_SECONDS = 900.0
 
 _PROCESS_LOCKS_GUARD = threading.Lock()
 _PROCESS_LOCKS: Dict[Tuple[str, str, str, str], threading.Lock] = {}
@@ -36,6 +38,7 @@ class CloudStateIntegrityError(ValueError):
 
 __all__ = [
     "CloudStateIntegrityError",
+    "DEFAULT_LOCK_TTL_SECONDS",
     "R2Config",
     "R2CloudStateStore",
     "sign_aws_sigv4_headers",
@@ -200,12 +203,12 @@ class R2Config:
 def _safe_key(raw: str) -> str:
     """Deterministic R2 key segment shared with the Cloudflare Worker gateway.
 
-    Contract (exact parity with JS ``replace(/^[\\s\\u001c-\\u001f\\u0085]+|[\\s\\u001c-\\u001f\\u0085]+$/g, "").toLowerCase()``):
-    - Strip leading/trailing Unicode whitespace (including ``\\u001c-\\u001f`` and ``\\u0085``) and lowercase.
+    Contract (exact parity with JS ``replace(/^[\\s\\u001c-\\u001f\\u0085\\ufeff]+|[\\s\\u001c-\\u001f\\u0085\\ufeff]+$/g, "").toLowerCase()``):
+    - Strip leading/trailing Unicode whitespace (including ``\\u001c-\\u001f``, ``\\u0085``, and ``\\ufeff``) and lowercase.
     - If matching ``^[a-z0-9._-]+$``, return as-is.
     - Otherwise return ``k_<sha256(utf8)[:24]>``.
     """
-    text = str(raw or "").strip().lower()
+    text = _UNICODE_TRIM_RE.sub("", str(raw or "")).lower()
     if not text:
         raise ValueError("R2_KEY_SEGMENT_EMPTY")
     if _SAFE_ASCII_RE.fullmatch(text):
@@ -633,10 +636,10 @@ class R2CloudStateStore:
         job_id: str,
         owner_id: str,
         extra: Optional[Mapping[str, Any]] = None,
-        lock_ttl_seconds: float = 300.0,
+        lock_ttl_seconds: float = DEFAULT_LOCK_TTL_SECONDS,
         now_utc: Optional[datetime] = None,
     ) -> Tuple[bool, Dict[str, Any]]:
-        """Atomically acquire an active job lock with lease TTL and crash takeover."""
+        """Atomically acquire an active job lock with lease TTL and conditional-PUT takeover."""
         ttl = float(lock_ttl_seconds)
         if ttl <= 0:
             raise ValueError("R2_LOCK_TTL_MUST_BE_POSITIVE")
@@ -668,18 +671,19 @@ class R2CloudStateStore:
                     existing, now, ttl
                 ):
                     return False, existing
-                # Expired or terminal lock: atomically recover via If-Match or delete+create
-                if existing_etag:
-                    status = self._put_lock_conditional(
-                        lock_key, lock_doc, if_match=existing_etag
-                    )
-                    if status in (200, 201, 204):
-                        return True, lock_doc
-                    if status == 412:
-                        winner, _ = self._get_json_with_etag(lock_key)
-                        return False, winner if isinstance(winner, dict) else {}
-                    raise RuntimeError(f"R2_LOCK_PUT_FAILED:{status}:{lock_key}")
-                self.delete_key(lock_key)
+                # Released, terminal, or expired lock: take over atomically via PUT If-Match.
+                # Fail closed if ETag is missing — NEVER unconditionally delete.
+                if not existing_etag:
+                    raise RuntimeError(f"R2_LOCK_ETAG_MISSING:{lock_key}")
+                status = self._put_lock_conditional(
+                    lock_key, lock_doc, if_match=existing_etag
+                )
+                if status in (200, 201, 204):
+                    return True, lock_doc
+                if status == 412:
+                    winner, _ = self._get_json_with_etag(lock_key)
+                    return False, winner if isinstance(winner, dict) else {}
+                raise RuntimeError(f"R2_LOCK_PUT_FAILED:{status}:{lock_key}")
 
             status = self._put_lock_conditional(
                 lock_key, lock_doc, if_none_match="*"
@@ -694,16 +698,12 @@ class R2CloudStateStore:
                         winner, now, ttl
                     ):
                         return False, winner
-                    # Winner lock is already expired or terminal -> attempt atomic takeover
-                    if winner_etag:
-                        takeover_status = self._put_lock_conditional(
-                            lock_key, lock_doc, if_match=winner_etag
-                        )
-                    else:
-                        self.delete_key(lock_key)
-                        takeover_status = self._put_lock_conditional(
-                            lock_key, lock_doc, if_none_match="*"
-                        )
+                    # Winner lock is released, terminal, or expired -> atomic takeover via If-Match.
+                    if not winner_etag:
+                        raise RuntimeError(f"R2_LOCK_ETAG_MISSING:{lock_key}")
+                    takeover_status = self._put_lock_conditional(
+                        lock_key, lock_doc, if_match=winner_etag
+                    )
                     if takeover_status in (200, 201, 204):
                         return True, lock_doc
                     if takeover_status == 412:
@@ -721,7 +721,7 @@ class R2CloudStateStore:
         owner_id: Optional[str] = None,
         job_id: Optional[str] = None,
     ) -> bool:
-        """Conditionally release an active job lock using owner_id/job_id + If-Match ETag."""
+        """Conditionally release an active job lock via R2-native PUT If-Match (status=RELEASED)."""
         if not isinstance(owner_id, str) or not owner_id.strip():
             return False
         lock_key = self._lock_key(person_key, season)
@@ -736,7 +736,24 @@ class R2CloudStateStore:
                 current_job = current.get("job_id")
                 if not isinstance(current_job, str) or current_job != job_id:
                     return False
-            return self._delete_key_conditional(lock_key, if_match=etag)
+            # Fail-closed if ETag is missing: NEVER unconditionally delete or overwrite.
+            if not etag:
+                return False
+            released_doc: Dict[str, Any] = dict(current)
+            released_doc["status"] = "RELEASED"
+            released_doc["job_id"] = current.get("job_id")
+            released_doc["owner_id"] = current.get("owner_id")
+            released_doc["released_at_utc"] = datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            status = self._put_lock_conditional(
+                lock_key, released_doc, if_match=etag
+            )
+            if status in (200, 201, 204):
+                return True
+            if status == 412:
+                return False
+            raise RuntimeError(f"R2_LOCK_RELEASE_FAILED:{status}:{lock_key}")
 
     def find_active_job_for_person(
         self,
@@ -744,7 +761,7 @@ class R2CloudStateStore:
         season: str,
         *,
         now_utc: Optional[datetime] = None,
-        default_ttl_seconds: float = 300.0,
+        default_ttl_seconds: float = DEFAULT_LOCK_TTL_SECONDS,
     ) -> Optional[Dict[str, Any]]:
         lock_doc = self.get_json(self._lock_key(person_key, season))
         if not isinstance(lock_doc, dict):
