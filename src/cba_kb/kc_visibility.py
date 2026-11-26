@@ -127,3 +127,118 @@ def refuse_claim_merge(fact: Dict[str, Any], claim: Dict[str, Any]) -> None:
         else "unknown"
     raise ValueError(
         f"CLAIM_MERGE_INTO_FACT_REFUSED:{fact_id}")
+
+
+# ---------------------------------------------------------------------------
+# REQ-232 P0-4: Dual-Visibility Card Export & Fail-Closed Public-Safe Guard
+# ---------------------------------------------------------------------------
+
+CARD_VISIBILITY_MODES = ("internal_full", "public_safe")
+
+_PUBLIC_SAFE_FORBIDDEN_SUBSTRINGS = (
+    "web 剪藏",
+    "## document passage",
+)
+_PUBLIC_SAFE_TEN_SOURCES_RE = re.compile(r"10[\s_-]+sources", re.IGNORECASE)
+_PUBLIC_SAFE_SCHEME_RE = re.compile(r"(?:r2|s3|file)://", re.IGNORECASE)
+_PUBLIC_SAFE_POSIX_LOCAL_ROOTS = (
+    "Users|home|tmp|var|etc|opt|srv|data|private|root|mnt|Volumes|Library|Applications"
+)
+_PUBLIC_SAFE_LOCAL_PATH_RE = re.compile(
+    r"(?:(?<![A-Za-z0-9_.:/])/(?:" + _PUBLIC_SAFE_POSIX_LOCAL_ROOTS + r")/[^\s)\]<>\"',;]+"
+    r"|(?<![A-Za-z0-9_.:/\\])[A-Za-z]:[\\/][^\s)\]<>\"',;]+"
+    r"|(?<![A-Za-z0-9_.:/\\])\\\\[A-Za-z0-9_.-]+\\[^\s)\]<>\"',;]+)"
+)
+_PUBLIC_SAFE_SHA256_RE = re.compile(r"\b[0-9a-fA-F]{64}\b")
+_PUBLIC_SAFE_RAW_SHA_KEY_RE = re.compile(r"\braw_sha256\b", re.IGNORECASE)
+_PUBLIC_SAFE_DOC_ID_RE = re.compile(
+    r"(?:\bdoc:[A-Za-z0-9_.:-]+|\bSnapshot doc_id:|\bdoc_id\s*:|"
+    r"\b(?:prior_doc_id|new_doc_id|prior_record_id|new_record_id)\b)",
+    re.IGNORECASE,
+)
+_PUBLIC_SAFE_HTTP_URL_RE = re.compile(r"https?://[^\s)\]<>\"']+", re.IGNORECASE)
+_PUBLIC_SAFE_DRIVE_CANDIDATE_RE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{25,}(?![A-Za-z0-9_-])")
+_HISTORICAL_ARCHIVE_BANNER_PREFIX = "> [HISTORICAL_SEASON_ARCHIVE] "
+
+
+def _is_public_safe_drive_like_token(token: str, is_raw_drive_token_fn: Any) -> bool:
+    if is_raw_drive_token_fn(token):
+        return True
+    if len(token) >= 25 and token.count("_") <= 2 and token.count("-") <= 2:
+        upper_count = sum(1 for c in token if c.isupper())
+        lower_count = sum(1 for c in token if c.islower())
+        if upper_count >= 2 and lower_count >= 2:
+            return True
+    return False
+
+
+def validate_card_visibility(visibility: str) -> str:
+    """Validate card visibility mode; fail closed on any unknown value."""
+    if not isinstance(visibility, str) or visibility not in CARD_VISIBILITY_MODES:
+        raise ValueError(f"INVALID_CARD_VISIBILITY:{visibility!r}")
+    return visibility
+
+
+def verify_public_safe_card_text(markdown: str) -> None:
+    """Fail-closed leak guard for public_safe rendered research cards (REQ-232 P0-4).
+
+    Raises ValueError("PUBLIC_SAFE_REDACTION_VIOLATION:...") if any private path,
+    cloud bucket URI, Document Passage verbatim quote, fenced code block, internal
+    doc_id / revision record id, raw_sha256 / 64-hex hash, or raw Google Drive ID / URL
+    appears in the text.
+    """
+    if not isinstance(markdown, str):
+        raise ValueError("PUBLIC_SAFE_REDACTION_VIOLATION:non_string_markdown")
+
+    violations: List[str] = []
+    lowered = markdown.lower()
+
+    for forbidden in _PUBLIC_SAFE_FORBIDDEN_SUBSTRINGS:
+        if forbidden in lowered:
+            violations.append(f"forbidden_marker:{forbidden}")
+
+    if _PUBLIC_SAFE_TEN_SOURCES_RE.search(markdown):
+        violations.append("forbidden_marker:10_sources")
+
+    if _PUBLIC_SAFE_SCHEME_RE.search(markdown):
+        violations.append("private_uri_scheme")
+
+    if _PUBLIC_SAFE_LOCAL_PATH_RE.search(markdown):
+        violations.append("local_path")
+
+    if _PUBLIC_SAFE_RAW_SHA_KEY_RE.search(markdown):
+        violations.append("raw_sha256_field")
+
+    if _PUBLIC_SAFE_SHA256_RE.search(markdown):
+        violations.append("hex64_digest")
+
+    if _PUBLIC_SAFE_DOC_ID_RE.search(markdown):
+        violations.append("internal_doc_id")
+
+    if "```" in markdown:
+        violations.append("fenced_code_block")
+
+    for line in markdown.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith(">") and not stripped.startswith(_HISTORICAL_ARCHIVE_BANNER_PREFIX):
+            violations.append("verbatim_blockquote")
+            break
+
+    from .consumer_surface import (
+        _DRIVE_PREFIXED_ID_RE,
+        _DRIVE_URL_RE,
+        _is_raw_drive_token,
+    )
+
+    if _DRIVE_URL_RE.search(markdown):
+        violations.append("drive_url")
+    if _DRIVE_PREFIXED_ID_RE.search(markdown):
+        violations.append("drive_prefixed_id")
+    text_without_public_urls = _PUBLIC_SAFE_HTTP_URL_RE.sub(" ", markdown)
+    for match in _PUBLIC_SAFE_DRIVE_CANDIDATE_RE.finditer(text_without_public_urls):
+        if _is_public_safe_drive_like_token(match.group(0), _is_raw_drive_token):
+            violations.append("raw_drive_id")
+            break
+
+    if violations:
+        raise ValueError("PUBLIC_SAFE_REDACTION_VIOLATION:" + ",".join(violations))

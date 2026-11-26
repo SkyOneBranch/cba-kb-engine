@@ -410,6 +410,8 @@ def main():
     q.add_argument('--output-dir',type=Path,default=None)
     q.add_argument('--register-for-sync',action='store_true',default=False)
     q.add_argument('--format',choices=('json','markdown'),default='json')
+    q.add_argument('--visibility',choices=('internal_full','public_safe'),default='internal_full')
+    q.add_argument('--entity-role',default=None)
     q.add_argument('--master-csv',type=Path,default=None)
     q.add_argument('--foreign-csv',type=Path,default=None)
     q.add_argument('--identity-registry',type=Path,default=None)
@@ -417,6 +419,21 @@ def main():
     q.add_argument('--game-logs-dir',type=Path,default=None)
     q.add_argument('--ops-checkpoint',type=Path,default=None)
     q.add_argument('--negative-receipts',type=Path,default=None)
+    q=sub.add_parser('export-person-cards')
+    q.add_argument('--players',required=True,help='Comma-separated player names/IDs to export')
+    q.add_argument('--season',default='2026-2027')
+    q.add_argument('--recent-games-window',type=int,default=5)
+    q.add_argument('--output-dir',type=Path,required=True)
+    q.add_argument('--visibility',choices=('internal_full','public_safe'),default='internal_full')
+    q.add_argument('--entity-role',default=None)
+    q.add_argument('--master-csv',type=Path,default=None)
+    q.add_argument('--foreign-csv',type=Path,default=None)
+    q.add_argument('--identity-registry',type=Path,default=None)
+    q.add_argument('--season-stats',type=Path,default=None)
+    q.add_argument('--game-logs-dir',type=Path,default=None)
+    q.add_argument('--ops-checkpoint',type=Path,default=None)
+    q.add_argument('--negative-receipts',type=Path,default=None)
+    q.add_argument('--game-stats-degraded',action='store_true',default=False)
     q=sub.add_parser('snowball-query')
     q.add_argument('--person',required=True)
     q.add_argument('--season',default='2026-2027')
@@ -1902,6 +1919,8 @@ def main():
                 negative_receipts=neg_recs,
                 output_dir=a.output_dir,
                 register_for_sync=a.register_for_sync,
+                entity_role=a.entity_role,
+                visibility=a.visibility,
             )
             if a.format == 'markdown':
                 stage(a.command, 'done')
@@ -1910,6 +1929,75 @@ def main():
                 else:
                     print(json.dumps(result, ensure_ascii=False, indent=2))
                 return
+        elif a.command == 'export-person-cards':
+            from .person_card_builder import (
+                _load_game_logs_from_dir,
+                _read_csv_rows,
+                _read_json_or_jsonl,
+                build_person_card,
+            )
+            configured = a.instance_root is not None or bool(os.environ.get('CBA_KB_INSTANCE_ROOT'))
+            instance = private_instance() if configured else None
+            master_rows = _read_csv_rows(a.master_csv) if a.master_csv is not None else None
+            foreign_rows = _read_csv_rows(a.foreign_csv) if a.foreign_csv is not None else None
+            id_reg = (
+                json.loads(a.identity_registry.read_text(encoding='utf-8'))
+                if a.identity_registry is not None
+                else None
+            )
+            season_stats = _read_json_or_jsonl(a.season_stats) if a.season_stats is not None else None
+            game_stats = _load_game_logs_from_dir(a.game_logs_dir) if a.game_logs_dir is not None else None
+            doc_bundles = None
+            if a.ops_checkpoint is not None and a.ops_checkpoint.is_file():
+                ckpt_obj = json.loads(a.ops_checkpoint.read_text(encoding='utf-8'))
+                raw_b = ckpt_obj.get('consumed_bundles') if isinstance(ckpt_obj, dict) else None
+                if isinstance(raw_b, dict):
+                    doc_bundles = [dict(v) for _, v in sorted(raw_b.items()) if isinstance(v, dict)]
+                elif isinstance(raw_b, list):
+                    doc_bundles = [dict(v) for v in raw_b if isinstance(v, dict)]
+            neg_recs = (
+                _read_json_or_jsonl(a.negative_receipts)
+                if a.negative_receipts is not None
+                else None
+            )
+            players = [p.strip() for p in a.players.split(',') if p.strip()]
+            exported_cards = []
+            exported_count = 0
+            for player in players:
+                card_res = build_person_card(
+                    player,
+                    season=a.season,
+                    recent_games_window=a.recent_games_window,
+                    instance=instance,
+                    master_rows=master_rows,
+                    foreign_rows=foreign_rows,
+                    identity_registry=id_reg,
+                    season_stats_records=season_stats,
+                    game_stats_records=game_stats,
+                    document_bundles=doc_bundles,
+                    negative_receipts=neg_recs,
+                    output_dir=a.output_dir,
+                    game_stats_degraded=bool(a.game_stats_degraded),
+                    entity_role=a.entity_role,
+                    visibility=a.visibility,
+                )
+                if card_res.get('status') == 'BUILT':
+                    exported_count += 1
+                exported_cards.append({
+                    'player': player,
+                    'status': card_res.get('status'),
+                    'visibility': a.visibility,
+                    'filename': card_res.get('filename'),
+                    'card_path': card_res.get('card_path'),
+                    'card_sha256': card_res.get('card_sha256'),
+                })
+            result = {
+                'season': a.season,
+                'visibility': a.visibility,
+                'output_dir': str(a.output_dir),
+                'exported_count': exported_count,
+                'cards': exported_cards,
+            }
         elif a.command == 'snowball-query':
             import shlex
             from .cloud_state import R2CloudStateStore, R2Config

@@ -24,13 +24,22 @@ from .common import atomic
 from .consumer_surface import (
     CONSUMER_MASTER_FILENAME,
     FOREIGN_REGISTRATION_CSV_FILENAME,
+    _is_prior_season,
+    _parse_season_start_year,
+    build_person_domain_horizons,
     evaluate_league_coverage,
     find_boundary_safe_name_spans,
     scrub_raw_drive_ids_for_consumer,
 )
 from .game_stats import summarize_recent_games
 from .instance import Instance
-from .kc_render import render_research_card, research_card_consumer_filename
+from .kc_render import (
+    render_research_card,
+    research_card_consumer_filename,
+    research_card_public_consumer_filename,
+)
+from .kc_visibility import validate_card_visibility, verify_public_safe_card_text
+from .stats import CORE_SEASON_STATS_COLUMNS
 
 
 def _norm_key(value: Any) -> str:
@@ -810,6 +819,26 @@ def _person_match_tokens(person: Dict[str, Any]) -> set[str]:
     return tokens
 
 
+def _season_stats_sort_key(rec: Dict[str, Any]) -> tuple[int, int, str, str]:
+    mt = str(rec.get("match_type") or "").strip().upper()
+    if mt in ("REGULAR", "1", "常规赛"):
+        mt_rank = 0
+    elif mt in ("PLAYOFFS", "2", "季后赛"):
+        mt_rank = 1
+    else:
+        mt_rank = 2
+    sc = str(rec.get("scope") or "").strip().upper()
+    if sc == "WHOLE_SEASON":
+        sc_rank = 0
+    elif sc == "TEAM_SPLIT":
+        sc_rank = 1
+    else:
+        sc_rank = 2
+    team_key = str(rec.get("team_name") or rec.get("team_id") or "")
+    rec_id = str(rec.get("record_id") or "")
+    return (mt_rank, sc_rank, team_key, rec_id)
+
+
 def _match_season_stats(
     person: Dict[str, Any],
     season_stats_records: Sequence[Dict[str, Any]],
@@ -831,13 +860,67 @@ def _match_season_stats(
         r_name = _norm_key(rec.get("player_name"))
         if (uid and r_uid == uid) or (pid and r_pid == pid) or (not uid and not pid and pname and r_name == pname):
             matched.append(rec)
-    matched.sort(
-        key=lambda r: (
-            0 if str(r.get("scope") or "").upper() == "WHOLE_SEASON" else 1,
-            str(r.get("record_id") or ""),
-        )
-    )
+    matched.sort(key=_season_stats_sort_key)
     return matched
+
+
+def _match_prior_season_stats(
+    person: Dict[str, Any],
+    season_stats_records: Sequence[Dict[str, Any]],
+    *,
+    target_season: str,
+) -> tuple[Optional[str], List[Dict[str, Any]]]:
+    """Find the latest prior season (< target_season) stats records for a resolved person."""
+    uid = _norm_key(person.get("player_uid"))
+    pid = _norm_key(person.get("player_id"))
+    pname = _norm_key(person.get("player_name"))
+
+    by_season: Dict[str, List[Dict[str, Any]]] = {}
+    for rec in season_stats_records or ():
+        if not isinstance(rec, dict):
+            continue
+        rec_season = str(rec.get("season") or "").strip()
+        if not rec_season or not _is_prior_season(rec_season, target_season):
+            continue
+        r_uid = _norm_key(rec.get("player_uid"))
+        r_pid = _norm_key(rec.get("provider_player_id"))
+        r_name = _norm_key(rec.get("player_name"))
+        if (uid and r_uid == uid) or (pid and r_pid == pid) or (not uid and not pid and pname and r_name == pname):
+            by_season.setdefault(rec_season, []).append(rec)
+
+    if not by_season:
+        return None, []
+
+    latest_prior = max(
+        by_season.keys(),
+        key=lambda s: (_parse_season_start_year(s) or -1, s),
+    )
+    rows = sorted(by_season[latest_prior], key=_season_stats_sort_key)
+    return latest_prior, rows
+
+
+def _build_season_stats_table_rows(
+    records: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for rec in sorted(records, key=_season_stats_sort_key):
+        if not isinstance(rec, dict):
+            continue
+        rec_metrics = rec.get("metrics") if isinstance(rec.get("metrics"), dict) else {}
+        prov = rec.get("provenance") if isinstance(rec.get("provenance"), dict) else {}
+        core_metrics = {col: rec_metrics.get(col) for col in CORE_SEASON_STATS_COLUMNS}
+        rows.append({
+            "season": str(rec.get("season") or ""),
+            "match_type": str(rec.get("match_type") or "").strip() or "UNKNOWN",
+            "scope": str(rec.get("scope") or "").strip() or "UNKNOWN",
+            "team_id": rec.get("team_id"),
+            "team_name": rec.get("team_name"),
+            "record_id": rec.get("record_id"),
+            "captured_at": prov.get("captured_at"),
+            "locator": prov.get("locator") or rec.get("record_id"),
+            "metrics": core_metrics,
+        })
+    return rows
 
 
 def _match_game_stats(
@@ -890,6 +973,7 @@ def _match_document_bundles(
     document_bundles: Sequence[Dict[str, Any]],
     *,
     roster_candidates: Optional[Sequence[Dict[str, Any]]] = None,
+    visibility: str = "internal_full",
 ) -> List[Dict[str, Any]]:
     tokens = _person_match_tokens(person)
     id_tokens = {
@@ -1031,12 +1115,17 @@ def _match_document_bundles(
         if hit:
             if doc_id:
                 seen_ids.add(doc_id)
+            raw_title = str(b.get("title") or "").strip()
+            if visibility == "public_safe":
+                safe_title = "-" if (not raw_title or (doc_id and raw_title == doc_id)) else raw_title
+            else:
+                safe_title = raw_title or doc_id or "-"
             matched.append({
                 "doc_id": doc_id or "-",
                 "source_tier": b.get("source_tier") or "T2",
                 "completeness": b.get("completeness") or "full",
                 "published_at": b.get("published_at"),
-                "title": b.get("title") or doc_id or "-",
+                "title": safe_title,
                 "canonical_url": b.get("canonical_url"),
                 "disclosure_posture": b.get("disclosure_posture"),
             })
@@ -1062,11 +1151,14 @@ def build_person_card(
     coverage_ledger: Optional[Dict[str, Any]] = None,
     observation_horizon: Optional[Dict[str, Any]] = None,
     game_stats_degraded: bool = False,
+    entity_role: Optional[str] = None,
+    visibility: str = "internal_full",
 ) -> Dict[str, Any]:
     """Assemble and render an on-demand research card for any player in local KB.
 
     Zero network calls, zero Google Drive API calls.
     """
+    vis = validate_card_visibility(visibility)
     discovered = _discover_instance_inputs(instance) if instance is not None else {}
     obs_horizon: Optional[Dict[str, Any]] = None
     if isinstance(observation_horizon, dict):
@@ -1146,7 +1238,9 @@ def build_person_card(
         if doc_bundles
         else None
     )
-    citations = _match_document_bundles(person, doc_bundles, roster_candidates=roster_pool)
+    citations = _match_document_bundles(
+        person, doc_bundles, roster_candidates=roster_pool, visibility=vis
+    )
 
     player_name = str(person.get("player_name") or query.strip())
     player_id = person.get("player_id") or person.get("player_uid") or "unassigned"
@@ -1165,6 +1259,7 @@ def build_person_card(
         or person.get("current_club")
     )
 
+    prior_season_baseline: Optional[Dict[str, Any]] = None
     if matched_season:
         primary = matched_season[0]
         metrics = primary.get("metrics") or {}
@@ -1205,6 +1300,7 @@ def build_person_card(
                 },
             },
         }
+        payload["season_stats_table"] = _build_season_stats_table_rows(matched_season)
     else:
         posture = "UNKNOWN"
         unknown_subkind = "NO_SEASON_STATS_RECORDED_YET"
@@ -1230,6 +1326,53 @@ def build_person_card(
                 },
             },
         }
+        prior_season, prior_recs = _match_prior_season_stats(
+            person, s_stats, target_season=season
+        )
+        if prior_season and prior_recs:
+            prior_rows = _build_season_stats_table_rows(prior_recs)
+            prior_primary = prior_recs[0]
+            prior_prov = (
+                prior_primary.get("provenance")
+                if isinstance(prior_primary.get("provenance"), dict)
+                else {}
+            )
+            prior_season_baseline = {
+                "season": prior_season,
+                "target_season": season,
+                "rows": prior_rows,
+                "captured_at": prior_prov.get("captured_at"),
+                "locator": prior_prov.get("locator") or prior_primary.get("record_id"),
+            }
+            payload["prior_season_baseline"] = prior_season_baseline
+
+    effective_role = entity_role or str(person.get("entity_role") or "PLAYER")
+    has_reg_records = bool(person.get("domestic_records") or person.get("foreign_records"))
+    reg_obs_until = (foreign_registration or {}).get("published_at") or discovered.get("data_cutoff")
+    stats_obs_until = None
+    if matched_season:
+        first_prov = matched_season[0].get("provenance")
+        if isinstance(first_prov, dict):
+            stats_obs_until = first_prov.get("captured_at")
+    if not stats_obs_until and isinstance(recent_summary, dict):
+        stats_obs_until = recent_summary.get("latest_captured_at")
+    if not stats_obs_until:
+        stats_obs_until = discovered.get("data_cutoff")
+    ann_obs_until = discovered.get("data_cutoff")
+
+    domain_horizons = build_person_domain_horizons(
+        entity_role=effective_role,
+        has_registration_records=has_reg_records,
+        registration_observed_until=reg_obs_until,
+        has_season_stats=bool(matched_season),
+        has_game_stats=bool(matched_games),
+        stats_observed_until=stats_obs_until,
+        game_stats_degraded=bool(game_stats_degraded),
+        has_official_announcements=bool(citations),
+        announcements_observed_until=ann_obs_until,
+        coverage_eval=obs_horizon,
+    )
+    payload["domain_horizons"] = domain_horizons
 
     reg_profile: Dict[str, Any] = {
         "player_name": player_name,
@@ -1262,17 +1405,26 @@ def build_person_card(
     if obs_horizon is not None:
         payload["observation_horizon"] = obs_horizon
 
-    raw_markdown = render_research_card(payload, evidence_verified=True)
+    raw_markdown = render_research_card(payload, evidence_verified=True, visibility=vis)
     markdown = scrub_raw_drive_ids_for_consumer(raw_markdown, known_drive_ids=known_drive_ids)
     if not markdown.rstrip().endswith("end_marker: true"):
         markdown = markdown.rstrip() + "\n\nend_marker: true\n"
+    if vis == "public_safe":
+        verify_public_safe_card_text(markdown)
 
     filename_middle = _resolve_filename_middle_segment(person, current_club=effective_club)
-    filename = research_card_consumer_filename(
-        player_name,
-        filename_middle,
-        season,
-    )
+    if vis == "public_safe":
+        filename = research_card_public_consumer_filename(
+            player_name,
+            filename_middle,
+            season,
+        )
+    else:
+        filename = research_card_consumer_filename(
+            player_name,
+            filename_middle,
+            season,
+        )
     card_bytes = markdown.encode("utf-8")
     card_sha256 = hashlib.sha256(card_bytes).hexdigest()
     card_path_str: Optional[str] = None
@@ -1315,10 +1467,13 @@ def build_person_card(
         "status": "BUILT",
         "query": resolution["query"],
         "season": season,
+        "visibility": vis,
         "person": person,
         "candidates": resolution["candidates"],
         "posture": posture,
         "unknown_subkind": unknown_subkind,
+        "prior_season_baseline": prior_season_baseline,
+        "domain_horizons": domain_horizons,
         "recent_games_summary": recent_summary,
         "filename": filename,
         "card_path": card_path_str,
