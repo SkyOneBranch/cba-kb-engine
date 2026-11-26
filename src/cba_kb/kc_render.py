@@ -21,6 +21,8 @@ from typing import Any, Dict, List
 
 from .aliases import format_club_team_display
 from .kc_projection import KcError
+from .kc_visibility import validate_card_visibility, verify_public_safe_card_text
+from .stats import CORE_SEASON_STATS_COLUMNS
 
 READABILITY_STATUS = "NOT_VERIFIED_PENDING_PHASE_2"
 
@@ -48,6 +50,14 @@ def research_card_consumer_filename(player_name: str, player_id: str, season: st
     return f"研究卡_{safe_name}_{safe_id}_{safe_season}_CURRENT.md"
 
 
+def research_card_public_consumer_filename(player_name: str, player_id: str, season: str) -> str:
+    """Build self-describing Chinese consumer filename for public_safe research cards."""
+    safe_name = _safe_filename_part(player_name, "player_name")
+    safe_id = _safe_filename_part(player_id, "player_id")
+    safe_season = _safe_filename_part(season, "season")
+    return f"研究卡_{safe_name}_{safe_id}_{safe_season}_PUBLIC_CURRENT.md"
+
+
 def slice_consumer_filename(
     player_name: str, player_id: str, season: str, match_type: str = "REGULAR"
 ) -> str:
@@ -59,17 +69,126 @@ def slice_consumer_filename(
     return f"研究切片_{safe_name}_{safe_id}_{safe_season}_{safe_mt}_CURRENT.md"
 
 
+_SEASON_METRIC_SHORT_LABELS: Dict[str, str] = {
+    "games_played": "GP",
+    "games_started": "GS",
+    "minutes_per_game": "MIN",
+    "points_per_game": "PTS",
+    "rebounds_per_game": "REB",
+    "assists_per_game": "AST",
+    "steals_per_game": "STL",
+    "blocks_per_game": "BLK",
+    "turnovers_per_game": "TOV",
+    "field_goals_percentage": "FG%",
+    "three_point_percentage": "3P%",
+    "free_throws_percentage": "FT%",
+}
+
+
+def _match_type_sort_rank(match_type: Any) -> int:
+    mt = str(match_type or "").strip().upper()
+    if mt in ("REGULAR", "1", "常规赛"):
+        return 0
+    if mt in ("PLAYOFFS", "2", "季后赛"):
+        return 1
+    return 2
+
+
+def _scope_sort_rank(scope: Any) -> int:
+    sc = str(scope or "").strip().upper()
+    if sc == "WHOLE_SEASON":
+        return 0
+    if sc == "TEAM_SPLIT":
+        return 1
+    return 2
+
+
+def _fmt_season_metric(val: Any) -> str:
+    if val is None:
+        return "UNKNOWN"
+    return str(val)
+
+
+def _render_season_stats_table_lines(
+    rows: List[Dict[str, Any]],
+    *,
+    is_public: bool = False,
+) -> List[str]:
+    valid_rows = [r for r in rows if isinstance(r, dict)]
+    if not valid_rows:
+        return []
+    sorted_rows = sorted(
+        valid_rows,
+        key=lambda r: (
+            _match_type_sort_rank(r.get("match_type")),
+            _scope_sort_rank(r.get("scope")),
+            str(r.get("team_name") or r.get("team_id") or ""),
+            str(r.get("record_id") or ""),
+        ),
+    )
+    metric_headers = [_SEASON_METRIC_SHORT_LABELS[col] for col in CORE_SEASON_STATS_COLUMNS]
+    headers = ["Match Type", "Scope", "Team", *metric_headers, "Captured At"]
+    if not is_public:
+        headers.append("Locator")
+    table_lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(["---"] * len(headers)) + " |",
+    ]
+    for row in sorted_rows:
+        metrics = row.get("metrics") if isinstance(row.get("metrics"), dict) else row
+        mt = str(row.get("match_type") or "-")
+        sc = str(row.get("scope") or "-")
+        team = str(row.get("team_name") or row.get("team_id") or "-")
+        cap = str(row.get("captured_at") or "-")
+        metric_vals = [_fmt_season_metric(metrics.get(col)) for col in CORE_SEASON_STATS_COLUMNS]
+        cells = [mt, sc, team, *metric_vals, cap]
+        if not is_public:
+            loc = str(row.get("locator") or row.get("record_id") or "-")
+            cells.append(loc)
+        table_lines.append("| " + " | ".join(cells) + " |")
+    return table_lines
+
+
+def _is_public_safe_citation(cite: Dict[str, Any]) -> bool:
+    if not isinstance(cite, dict):
+        return False
+    tier = str(cite.get("source_tier") or "").strip().upper()
+    if tier == "MANUAL":
+        return False
+    url = str(cite.get("canonical_url") or "").strip()
+    if not (url.startswith("https://") or url.startswith("http://")):
+        return False
+    combined = f"{cite.get('title') or ''}\n{url}"
+    for marker in ("10_sources", "Web 剪藏", "r2://", "s3://", "file:///"):
+        if marker.lower() in combined.lower():
+            return False
+    return True
+
+
+def _is_internal_locator(value: Any) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    low = value.lower()
+    for marker in ("doc:", "10_sources", "web 剪藏", "r2://", "s3://", "file:///"):
+        if marker in low:
+            return True
+    return False
+
+
 def render_research_card(
     payload: Dict[str, Any],
     *,
     evidence_verified: bool = False,
     max_external_citations_per_card: int = 10,
+    visibility: str = "internal_full",
 ) -> str:
     """Render compact exception-aware research card.
 
     Enforces evidence_verified=True guard. Renders grains and evidence posture.
     Ends strictly with 'end_marker: true'.
     """
+    vis = validate_card_visibility(visibility)
+    is_public = vis == "public_safe"
     if evidence_verified is not True:
         raise KcRenderError("RESEARCH_CARD_NOT_VERIFIED")
 
@@ -100,32 +219,49 @@ def render_research_card(
     else:
         title = "# Research Card (Serving Projection)"
 
-    lines: List[str] = [
-        title,
-        "",
-    ]
+    lines: List[str] = [title]
+    if is_public:
+        lines.append("- Visibility: PUBLIC_SAFE")
+    lines.append("")
 
-    # 0. Observation Horizon Section (REQ-230 P0-1: optional, 0-byte diff when absent)
+    # 0. Observation Horizon Section (REQ-230 P0-1 / REQ-232 P0-2: optional, 0-byte diff when absent)
     obs_horizon = payload.get("observation_horizon")
     has_obs_horizon = isinstance(obs_horizon, dict) and bool(obs_horizon)
-    if has_obs_horizon:
-        obs_until = obs_horizon.get("observed_until") or "UNKNOWN"
-        cov_status = (
-            obs_horizon.get("overall_status")
-            or obs_horizon.get("coverage_status")
-            or "UNKNOWN"
-        )
-        missing_items = obs_horizon.get("missing_items") or []
-        honest_disclosure = str(obs_horizon.get("honest_disclosure") or "").strip()
+    domain_horizons = payload.get("domain_horizons")
+    has_domain_horizons = isinstance(domain_horizons, dict) and bool(domain_horizons)
+    if has_obs_horizon or has_domain_horizons:
         lines.append("## Observation Horizon")
-        lines.append(f"- observed_until: {obs_until}")
-        lines.append(f"- coverage_status: {cov_status}")
-        if missing_items:
-            lines.append(f"- missing_items: {', '.join(str(x) for x in missing_items)}")
-        else:
-            lines.append("- missing_items: []")
-        if honest_disclosure:
-            lines.append(f"- honest_disclosure: {honest_disclosure}")
+        if has_obs_horizon:
+            obs_until = obs_horizon.get("observed_until") or "UNKNOWN"
+            cov_status = (
+                obs_horizon.get("overall_status")
+                or obs_horizon.get("coverage_status")
+                or "UNKNOWN"
+            )
+            missing_items = obs_horizon.get("missing_items") or []
+            honest_disclosure = str(obs_horizon.get("honest_disclosure") or "").strip()
+            lines.append(f"- observed_until: {obs_until}")
+            lines.append(f"- coverage_status: {cov_status}")
+            if missing_items:
+                lines.append(f"- missing_items: {', '.join(str(x) for x in missing_items)}")
+            else:
+                lines.append("- missing_items: []")
+            if honest_disclosure:
+                lines.append(f"- honest_disclosure: {honest_disclosure}")
+        if has_domain_horizons:
+            ordered_doms = ["registration", "statistics", "official_announcements"]
+            extra_doms = sorted(k for k in domain_horizons if k not in ordered_doms)
+            for dom_key in [*ordered_doms, *extra_doms]:
+                dom_val = domain_horizons.get(dom_key)
+                if not isinstance(dom_val, dict):
+                    continue
+                d_status = dom_val.get("status") or "SOURCE_GAP_UNKNOWN"
+                d_obs = dom_val.get("observed_until") or "UNKNOWN"
+                d_note = str(dom_val.get("note") or "").strip()
+                note_part = f" — {d_note}" if d_note else ""
+                lines.append(
+                    f"- domain[{dom_key}]: status={d_status}, observed_until={d_obs}{note_part}"
+                )
         lines.append("")
 
     # 1. Stats & Scope Section
@@ -159,7 +295,7 @@ def render_research_card(
         lines.append(f"- Games Played: {games_played}")
     if captured_at:
         lines.append(f"- Cutoff / Captured At: {captured_at}")
-    if locator:
+    if locator and not (is_public and _is_internal_locator(locator)):
         lines.append(f"- Locator: {locator}")
 
     if posture in ("CLEAN_OFFICIAL", "IDENTICAL_DUPLICATE"):
@@ -207,6 +343,34 @@ def render_research_card(
         subkind = transparency.get("unknown_subkind", "NO_RELIABLE_EVIDENCE_IN_KB")
         lines.append(f"- Unknown: {subkind}")
 
+    # 1b. 12-Metric Season Averages Table (REQ-232 P0-1: optional, 0-byte diff when absent)
+    season_stats_table = payload.get("season_stats_table")
+    if isinstance(season_stats_table, list) and season_stats_table:
+        table_lines = _render_season_stats_table_lines(season_stats_table, is_public=is_public)
+        if table_lines:
+            lines.extend([
+                "",
+                "### Season Averages (Player-Season Grain)",
+                *table_lines,
+            ])
+
+    # 1c. Prior Full-Season Baseline (REQ-232 P0-1: historical reference only, 0-byte diff when absent)
+    prior_baseline = payload.get("prior_season_baseline")
+    if isinstance(prior_baseline, dict) and isinstance(prior_baseline.get("rows"), list) and prior_baseline["rows"]:
+        prior_s = str(prior_baseline.get("season") or "UNKNOWN")
+        target_s = str(prior_baseline.get("target_season") or season)
+        prior_table = _render_season_stats_table_lines(prior_baseline["rows"], is_public=is_public)
+        if prior_table:
+            lines.extend([
+                "",
+                f"### Prior Full-Season Baseline ({prior_s} — Historical Reference Only, Not {target_s})",
+            ])
+            if prior_baseline.get("captured_at"):
+                lines.append(f"- Captured At: {prior_baseline['captured_at']}")
+            if prior_baseline.get("locator") and not is_public:
+                lines.append(f"- Locator: {prior_baseline['locator']}")
+            lines.extend(prior_table)
+
     # 2. Claim Layer Section (when claims exist)
     claim_trans = transparency.get("claim_transparency") or {}
     claims_list = claim_layer.get("claims") if isinstance(claim_layer, dict) else None
@@ -223,8 +387,8 @@ def render_research_card(
                 f"{rev.get('statement')} [prior: {rev.get('prior_claim_id')}]"
             )
 
-    # 3. Document Passage Section
-    if isinstance(doc_layer, dict) and doc_layer.get("verbatim"):
+    # 3. Document Passage Section (strictly stripped under visibility="public_safe")
+    if not is_public and isinstance(doc_layer, dict) and doc_layer.get("verbatim"):
         lines.extend([
             "",
             "## Document Passage",
@@ -236,39 +400,50 @@ def render_research_card(
     # 4. External Citations Section (REQ-220 P0-3: ranked & capped with honest disclosure)
     raw_external_citations = payload.get("external_citations")
     if isinstance(raw_external_citations, (list, tuple)) and raw_external_citations:
-        from .consumer_surface import select_external_citations
-
-        selection = select_external_citations(
-            raw_external_citations,
-            max_external_citations_per_card=max_external_citations_per_card,
+        effective_citations = (
+            [c for c in raw_external_citations if _is_public_safe_citation(c)]
+            if is_public
+            else list(raw_external_citations)
         )
-        total_linked = selection["total_linked_count"]
-        displayed = selection["displayed_count"]
-        cap = selection["max_external_citations_per_card"]
-        lines.extend([
-            "",
-            "## External Citations",
-            f"- Archive External Evidence: {total_linked} linked, {displayed} displayed (cap={cap})",
-        ])
-        if selection["truncated"]:
-            omitted = total_linked - displayed
-            lines.append(
-                f"- Truncated: {omitted} additional linked archive document(s) omitted from card surface"
+        if effective_citations:
+            from .consumer_surface import select_external_citations
+
+            selection = select_external_citations(
+                effective_citations,
+                max_external_citations_per_card=max_external_citations_per_card,
             )
-        for cite in selection["selected"]:
-            tier = cite.get("source_tier") or "UNKNOWN"
-            comp = cite.get("completeness") or "unknown"
-            pub = cite.get("published_at") or "-"
-            title_str = cite.get("title") or cite.get("doc_id") or "-"
-            doc_id = cite.get("doc_id") or "-"
-            url = cite.get("canonical_url") or ""
-            rev_note = ""
-            if cite.get("disclosure_posture") == "LOUD_REVISION" or cite.get("revision_summary"):
-                rev_note = " [LOUD_REVISION]"
-            url_part = f" ({url})" if url else ""
-            lines.append(
-                f"  * [{tier}] ({comp}, {pub}) {title_str} — {doc_id}{url_part}{rev_note}"
-            )
+            total_linked = selection["total_linked_count"]
+            displayed = selection["displayed_count"]
+            cap = selection["max_external_citations_per_card"]
+            lines.extend([
+                "",
+                "## External Citations",
+                f"- Archive External Evidence: {total_linked} linked, {displayed} displayed (cap={cap})",
+            ])
+            if selection["truncated"]:
+                omitted = total_linked - displayed
+                lines.append(
+                    f"- Truncated: {omitted} additional linked archive document(s) omitted from card surface"
+                )
+            for cite in selection["selected"]:
+                tier = cite.get("source_tier") or "UNKNOWN"
+                comp = cite.get("completeness") or "unknown"
+                pub = cite.get("published_at") or "-"
+                title_str = cite.get("title") or cite.get("doc_id") or "-"
+                doc_id = cite.get("doc_id") or "-"
+                url = cite.get("canonical_url") or ""
+                rev_note = ""
+                if cite.get("disclosure_posture") == "LOUD_REVISION" or cite.get("revision_summary"):
+                    rev_note = " [LOUD_REVISION]"
+                url_part = f" ({url})" if url else ""
+                if is_public:
+                    lines.append(
+                        f"  * [{tier}] ({comp}, {pub}) {title_str}{url_part}{rev_note}"
+                    )
+                else:
+                    lines.append(
+                        f"  * [{tier}] ({comp}, {pub}) {title_str} — {doc_id}{url_part}{rev_note}"
+                    )
 
     # 5. Revision Disclosures Section (REQ-220 P0-2 / P0-3: LOUD_REVISION disclosure)
     rev_disclosures = payload.get("revision_disclosures")
@@ -383,10 +558,11 @@ def render_research_card(
                 lines.append(f"- Jersey Number: {for_reg['jersey_number']}")
             if for_reg.get("published_at"):
                 lines.append(f"- Official Snapshot Published At: {for_reg['published_at']}")
-            if for_reg.get("doc_id"):
-                lines.append(f"- Snapshot doc_id: {for_reg['doc_id']}")
-            if for_reg.get("raw_sha256"):
-                lines.append(f"- Snapshot raw_sha256: {for_reg['raw_sha256']}")
+            if not is_public:
+                if for_reg.get("doc_id"):
+                    lines.append(f"- Snapshot doc_id: {for_reg['doc_id']}")
+                if for_reg.get("raw_sha256"):
+                    lines.append(f"- Snapshot raw_sha256: {for_reg['raw_sha256']}")
             lines.append(
                 "- Data Layer: evidence / candidate_observation (Statement != Fact)"
             )
@@ -469,8 +645,10 @@ def render_research_card(
                     if m.get("free_throws_made") is not None and m.get("free_throws_attempted") is not None
                     else "UNKNOWN"
                 )
-                loc = prov.get("doc_id") or (
-                    str(prov.get("raw_sha256") or "")[:12] if prov.get("raw_sha256") else "-"
+                loc = "-" if is_public else (
+                    prov.get("doc_id") or (
+                        str(prov.get("raw_sha256") or "")[:12] if prov.get("raw_sha256") else "-"
+                    )
                 )
                 rev_mark = "[LOUD_REVISION]" if g.get("is_revised") else "-"
                 lines.append(
@@ -526,6 +704,9 @@ def render_research_card(
         from .consumer_surface import assert_no_exaggerated_coverage_claims
 
         assert_no_exaggerated_coverage_claims(final_text, obs_horizon)
+
+    if is_public:
+        verify_public_safe_card_text(final_text)
 
     return final_text
 

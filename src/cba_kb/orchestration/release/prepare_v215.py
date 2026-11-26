@@ -30,6 +30,7 @@ from scripts import prepare_production as _base  # noqa: E402
 from cba_kb.canonical_registry import load_registry  # noqa: E402
 from cba_kb.common import atomic, digest, read, save  # noqa: E402
 from cba_kb.consumer_surface import (  # noqa: E402
+    assert_unique_current_card_per_person,
     build_consumer_surface_targets_spec,
     build_promoted_research_slice_artifacts,
     compute_master_row_count,
@@ -105,6 +106,7 @@ V221_1_BASELINE_SHA = "e58a2787a6176397a142abced682eed5d10f1289"
 V222_1_BASELINE_SHA = "29589e7d4d90a81a6507ecaa1ec73945a5eecfc1"
 V230_1_BASELINE_SHA = "3a7239361b2b81f763dce3477b3c3ad81f357b90"
 V231_1_BASELINE_SHA = "7afb18b1e867146ed99cc73fa16e53d990c54e95"
+V232_1_BASELINE_SHA = "985c647a459ef7a7c970445a9a37db082eaecc71"
 
 V215_RELEASE_SPECS: dict[str, dict] = {
     "v2.1.5-1": {
@@ -149,6 +151,19 @@ V215_RELEASE_SPECS: dict[str, dict] = {
         "enable_observation_horizon_v230": True,
         "enable_on_demand_cards_v230": True,
         "enable_v231_surface_enhancements": True,
+        "incremental_delta_only": True,
+        "archive_format": "bundle_v1",
+    },
+    "v2.3.2-1": {
+        "product_baseline_sha": V232_1_BASELINE_SHA,
+        "enable_consumer_surface_v215": True,
+        "enable_operational_kb_v220": True,
+        "enable_curated_compact_surface_v222": True,
+        "enable_observation_horizon_v230": True,
+        "enable_on_demand_cards_v230": True,
+        "enable_v231_surface_enhancements": True,
+        "enable_v232_card_pipeline": True,
+        "active_league_season": "2026-2027",
         "incremental_delta_only": True,
         "archive_format": "bundle_v1",
     },
@@ -1678,6 +1693,8 @@ def _build_instance_consumer_targets(
             )
 
     promoted_research = {}
+    enable_v232_pipeline = bool(release_spec.get("enable_v232_card_pipeline"))
+    active_league_season = release_spec.get("active_league_season")
     slice_spec_path = instance.data_root / "promoted_research_slices.json"
     if slice_spec_path.is_file():
         spec_list = json.loads(slice_spec_path.read_text(encoding="utf-8"))
@@ -1695,6 +1712,8 @@ def _build_instance_consumer_targets(
                 passage_label=item.get("passage_label", "主要场均数据表"),
                 target_domain=item.get("target_domain", "production"),
                 additional_match_types=item.get("additional_match_types", ()),
+                active_league_season=active_league_season,
+                enable_v232_card_pipeline=enable_v232_pipeline,
             )
             for k, v in built.items():
                 v["publish_parent"] = data_parent
@@ -1797,6 +1816,8 @@ def _build_instance_consumer_targets(
     )
     for spec in targets.values():
         spec["publish_parent"] = data_parent
+    if enable_v232_pipeline:
+        assert_unique_current_card_per_person(targets)
     return targets
 
 

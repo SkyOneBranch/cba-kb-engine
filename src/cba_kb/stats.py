@@ -84,6 +84,22 @@ CANONICAL_METRIC_MVP_ALLOWLIST = frozenset({
     "free_throws_percentage_rate",
 })
 
+# Authoritative v2.3.2 12-metric core season averages display order (REQ-232 P0-1)
+CORE_SEASON_STATS_COLUMNS: Tuple[str, ...] = (
+    "games_played",
+    "games_started",
+    "minutes_per_game",
+    "points_per_game",
+    "rebounds_per_game",
+    "assists_per_game",
+    "steals_per_game",
+    "blocks_per_game",
+    "turnovers_per_game",
+    "field_goals_percentage",
+    "three_point_percentage",
+    "free_throws_percentage",
+)
+
 # Authoritative MVP raw provider field allowlist
 RAW_METRICS_MVP_ALLOWLIST = frozenset({
     "playerId",

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+from enum import Enum
 import hashlib
 import io
 import json
@@ -12,7 +13,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 import yaml
 
 from .kc_consume import ConsumeSession, _content_digest
-from .kc_passages import evidence_chain
+from .kc_passages import build_routed_passage, evidence_chain
 from .kc_render import (
     research_card_consumer_filename,
     slice_consumer_filename,
@@ -329,6 +330,266 @@ def render_observation_horizon_header(
     rendered = "\n".join(lines)
     assert_no_exaggerated_coverage_claims(rendered, coverage_eval)
     return rendered
+
+
+class DomainHorizonStatus(str, Enum):
+    """4-state per-domain observation horizon enum (REQ-232 P0-2)."""
+
+    VERIFIED_PRESENT = "VERIFIED_PRESENT"
+    OBSERVED_EMPTY = "OBSERVED_EMPTY"
+    SOURCE_GAP_UNKNOWN = "SOURCE_GAP_UNKNOWN"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+
+
+_NON_PLAYER_ENTITY_ROLES = frozenset({
+    "HEAD_COACH",
+    "ASSISTANT_COACH",
+    "COACH",
+    "EXECUTIVE",
+    "GM",
+    "GENERAL_MANAGER",
+    "REFEREE",
+    "STAFF",
+    "主教练",
+    "助理教练",
+    "教练",
+    "领队",
+    "总经理",
+    "裁判",
+})
+
+
+def _is_non_player_role(entity_role: Optional[str]) -> bool:
+    if not isinstance(entity_role, str) or not entity_role.strip():
+        return False
+    raw = entity_role.strip()
+    upper = raw.upper()
+    if raw in _NON_PLAYER_ENTITY_ROLES or upper in _NON_PLAYER_ENTITY_ROLES:
+        return True
+    if "COACH" in upper or "教练" in raw:
+        return True
+    return False
+
+
+def _extract_domain_obs_from_eval(
+    coverage_eval: Optional[Mapping[str, Any]],
+    domain_keys: Sequence[str],
+) -> Optional[str]:
+    if not isinstance(coverage_eval, Mapping):
+        return None
+    domains = coverage_eval.get("domains")
+    if isinstance(domains, Mapping):
+        for dk in domain_keys:
+            entry = domains.get(dk)
+            if isinstance(entry, Mapping):
+                obs = entry.get("observed_until")
+                if isinstance(obs, str) and obs.strip():
+                    return obs.strip()
+    overall_obs = coverage_eval.get("observed_until")
+    if isinstance(overall_obs, str) and overall_obs.strip():
+        return overall_obs.strip()
+    return None
+
+
+def build_person_domain_horizons(
+    *,
+    entity_role: str = "PLAYER",
+    has_registration_records: bool = False,
+    registration_observed_until: Optional[str] = None,
+    registration_source_gap: bool = False,
+    has_season_stats: bool = False,
+    has_game_stats: bool = False,
+    stats_observed_until: Optional[str] = None,
+    game_stats_degraded: bool = False,
+    stats_source_gap: bool = False,
+    has_official_announcements: bool = False,
+    announcements_observed_until: Optional[str] = None,
+    announcements_source_gap: bool = False,
+    coverage_eval: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Build 3-domain independent observation horizon for a person card (REQ-232 P0-2).
+
+    Returns exact keys: ``registration``, ``statistics``, ``official_announcements``,
+    each with ``{status, observed_until, note}``.
+    Degraded statistics NEVER pollute verified registration.
+    """
+    reg_obs = (
+        registration_observed_until.strip()
+        if isinstance(registration_observed_until, str) and registration_observed_until.strip()
+        else _extract_domain_obs_from_eval(
+            coverage_eval, ("domestic_registration", "foreign_registration")
+        )
+    )
+    stats_obs = (
+        stats_observed_until.strip()
+        if isinstance(stats_observed_until, str) and stats_observed_until.strip()
+        else _extract_domain_obs_from_eval(coverage_eval, ("game_stats",))
+    )
+    ann_obs = (
+        announcements_observed_until.strip()
+        if isinstance(announcements_observed_until, str) and announcements_observed_until.strip()
+        else _extract_domain_obs_from_eval(coverage_eval, ("club_announcements",))
+    )
+
+    # 1. Registration domain (isolated from statistics degradation)
+    if has_registration_records:
+        reg_entry = {
+            "status": DomainHorizonStatus.VERIFIED_PRESENT.value,
+            "observed_until": reg_obs,
+            "note": "Registration records verified in local KB.",
+        }
+    elif registration_source_gap:
+        reg_entry = {
+            "status": DomainHorizonStatus.SOURCE_GAP_UNKNOWN.value,
+            "observed_until": reg_obs,
+            "note": "Registration source gap or unavailable.",
+        }
+    elif reg_obs:
+        reg_entry = {
+            "status": DomainHorizonStatus.OBSERVED_EMPTY.value,
+            "observed_until": reg_obs,
+            "note": "Observed through horizon; no registration records found.",
+        }
+    else:
+        reg_entry = {
+            "status": DomainHorizonStatus.SOURCE_GAP_UNKNOWN.value,
+            "observed_until": None,
+            "note": "No registration observation horizon recorded.",
+        }
+
+    # 2. Statistics domain
+    if _is_non_player_role(entity_role):
+        stats_entry = {
+            "status": DomainHorizonStatus.NOT_APPLICABLE.value,
+            "observed_until": None,
+            "note": f"Non-player role ({entity_role}) does not have player boxscore statistics.",
+        }
+    elif game_stats_degraded or stats_source_gap:
+        stats_entry = {
+            "status": DomainHorizonStatus.SOURCE_GAP_UNKNOWN.value,
+            "observed_until": stats_obs,
+            "note": "Statistics source degraded or gap present; isolated from registration domain.",
+        }
+    elif has_season_stats or has_game_stats:
+        stats_entry = {
+            "status": DomainHorizonStatus.VERIFIED_PRESENT.value,
+            "observed_until": stats_obs,
+            "note": "Player statistics verified in local KB.",
+        }
+    elif stats_obs:
+        stats_entry = {
+            "status": DomainHorizonStatus.OBSERVED_EMPTY.value,
+            "observed_until": stats_obs,
+            "note": "Observed through horizon; no player statistics recorded yet.",
+        }
+    else:
+        stats_entry = {
+            "status": DomainHorizonStatus.SOURCE_GAP_UNKNOWN.value,
+            "observed_until": None,
+            "note": "No statistics observation horizon recorded.",
+        }
+
+    # 3. Official announcements domain
+    if has_official_announcements:
+        ann_entry = {
+            "status": DomainHorizonStatus.VERIFIED_PRESENT.value,
+            "observed_until": ann_obs,
+            "note": "Matching official announcements verified.",
+        }
+    elif announcements_source_gap:
+        ann_entry = {
+            "status": DomainHorizonStatus.SOURCE_GAP_UNKNOWN.value,
+            "observed_until": ann_obs,
+            "note": "Official announcements source gap or unavailable.",
+        }
+    elif ann_obs:
+        ann_entry = {
+            "status": DomainHorizonStatus.OBSERVED_EMPTY.value,
+            "observed_until": ann_obs,
+            "note": "Observed through horizon; no matching official announcements.",
+        }
+    else:
+        ann_entry = {
+            "status": DomainHorizonStatus.SOURCE_GAP_UNKNOWN.value,
+            "observed_until": None,
+            "note": "No official announcements observation horizon recorded.",
+        }
+
+    return {
+        "registration": reg_entry,
+        "statistics": stats_entry,
+        "official_announcements": ann_entry,
+    }
+
+
+_SEASON_YEAR_RE = re.compile(r"^(\d{4})")
+
+
+def _parse_season_start_year(season: Any) -> Optional[int]:
+    if not isinstance(season, str):
+        return None
+    m = _SEASON_YEAR_RE.match(season.strip())
+    return int(m.group(1)) if m else None
+
+
+def _is_prior_season(season: str, active_league_season: str) -> bool:
+    s_clean = str(season or "").strip()
+    a_clean = str(active_league_season or "").strip()
+    if not s_clean or not a_clean or s_clean == a_clean:
+        return False
+    s_yr = _parse_season_start_year(s_clean)
+    a_yr = _parse_season_start_year(a_clean)
+    if s_yr is not None and a_yr is not None:
+        return s_yr < a_yr
+    return s_clean < a_clean
+
+
+def assert_unique_current_card_per_person(targets: Any) -> None:
+    """Fail-closed guard ensuring at most one ``研究卡_*_CURRENT.md`` per person (REQ-232 P0-3).
+
+    Accepts either a mapping ``{logical_key: {"name": ...}}`` or a sequence of
+    filenames / paths / dicts. Historical ``*_ARCHIVE.md`` cards are allowed
+    alongside a single active ``*_CURRENT.md`` card.
+    """
+    names: list[str] = []
+    if isinstance(targets, Mapping):
+        for val in targets.values():
+            if isinstance(val, Mapping):
+                raw_name = val.get("name") or val.get("filename") or val.get("path")
+            else:
+                raw_name = val
+            if isinstance(raw_name, (str, Path)) and str(raw_name).strip():
+                names.append(Path(str(raw_name).strip()).name)
+    elif isinstance(targets, (list, tuple, set)):
+        for item in targets:
+            if isinstance(item, Mapping):
+                raw_name = item.get("name") or item.get("filename") or item.get("path")
+            else:
+                raw_name = item
+            if isinstance(raw_name, (str, Path)) and str(raw_name).strip():
+                names.append(Path(str(raw_name).strip()).name)
+
+    seen_by_person: Dict[tuple[str, str], list[str]] = {}
+    for basename in names:
+        if not basename.startswith("研究卡_"):
+            continue
+        if basename.endswith("_PUBLIC_CURRENT.md"):
+            vis_bucket = "public_safe"
+        elif basename.endswith("_CURRENT.md"):
+            vis_bucket = "internal_full"
+        else:
+            continue
+        parts = basename.split("_")
+        if len(parts) < 3 or not parts[1].strip():
+            continue
+        person_key = parts[1].strip()
+        seen_by_person.setdefault((person_key, vis_bucket), []).append(basename)
+
+    for (person_key, _vis), files in sorted(seen_by_person.items()):
+        if len(files) > 1:
+            raise ValueError(
+                f"DUPLICATE_CURRENT_PERSON_CARD:{person_key}:{','.join(sorted(files))}"
+            )
 
 
 def _extract_horizon_csv_fields(
@@ -2419,16 +2680,49 @@ def build_promoted_research_slice_artifacts(
     competition: str = "CBA",
     metric: str = "points_per_game",
     additional_match_types: Sequence[str] = (),
+    active_league_season: Optional[str] = None,
+    enable_v232_card_pipeline: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
     """Build self-describing CURRENT research card, slice, and excerpt artifacts via ConsumeSession."""
     players = fixture["players"]
     records = fixture["stats_records"]
-    passages = fixture["passages"]
+    raw_passages = fixture["passages"]
     fact = fixture.get("fact")
     claims = fixture.get("claims") or []
     source_objects = fixture.get("source_objects") or []
-    if not players or not records or not passages:
+    if not players or not records or not raw_passages:
         raise ValueError("PROMOTED_RESEARCH_SLICE_INPUT_INCOMPLETE")
+
+    passages: list[Dict[str, Any]] = []
+    for raw_p in raw_passages:
+        if not isinstance(raw_p, dict):
+            passages.append(raw_p)
+            continue
+        if raw_p.get("digest_kind") == "KC_PASSAGE_SHA256":
+            passages.append(raw_p)
+            continue
+        p_text = raw_p.get("text")
+        p_digest = raw_p.get("digest")
+        if (
+            isinstance(p_text, str)
+            and (
+                p_digest is None
+                or p_digest == hashlib.sha256(p_text.encode("utf-8")).hexdigest()
+            )
+            and all(raw_p.get(k) for k in ("source_id", "revision", "locator"))
+        ):
+            sealed = build_routed_passage(
+                source_id=str(raw_p["source_id"]),
+                revision=str(raw_p["revision"]),
+                locator=str(raw_p["locator"]),
+                text=p_text,
+                player_uid=raw_p.get("player_uid"),
+                aliases=raw_p.get("aliases"),
+                title=raw_p.get("title"),
+            )
+            passages.append(sealed)
+        else:
+            passages.append(raw_p)
 
     authorized_players = {player_uid}
     authorized_sources = {p["source_id"] for p in passages}
@@ -2570,14 +2864,37 @@ def build_promoted_research_slice_artifacts(
         fact_guarantee=guarantee,
     )
 
-    card_md = session.render_verified(ans, kind="research_card").encode("utf-8")
-    passage_md = session.render_verified(cited, kind="passage").encode("utf-8")
+    is_historical_archive = bool(
+        enable_v232_card_pipeline
+        and active_league_season
+        and _is_prior_season(season, active_league_season)
+    )
+    archive_banner = (
+        f"> [HISTORICAL_SEASON_ARCHIVE] 本文件为 {season} 历史赛季定格档案，"
+        f"非当前活跃赛季（{active_league_season}）主卡\n\n"
+        if is_historical_archive
+        else ""
+    )
+
+    def _maybe_archive_name(filename: str) -> str:
+        if is_historical_archive and filename.endswith("_CURRENT.md"):
+            return filename[: -len("_CURRENT.md")] + "_ARCHIVE.md"
+        return filename
+
+    card_text = session.render_verified(ans, kind="research_card")
+    passage_text = session.render_verified(cited, kind="passage")
+    card_md = (archive_banner + card_text).encode("utf-8")
+    passage_md = (archive_banner + passage_text).encode("utf-8")
 
     pid_slug = _safe_ascii_key(player_id)
     season_slug = _safe_ascii_key(season)
 
-    card_name = research_card_consumer_filename(player_name, player_id, season)
-    passage_name = f"研究摘录_{'_'.join(player_name.split())}_{'_'.join(player_id.split())}_{'_'.join(season.split())}_{'_'.join(passage_label.split())}_CURRENT.md"
+    card_name = _maybe_archive_name(
+        research_card_consumer_filename(player_name, player_id, season)
+    )
+    passage_name = _maybe_archive_name(
+        f"研究摘录_{'_'.join(player_name.split())}_{'_'.join(player_id.split())}_{'_'.join(season.split())}_{'_'.join(passage_label.split())}_CURRENT.md"
+    )
 
     result: Dict[str, Dict[str, Any]] = {
         f"research/card_{pid_slug}_{season_slug}": {
@@ -2597,9 +2914,10 @@ def build_promoted_research_slice_artifacts(
     }
     for mt in ordered_match_types:
         mt_slug = _safe_ascii_key(mt)
-        slice_md = session.render_verified(sliced_by_mt[mt], kind="slice_markdown").encode("utf-8")
+        slice_text = session.render_verified(sliced_by_mt[mt], kind="slice_markdown")
+        slice_md = (archive_banner + slice_text).encode("utf-8")
         result[f"research/slice_{pid_slug}_{season_slug}_{mt_slug}"] = {
-            "name": slice_consumer_filename(player_name, player_id, season, mt),
+            "name": _maybe_archive_name(slice_consumer_filename(player_name, player_id, season, mt)),
             "mime": "text/markdown",
             "mode": "binary",
             "parent_role": "data",

@@ -240,10 +240,37 @@ def _validate_authoritative_release_state(
                     "ARCHIVE_COMPACT_INVALID_RELEASE_STATE:"
                     f"unknown_previous_release_id={prev_str or 'invalid'}"
                 )
-        status_val = release_status.get("status")
-        if not isinstance(status_val, str) or status_val.strip() != "COMPLETE":
+        has_status = "status" in release_status and release_status.get("status") is not None
+        has_state = "state" in release_status and release_status.get("state") is not None
+        status_str = (
+            release_status.get("status").strip()
+            if isinstance(release_status.get("status"), str)
+            else None
+        )
+        state_str = (
+            release_status.get("state").strip()
+            if isinstance(release_status.get("state"), str)
+            else None
+        )
+        if has_status and has_state:
+            if status_str != state_str or status_str != "COMPLETE":
+                raise ArchiveCompactionError(
+                    "ARCHIVE_COMPACT_INVALID_RELEASE_STATE:"
+                    f"status={release_status.get('status')!r},state={release_status.get('state')!r}"
+                )
+        elif has_status:
+            if status_str != "COMPLETE":
+                raise ArchiveCompactionError(
+                    f"ARCHIVE_COMPACT_INVALID_RELEASE_STATE:status={release_status.get('status')!r}"
+                )
+        elif has_state:
+            if state_str != "COMPLETE":
+                raise ArchiveCompactionError(
+                    f"ARCHIVE_COMPACT_INVALID_RELEASE_STATE:state={release_status.get('state')!r}"
+                )
+        else:
             raise ArchiveCompactionError(
-                f"ARCHIVE_COMPACT_INVALID_RELEASE_STATE:status={status_val!r}"
+                "ARCHIVE_COMPACT_INVALID_RELEASE_STATE:status=None"
             )
         has_verified_anchor = True
 
