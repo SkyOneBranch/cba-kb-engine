@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .aliases import format_club_team_display
 from .kc_projection import KcError
@@ -188,17 +188,41 @@ def _is_internal_locator(value: Any) -> bool:
     return False
 
 
+def _public_locator(value: Any) -> Optional[str]:
+    """Return locator only if it is a clean public https:// URL; else None."""
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned or not cleaned.lower().startswith("https://"):
+        return None
+    if _is_internal_locator(cleaned):
+        return None
+    return cleaned
+
+
 def _sanitize_public_free_text(value: Any, *, fallback: str = "-") -> str:
-    """Strip verbatim blockquotes, fenced code blocks, private URIs, and internal IDs for public_safe."""
+    """Strip verbatim blockquotes (including lazy continuations & inline `>`),
+    fenced code blocks, private URIs, and internal IDs for public_safe."""
     if not isinstance(value, str) or not value.strip():
         return fallback
     cleaned = _FENCED_BLOCK_RE.sub("", value)
     cleaned = cleaned.replace("```", "")
     kept_lines: List[str] = []
+    in_blockquote = False
     for raw_line in cleaned.splitlines():
         s = raw_line.strip()
-        if not s or s.startswith(">"):
+        if not s:
+            in_blockquote = False
             continue
+        if s.startswith(">"):
+            in_blockquote = True
+            continue
+        if in_blockquote:
+            continue
+        if ">" in s:
+            s = s.split(">", 1)[0].strip()
+            if not s:
+                continue
         kept_lines.append(s)
     joined = " ".join(kept_lines)
     joined = _PRIVATE_URI_TOKEN_RE.sub("", joined)
@@ -339,10 +363,18 @@ def render_research_card(
         if val is not None:
             lines.append(f"- Metric: {metric} = {val} (latest cutoff)")
         for cr in transparency.get("cutoff_records", []):
-            lines.append(
-                f"  * Cutoff {cr.get('games_played')} games ({cr.get('captured_at') or '-'}): "
-                f"{cr.get('value')} [Locator: {cr.get('locator')}]"
-            )
+            if is_public:
+                pub_loc = _public_locator(cr.get("locator"))
+                loc_part = f" [Locator: {pub_loc}]" if pub_loc else ""
+                lines.append(
+                    f"  * Cutoff {cr.get('games_played')} games ({cr.get('captured_at') or '-'}): "
+                    f"{cr.get('value')}{loc_part}"
+                )
+            else:
+                lines.append(
+                    f"  * Cutoff {cr.get('games_played')} games ({cr.get('captured_at') or '-'}): "
+                    f"{cr.get('value')} [Locator: {cr.get('locator')}]"
+                )
         for sp in transparency.get("scope_splits", []):
             lines.append(
                 f"  * Team Split {sp.get('team_name') or sp.get('team_id')}: "
@@ -353,23 +385,43 @@ def render_research_card(
         for rev in transparency.get("revision_history", []):
             prior_val = rev.get("prior_value")
             new_val = rev.get("new_value")
-            lines.append(
-                f"  * Prior Value: {prior_val} -> New Value: {new_val} "
-                f"(Supersedes: {rev.get('supersedes_record_id')}, Reason: {rev.get('reason')})"
-            )
+            if is_public:
+                safe_reason = _sanitize_public_free_text(rev.get("reason"), fallback="-")
+                lines.append(
+                    f"  * Prior Value: {prior_val} -> New Value: {new_val} "
+                    f"(Reason: {safe_reason})"
+                )
+            else:
+                lines.append(
+                    f"  * Prior Value: {prior_val} -> New Value: {new_val} "
+                    f"(Supersedes: {rev.get('supersedes_record_id')}, Reason: {rev.get('reason')})"
+                )
     elif posture == "DATA_DISCREPANCY":
         delta = transparency.get("delta")
         delta_note = f" (Delta: {delta})" if delta is not None else ""
         lines.append(f"- Discrepancy Detected for Metric: {metric}{delta_note}")
         for d in transparency.get("discrepancies", []):
-            lines.append(
-                f"  * Record {d.get('record_id')}: {d.get('value')} "
-                f"(Kind: {d.get('record_kind')}, Games: {d.get('games_played')}, Locator: {d.get('locator')})"
-            )
+            if is_public:
+                pub_loc = _public_locator(d.get("locator"))
+                loc_part = f", Locator: {pub_loc}" if pub_loc else ""
+                lines.append(
+                    f"  * Observed Value: {d.get('value')} "
+                    f"(Kind: {d.get('record_kind')}, Games: {d.get('games_played')}{loc_part})"
+                )
+            else:
+                lines.append(
+                    f"  * Record {d.get('record_id')}: {d.get('value')} "
+                    f"(Kind: {d.get('record_kind')}, Games: {d.get('games_played')}, Locator: {d.get('locator')})"
+                )
     elif posture == "TRUE_CONFLICT":
         lines.append(f"- Irreconcilable Conflict for Metric: {metric}")
         for d in transparency.get("discrepancies", []):
-            lines.append(f"  * Record {d.get('record_id')}: {d.get('value')} (Locator: {d.get('locator')})")
+            if is_public:
+                pub_loc = _public_locator(d.get("locator"))
+                loc_part = f" (Locator: {pub_loc})" if pub_loc else ""
+                lines.append(f"  * Observed Value: {d.get('value')}{loc_part}")
+            else:
+                lines.append(f"  * Record {d.get('record_id')}: {d.get('value')} (Locator: {d.get('locator')})")
     elif posture == "SINGLE_SOURCE_UNCORROBORATED":
         lines.append(f"- Metric: {metric} = {val}")
         lines.append("- Note: Single source uncorroborated")
@@ -476,7 +528,11 @@ def render_research_card(
                     rev_note = " [LOUD_REVISION]"
                 url_part = f" ({url})" if url else ""
                 if is_public:
-                    pub_title = _sanitize_public_free_text(cite.get("title"), fallback="-")
+                    raw_cite_title = str(cite.get("title") or "").strip()
+                    raw_cite_doc_id = str(cite.get("doc_id") or "").strip()
+                    if raw_cite_doc_id and raw_cite_title == raw_cite_doc_id:
+                        raw_cite_title = ""
+                    pub_title = _sanitize_public_free_text(raw_cite_title, fallback="-")
                     lines.append(
                         f"  * [{tier}] ({comp}, {pub}) {pub_title}{url_part}{rev_note}"
                     )

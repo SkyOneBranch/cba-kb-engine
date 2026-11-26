@@ -1116,11 +1116,10 @@ def _match_document_bundles(
             if doc_id:
                 seen_ids.add(doc_id)
             raw_title = str(b.get("title") or "").strip()
-            safe_title = (
-                (raw_title or "-")
-                if visibility == "public_safe"
-                else (raw_title or doc_id or "-")
-            )
+            if visibility == "public_safe":
+                safe_title = "-" if (not raw_title or (doc_id and raw_title == doc_id)) else raw_title
+            else:
+                safe_title = raw_title or doc_id or "-"
             matched.append({
                 "doc_id": doc_id or "-",
                 "source_tier": b.get("source_tier") or "T2",

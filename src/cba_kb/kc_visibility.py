@@ -164,7 +164,7 @@ _HISTORICAL_ARCHIVE_BANNER_PREFIX = "> [HISTORICAL_SEASON_ARCHIVE] "
 def _is_public_safe_drive_like_token(token: str, is_raw_drive_token_fn: Any) -> bool:
     if is_raw_drive_token_fn(token):
         return True
-    if len(token) >= 27 and token.count("_") <= 1 and token.count("-") <= 1:
+    if len(token) >= 25 and token.count("_") <= 2 and token.count("-") <= 2:
         upper_count = sum(1 for c in token if c.isupper())
         lower_count = sum(1 for c in token if c.islower())
         if upper_count >= 2 and lower_count >= 2:
