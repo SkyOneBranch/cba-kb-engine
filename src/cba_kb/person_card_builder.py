@@ -911,8 +911,8 @@ def _build_season_stats_table_rows(
         core_metrics = {col: rec_metrics.get(col) for col in CORE_SEASON_STATS_COLUMNS}
         rows.append({
             "season": str(rec.get("season") or ""),
-            "match_type": str(rec.get("match_type") or "REGULAR"),
-            "scope": str(rec.get("scope") or "WHOLE_SEASON"),
+            "match_type": str(rec.get("match_type") or "").strip() or "UNKNOWN",
+            "scope": str(rec.get("scope") or "").strip() or "UNKNOWN",
             "team_id": rec.get("team_id"),
             "team_name": rec.get("team_name"),
             "record_id": rec.get("record_id"),
@@ -973,6 +973,7 @@ def _match_document_bundles(
     document_bundles: Sequence[Dict[str, Any]],
     *,
     roster_candidates: Optional[Sequence[Dict[str, Any]]] = None,
+    visibility: str = "internal_full",
 ) -> List[Dict[str, Any]]:
     tokens = _person_match_tokens(person)
     id_tokens = {
@@ -1114,12 +1115,18 @@ def _match_document_bundles(
         if hit:
             if doc_id:
                 seen_ids.add(doc_id)
+            raw_title = str(b.get("title") or "").strip()
+            safe_title = (
+                (raw_title or "-")
+                if visibility == "public_safe"
+                else (raw_title or doc_id or "-")
+            )
             matched.append({
                 "doc_id": doc_id or "-",
                 "source_tier": b.get("source_tier") or "T2",
                 "completeness": b.get("completeness") or "full",
                 "published_at": b.get("published_at"),
-                "title": b.get("title") or doc_id or "-",
+                "title": safe_title,
                 "canonical_url": b.get("canonical_url"),
                 "disclosure_posture": b.get("disclosure_posture"),
             })
@@ -1232,7 +1239,9 @@ def build_person_card(
         if doc_bundles
         else None
     )
-    citations = _match_document_bundles(person, doc_bundles, roster_candidates=roster_pool)
+    citations = _match_document_bundles(
+        person, doc_bundles, roster_candidates=roster_pool, visibility=vis
+    )
 
     player_name = str(person.get("player_name") or query.strip())
     player_id = person.get("player_id") or person.get("player_uid") or "unassigned"

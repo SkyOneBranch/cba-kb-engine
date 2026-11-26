@@ -149,6 +149,15 @@ def _render_season_stats_table_lines(
     return table_lines
 
 
+_TEN_SOURCES_RE = re.compile(r"10[\s_-]+sources", re.IGNORECASE)
+_FENCED_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
+_INTERNAL_ID_TOKEN_RE = re.compile(
+    r"(?:\bdoc:[A-Za-z0-9_.:-]+|\b(?:prior_doc_id|new_doc_id|prior_record_id|new_record_id|doc_id)\s*[:=]\s*[^\s,;)\]]+|\b(?:prior_doc_id|new_doc_id|prior_record_id|new_record_id)\b)",
+    re.IGNORECASE,
+)
+_PRIVATE_URI_TOKEN_RE = re.compile(r"(?:r2|s3|file)://[^\s)\]<>\"']+", re.IGNORECASE)
+
+
 def _is_public_safe_citation(cite: Dict[str, Any]) -> bool:
     if not isinstance(cite, dict):
         return False
@@ -159,8 +168,10 @@ def _is_public_safe_citation(cite: Dict[str, Any]) -> bool:
     if not (url.startswith("https://") or url.startswith("http://")):
         return False
     combined = f"{cite.get('title') or ''}\n{url}"
-    for marker in ("10_sources", "Web 剪藏", "r2://", "s3://", "file:///"):
-        if marker.lower() in combined.lower():
+    if _TEN_SOURCES_RE.search(combined):
+        return False
+    for marker in ("web 剪藏", "r2://", "s3://", "file://"):
+        if marker in combined.lower():
             return False
     return True
 
@@ -168,11 +179,34 @@ def _is_public_safe_citation(cite: Dict[str, Any]) -> bool:
 def _is_internal_locator(value: Any) -> bool:
     if not isinstance(value, str) or not value.strip():
         return False
+    if _TEN_SOURCES_RE.search(value):
+        return True
     low = value.lower()
-    for marker in ("doc:", "10_sources", "web 剪藏", "r2://", "s3://", "file:///"):
+    for marker in ("doc:", "doc_id:", "web 剪藏", "r2://", "s3://", "file://"):
         if marker in low:
             return True
     return False
+
+
+def _sanitize_public_free_text(value: Any, *, fallback: str = "-") -> str:
+    """Strip verbatim blockquotes, fenced code blocks, private URIs, and internal IDs for public_safe."""
+    if not isinstance(value, str) or not value.strip():
+        return fallback
+    cleaned = _FENCED_BLOCK_RE.sub("", value)
+    cleaned = cleaned.replace("```", "")
+    kept_lines: List[str] = []
+    for raw_line in cleaned.splitlines():
+        s = raw_line.strip()
+        if not s or s.startswith(">"):
+            continue
+        kept_lines.append(s)
+    joined = " ".join(kept_lines)
+    joined = _PRIVATE_URI_TOKEN_RE.sub("", joined)
+    joined = _INTERNAL_ID_TOKEN_RE.sub("", joined)
+    joined = _TEN_SOURCES_RE.sub("", joined)
+    joined = re.sub(r"web\s*剪藏", "", joined, flags=re.IGNORECASE)
+    joined = " ".join(joined.split())
+    return joined or fallback
 
 
 def render_research_card(
@@ -382,10 +416,16 @@ def render_research_card(
             f"- Claim Posture: {c_posture}",
         ])
         for rev in claim_trans.get("revision_history", []):
-            lines.append(
-                f"  * Claim {rev.get('claim_id')} ({rev.get('status')}): "
-                f"{rev.get('statement')} [prior: {rev.get('prior_claim_id')}]"
-            )
+            if is_public:
+                safe_stmt = _sanitize_public_free_text(rev.get("statement"))
+                lines.append(
+                    f"  * Claim ({rev.get('status')}): {safe_stmt}"
+                )
+            else:
+                lines.append(
+                    f"  * Claim {rev.get('claim_id')} ({rev.get('status')}): "
+                    f"{rev.get('statement')} [prior: {rev.get('prior_claim_id')}]"
+                )
 
     # 3. Document Passage Section (strictly stripped under visibility="public_safe")
     if not is_public and isinstance(doc_layer, dict) and doc_layer.get("verbatim"):
@@ -429,7 +469,6 @@ def render_research_card(
                 tier = cite.get("source_tier") or "UNKNOWN"
                 comp = cite.get("completeness") or "unknown"
                 pub = cite.get("published_at") or "-"
-                title_str = cite.get("title") or cite.get("doc_id") or "-"
                 doc_id = cite.get("doc_id") or "-"
                 url = cite.get("canonical_url") or ""
                 rev_note = ""
@@ -437,10 +476,12 @@ def render_research_card(
                     rev_note = " [LOUD_REVISION]"
                 url_part = f" ({url})" if url else ""
                 if is_public:
+                    pub_title = _sanitize_public_free_text(cite.get("title"), fallback="-")
                     lines.append(
-                        f"  * [{tier}] ({comp}, {pub}) {title_str}{url_part}{rev_note}"
+                        f"  * [{tier}] ({comp}, {pub}) {pub_title}{url_part}{rev_note}"
                     )
                 else:
+                    title_str = cite.get("title") or cite.get("doc_id") or "-"
                     lines.append(
                         f"  * [{tier}] ({comp}, {pub}) {title_str} — {doc_id}{url_part}{rev_note}"
                     )
@@ -458,13 +499,20 @@ def render_research_card(
             if not isinstance(rev, dict):
                 continue
             posture_label = rev.get("disclosure_posture") or "LOUD_REVISION"
-            prior_id = rev.get("prior_doc_id") or rev.get("prior_record_id") or "-"
-            new_id = rev.get("new_doc_id") or rev.get("new_record_id") or "-"
             seq = rev.get("revision_seq") or "-"
-            notice = rev.get("disclosure_notice") or (
-                f"Document revision {seq}: {new_id} supersedes {prior_id}"
-            )
-            lines.append(f"- [{posture_label}] {notice}")
+            if is_public:
+                safe_notice = _sanitize_public_free_text(
+                    rev.get("disclosure_notice"),
+                    fallback=f"Document revision {seq} recorded",
+                )
+                lines.append(f"- [{posture_label}] {safe_notice}")
+            else:
+                prior_id = rev.get("prior_doc_id") or rev.get("prior_record_id") or "-"
+                new_id = rev.get("new_doc_id") or rev.get("new_record_id") or "-"
+                notice = rev.get("disclosure_notice") or (
+                    f"Document revision {seq}: {new_id} supersedes {prior_id}"
+                )
+                lines.append(f"- [{posture_label}] {notice}")
 
     # 6. Registration & Identity Profile Section (REQ-223 P0-3/P0-4: optional, lossless)
     reg_profile = payload.get("registration_profile")
@@ -666,9 +714,15 @@ def render_research_card(
                 if not isinstance(grev, dict):
                     continue
                 g_posture = grev.get("disclosure_posture") or "LOUD_REVISION"
-                g_notice = grev.get("disclosure_notice") or (
-                    f"{grev.get('new_record_id')} supersedes {grev.get('prior_record_id')}"
-                )
+                if is_public:
+                    g_notice = _sanitize_public_free_text(
+                        grev.get("disclosure_notice"),
+                        fallback="Single-game record revised",
+                    )
+                else:
+                    g_notice = grev.get("disclosure_notice") or (
+                        f"{grev.get('new_record_id')} supersedes {grev.get('prior_record_id')}"
+                    )
                 lines.append(f"- [{g_posture}] {g_notice}")
     elif (
         isinstance(payload.get("single_game_stats_gap"), dict)

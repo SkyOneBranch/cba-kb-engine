@@ -364,6 +364,8 @@ def _is_non_player_role(entity_role: Optional[str]) -> bool:
         return False
     raw = entity_role.strip()
     upper = raw.upper()
+    if "PLAYER" in upper or "球员" in raw:
+        return False
     if raw in _NON_PLAYER_ENTITY_ROLES or upper in _NON_PLAYER_ENTITY_ROLES:
         return True
     if "COACH" in upper or "教练" in raw:
