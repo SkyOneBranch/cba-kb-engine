@@ -16,6 +16,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
@@ -844,14 +845,62 @@ def _season_stats_sort_key(rec: Dict[str, Any]) -> tuple[int, int, str, str]:
     return (mt_rank, sc_rank, team_key, rec_id)
 
 
+def _extract_provider_player_ids(
+    person: Mapping[str, Any],
+    extra_ids: Sequence[str] = (),
+) -> set[str]:
+    """Extract normalized provider player IDs for exact homonym-safe stats matching."""
+    ids: set[str] = set()
+    for single_key in ("player_id", "provider_player_id"):
+        val = _norm_key(person.get(single_key))
+        if val:
+            ids.add(val)
+    raw_multi = person.get("provider_player_ids")
+    if isinstance(raw_multi, Sequence) and not isinstance(raw_multi, (str, bytes)):
+        for item in raw_multi:
+            val = _norm_key(item)
+            if val:
+                ids.add(val)
+    for item in extra_ids or ():
+        val = _norm_key(item)
+        if val:
+            ids.add(val)
+    return ids
+
+
+def _stats_record_matches_person(
+    rec: Mapping[str, Any],
+    *,
+    uids: set[str],
+    provider_ids: set[str],
+    pname: str,
+) -> bool:
+    """Exact ID-first stats matching with zero homonym cross-contamination (REQ-242 P0-E1)."""
+    r_uid = _norm_key(rec.get("player_uid"))
+    r_pid = _norm_key(rec.get("provider_player_id") or rec.get("player_id"))
+    r_name = _norm_key(rec.get("player_name"))
+
+    if provider_ids:
+        if r_pid and r_pid in provider_ids:
+            return True
+        if uids and r_uid in uids and (not r_pid or r_pid in provider_ids):
+            return True
+        return False
+    if uids:
+        return bool(r_uid and r_uid in uids)
+    return bool(pname and r_name == pname)
+
+
 def _match_season_stats(
     person: Dict[str, Any],
     season_stats_records: Sequence[Dict[str, Any]],
     *,
     season: str,
+    provider_player_ids: Sequence[str] = (),
 ) -> List[Dict[str, Any]]:
-    uid = _norm_key(person.get("player_uid"))
-    pid = _norm_key(person.get("player_id"))
+    uids = {_norm_key(person.get("player_uid"))}
+    uids.discard("")
+    provider_ids = _extract_provider_player_ids(person, provider_player_ids)
     pname = _norm_key(person.get("player_name"))
 
     matched: List[Dict[str, Any]] = []
@@ -860,10 +909,7 @@ def _match_season_stats(
             continue
         if season and rec.get("season") and str(rec["season"]) != str(season):
             continue
-        r_uid = _norm_key(rec.get("player_uid"))
-        r_pid = _norm_key(rec.get("provider_player_id"))
-        r_name = _norm_key(rec.get("player_name"))
-        if (uid and r_uid == uid) or (pid and r_pid == pid) or (not uid and not pid and pname and r_name == pname):
+        if _stats_record_matches_person(rec, uids=uids, provider_ids=provider_ids, pname=pname):
             matched.append(rec)
     matched.sort(key=_season_stats_sort_key)
     return matched
@@ -874,10 +920,12 @@ def _match_prior_season_stats(
     season_stats_records: Sequence[Dict[str, Any]],
     *,
     target_season: str,
+    provider_player_ids: Sequence[str] = (),
 ) -> tuple[Optional[str], List[Dict[str, Any]]]:
     """Find the latest prior season (< target_season) stats records for a resolved person."""
-    uid = _norm_key(person.get("player_uid"))
-    pid = _norm_key(person.get("player_id"))
+    uids = {_norm_key(person.get("player_uid"))}
+    uids.discard("")
+    provider_ids = _extract_provider_player_ids(person, provider_player_ids)
     pname = _norm_key(person.get("player_name"))
 
     by_season: Dict[str, List[Dict[str, Any]]] = {}
@@ -887,10 +935,7 @@ def _match_prior_season_stats(
         rec_season = str(rec.get("season") or "").strip()
         if not rec_season or not _is_prior_season(rec_season, target_season):
             continue
-        r_uid = _norm_key(rec.get("player_uid"))
-        r_pid = _norm_key(rec.get("provider_player_id"))
-        r_name = _norm_key(rec.get("player_name"))
-        if (uid and r_uid == uid) or (pid and r_pid == pid) or (not uid and not pid and pname and r_name == pname):
+        if _stats_record_matches_person(rec, uids=uids, provider_ids=provider_ids, pname=pname):
             by_season.setdefault(rec_season, []).append(rec)
 
     if not by_season:
@@ -1013,34 +1058,51 @@ def _compute_career_summary(rows: Sequence[Mapping[str, Any]]) -> Optional[Dict[
     return summary
 
 
+def _compute_season_span(seasons_seen: set[str]) -> Optional[str]:
+    if not seasons_seen:
+        return None
+    start_years: List[int] = []
+    end_years: List[int] = []
+    for s in seasons_seen:
+        m = re.match(r"^\s*(\d{4})\s*[-–—/]\s*(\d{4})\s*$", s)
+        if m:
+            start_years.append(int(m.group(1)))
+            end_years.append(int(m.group(2)))
+        else:
+            sy = _parse_season_start_year(s)
+            if sy is not None:
+                start_years.append(sy)
+                end_years.append(sy + 1)
+    if not start_years or not end_years:
+        return None
+    return f"{min(start_years)}–{max(end_years)}"
+
+
 def build_career_season_stats_tables(
     person: Mapping[str, Any],
     season_stats_records: Sequence[Mapping[str, Any]],
     *,
     linked_player_uids: Sequence[str] = (),
+    provider_player_ids: Sequence[str] = (),
+    career_coverage_mode: Optional[str] = None,
+    observed_until: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Assemble multi-season Regular Season + Playoffs career tables with Chinese team names
-    and zero double-counting between WHOLE_SEASON and TEAM_SPLIT rows (REQ-241 P0-2)."""
+    """Assemble multi-season Regular Season + Playoffs career tables with Chinese team names,
+    exact `provider_player_ids` matching, honest coverage metadata, and zero double-counting
+    between WHOLE_SEASON and TEAM_SPLIT rows (REQ-241 P0-2, REQ-242 P0-E1)."""
     uids = {
         _norm_key(person.get("player_uid")),
         *(_norm_key(u) for u in (linked_player_uids or ())),
     }
     uids.discard("")
-    pid = _norm_key(person.get("player_id"))
+    provider_ids = _extract_provider_player_ids(person, provider_player_ids)
     pname = _norm_key(person.get("player_name") or person.get("canonical_name"))
 
     matched: List[Dict[str, Any]] = []
     for rec in season_stats_records or ():
         if not isinstance(rec, Mapping):
             continue
-        r_uid = _norm_key(rec.get("player_uid"))
-        r_pid = _norm_key(rec.get("provider_player_id") or rec.get("player_id"))
-        r_name = _norm_key(rec.get("player_name"))
-        if (
-            (uids and r_uid in uids)
-            or (pid and r_pid == pid)
-            or (not uids and not pid and pname and r_name == pname)
-        ):
+        if _stats_record_matches_person(rec, uids=uids, provider_ids=provider_ids, pname=pname):
             matched.append(dict(rec))
 
     def _career_sort_key(rec: Mapping[str, Any]) -> tuple[int, str, int, str, str]:
@@ -1055,6 +1117,7 @@ def build_career_season_stats_tables(
     regular_rows: List[Dict[str, Any]] = []
     playoffs_rows: List[Dict[str, Any]] = []
     seasons_seen: set[str] = set()
+    captured_dates: List[str] = []
 
     for rec in sorted(matched, key=_career_sort_key):
         s_str = str(rec.get("season") or "").strip()
@@ -1084,6 +1147,12 @@ def build_career_season_stats_tables(
         if s_str:
             seasons_seen.add(s_str)
 
+        cap_at = prov.get("captured_at")
+        if isinstance(cap_at, str) and len(cap_at.strip()) >= 10:
+            date_prefix = cap_at.strip()[:10]
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_prefix):
+                captured_dates.append(date_prefix)
+
         row_obj: Dict[str, Any] = {
             "season": s_str,
             "match_type": mt_raw,
@@ -1091,11 +1160,25 @@ def build_career_season_stats_tables(
             "team_id": raw_tid,
             "team_name": resolved_team_name,
             "record_id": rec.get("record_id"),
-            "captured_at": prov.get("captured_at"),
+            "captured_at": cap_at,
             "locator": prov.get("locator") or rec.get("record_id"),
             "metrics": core_metrics,
         }
         bucket.append(row_obj)
+
+    raw_mode = str(
+        career_coverage_mode
+        or person.get("career_coverage_mode")
+        or ""
+    ).strip().upper()
+    effective_mode = (
+        "FULL_CBA_CAREER" if raw_mode == "FULL_CBA_CAREER" else "PARTIAL_SEASONS_OBSERVED"
+    )
+    effective_as_of: Optional[str] = None
+    if isinstance(observed_until, str) and observed_until.strip():
+        effective_as_of = observed_until.strip()[:10]
+    elif captured_dates:
+        effective_as_of = max(captured_dates)
 
     return {
         "regular_season_rows": regular_rows,
@@ -1103,6 +1186,11 @@ def build_career_season_stats_tables(
         "regular_career_summary": _compute_career_summary(regular_rows),
         "playoffs_career_summary": _compute_career_summary(playoffs_rows),
         "seasons_count": len(seasons_seen),
+        "season_span": _compute_season_span(seasons_seen),
+        "career_coverage_mode": effective_mode,
+        "career_stats_completeness": effective_mode,
+        "observed_until": effective_as_of,
+        "career_stats_as_of": effective_as_of,
     }
 
 
@@ -1111,9 +1199,11 @@ def _match_game_stats(
     game_stats_records: Sequence[Dict[str, Any]],
     *,
     season: str,
+    provider_player_ids: Sequence[str] = (),
 ) -> List[Dict[str, Any]]:
-    uid = _norm_key(person.get("player_uid"))
-    pid = _norm_key(person.get("player_id"))
+    uids = {_norm_key(person.get("player_uid"))}
+    uids.discard("")
+    provider_ids = _extract_provider_player_ids(person, provider_player_ids)
     pname = _norm_key(person.get("player_name"))
 
     matched: List[Dict[str, Any]] = []
@@ -1122,10 +1212,7 @@ def _match_game_stats(
             continue
         if season and rec.get("season") and str(rec["season"]) != str(season):
             continue
-        r_uid = _norm_key(rec.get("player_uid"))
-        r_pid = _norm_key(rec.get("provider_player_id"))
-        r_name = _norm_key(rec.get("player_name"))
-        if (uid and r_uid == uid) or (pid and r_pid == pid) or (not uid and not pid and pname and r_name == pname):
+        if _stats_record_matches_person(rec, uids=uids, provider_ids=provider_ids, pname=pname):
             matched.append(rec)
     return matched
 
@@ -1509,6 +1596,7 @@ def build_person_card(
                 "person_uid": pr_person.get("person_uid"),
                 "player_uid": linked_uids[0] if linked_uids else None,
                 "player_id": None,
+                "provider_player_ids": list(pr_person.get("provider_player_ids") or []),
                 "player_name": pr_person.get("canonical_name") or query.strip(),
                 "player_name_en": None,
                 "aliases": list(pr_person.get("aliases") or []),
@@ -1800,14 +1888,22 @@ def build_person_card(
             payload["encyclopedia_clues"] = list(encyclopedia_clues)
 
     if style == "wiki_v241":
-        # Resolve bio_profile
+        # Resolve bio_profile (enforce P0-E6 v2 provenance gate fail-closed)
         if bio_profile is not None:
             if hasattr(bio_profile, "to_dict") and callable(bio_profile.to_dict):
                 resolved_bio = dict(bio_profile.to_dict())
             elif isinstance(bio_profile, Mapping):
                 resolved_bio = dict(bio_profile)
         elif isinstance(person_bio_profiles, Mapping):
-            raw_profiles = person_bio_profiles.get("profiles") or ()
+            from .person_registry import (
+                PERSON_BIO_PROFILE_V2_SCHEMA,
+                validate_person_bio_profiles,
+            )
+
+            bio_bundle: Mapping[str, Any] = person_bio_profiles
+            if person_bio_profiles.get("schema") == PERSON_BIO_PROFILE_V2_SCHEMA:
+                bio_bundle = validate_person_bio_profiles(person_bio_profiles, strict=True)
+            raw_profiles = bio_bundle.get("profiles") or ()
             for prof in raw_profiles:
                 pd = (
                     dict(prof.to_dict())
@@ -1823,13 +1919,32 @@ def build_person_card(
                     resolved_bio = pd
                     break
         if resolved_bio is not None:
+            if vis == "public_safe":
+                resolved_bio = {
+                    k: v
+                    for k, v in resolved_bio.items()
+                    if k not in ("provenance", "attribute_provenance")
+                }
             payload["bio_profile"] = resolved_bio
 
-        linked_uids = tuple(
-            (payload.get("unified_profile") or {}).get("linked_player_uids") or ()
+        unified_map = payload.get("unified_profile") if isinstance(payload.get("unified_profile"), Mapping) else {}
+        linked_uids = tuple(unified_map.get("linked_player_uids") or ())
+        unified_provider_ids = tuple(unified_map.get("provider_player_ids") or ())
+        bio_coverage_mode = (
+            resolved_bio.get("career_coverage_mode")
+            if isinstance(resolved_bio, Mapping)
+            else None
+        )
+        career_obs_until = stats_obs_until or (
+            obs_horizon.get("observed_until") if isinstance(obs_horizon, Mapping) else None
         )
         career_season_stats = build_career_season_stats_tables(
-            person, s_stats, linked_player_uids=linked_uids
+            person,
+            s_stats,
+            linked_player_uids=linked_uids,
+            provider_player_ids=unified_provider_ids,
+            career_coverage_mode=bio_coverage_mode,
+            observed_until=career_obs_until,
         )
         payload["career_season_stats"] = career_season_stats
 

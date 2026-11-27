@@ -17,7 +17,13 @@ from .player_identity import normalize_name
 
 PERSON_REGISTRY_SCHEMA = "cba-kb.person-registry.v1"
 PERSON_BIO_PROFILES_SCHEMA = "cba-kb.person-bio-profiles.v1"
+PERSON_BIO_PROFILE_V2_SCHEMA = "cba-kb.person-bio-profile.v2"
+VALID_PERSON_BIO_PROFILES_SCHEMAS = frozenset({
+    PERSON_BIO_PROFILES_SCHEMA,
+    PERSON_BIO_PROFILE_V2_SCHEMA,
+})
 PERSON_UID_RE = re.compile(r"PERS-[A-Za-z0-9_-]{8,64}\Z")
+_SHA256_64_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}\Z")
 
 PLAYER_ROLES = frozenset({"PLAYER"})
 COACH_ROLES = frozenset({
@@ -122,6 +128,7 @@ class PersonProfile:
     canonical_name: str
     aliases: Tuple[str, ...] = ()
     linked_player_uids: Tuple[str, ...] = ()
+    provider_player_ids: Tuple[str, ...] = ()
     role_tenures: Tuple[RoleTenure, ...] = ()
     record_links: Tuple[Dict[str, Any], ...] = ()
     birth_year: Optional[int] = None
@@ -138,6 +145,17 @@ class PersonProfile:
             "linked_player_uids",
             _clean_str_tuple(self.linked_player_uids, "LINKED_PLAYER_UIDS"),
         )
+        raw_pids = self.provider_player_ids
+        if raw_pids is None:
+            cleaned_pids: Tuple[str, ...] = ()
+        elif isinstance(raw_pids, (str, bytes)) or not isinstance(raw_pids, Sequence):
+            raise PersonRegistryError("PROVIDER_PLAYER_IDS_SEQUENCE_REQUIRED")
+        else:
+            cleaned_pids = tuple(
+                _clean_required_str(str(item), "PROVIDER_PLAYER_IDS_ITEM")
+                for item in raw_pids
+            )
+        object.__setattr__(self, "provider_player_ids", cleaned_pids)
         if isinstance(self.role_tenures, (str, bytes)) or not isinstance(
             self.role_tenures, Sequence
         ):
@@ -170,7 +188,7 @@ class PersonProfile:
         object.__setattr__(self, "status", _clean_required_str(self.status, "STATUS"))
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        out: Dict[str, Any] = {
             "person_uid": self.person_uid,
             "canonical_name": self.canonical_name,
             "aliases": list(self.aliases),
@@ -180,6 +198,9 @@ class PersonProfile:
             "birth_year": self.birth_year,
             "status": self.status,
         }
+        if self.provider_player_ids:
+            out["provider_player_ids"] = list(self.provider_player_ids)
+        return out
 
 
 def _tenure_from_mapping(item: Mapping[str, Any]) -> RoleTenure:
@@ -206,6 +227,7 @@ def _normalize_person_entry(entry: PersonProfile | Mapping[str, Any]) -> Dict[st
         canonical_name=entry.get("canonical_name", ""),
         aliases=tuple(entry.get("aliases") or ()),
         linked_player_uids=tuple(entry.get("linked_player_uids") or ()),
+        provider_player_ids=tuple(entry.get("provider_player_ids") or ()),
         role_tenures=tuple(entry.get("role_tenures") or ()),
         record_links=tuple(entry.get("record_links") or ()),
         birth_year=entry.get("birth_year"),
@@ -420,6 +442,7 @@ def unify_player_and_coach_profile(
         "canonical_name": target["canonical_name"],
         "aliases": list(target["aliases"]),
         "linked_player_uids": list(target["linked_player_uids"]),
+        "provider_player_ids": list(target.get("provider_player_ids") or []),
         "role_tenures": sorted_tenures,
         "has_player_tenure": has_player_tenure,
         "has_coach_tenure": has_coach_tenure,
@@ -470,6 +493,11 @@ class PersonBioProfile:
     honors: Tuple[str, ...] = ()
     evidence_refs: Tuple[Any, ...] = ()
     review_status: str = "VERIFIED"
+    alma_mater: Optional[str] = None
+    roster_status: Optional[str] = None
+    career_coverage_mode: Optional[str] = None
+    provenance: Optional[Dict[str, Any]] = None
+    attribute_provenance: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "person_uid", _validate_pers_uid(self.person_uid))
@@ -516,9 +544,35 @@ class PersonBioProfile:
         object.__setattr__(
             self, "review_status", _clean_required_str(self.review_status, "REVIEW_STATUS")
         )
+        object.__setattr__(
+            self, "alma_mater", _clean_optional_str(self.alma_mater, "ALMA_MATER")
+        )
+        object.__setattr__(
+            self, "roster_status", _clean_optional_str(self.roster_status, "ROSTER_STATUS")
+        )
+        object.__setattr__(
+            self,
+            "career_coverage_mode",
+            _clean_optional_str(self.career_coverage_mode, "CAREER_COVERAGE_MODE"),
+        )
+        if self.provenance is not None:
+            if not isinstance(self.provenance, Mapping):
+                raise PersonRegistryError("PROVENANCE_OBJECT_REQUIRED")
+            object.__setattr__(self, "provenance", dict(self.provenance))
+        if self.attribute_provenance is not None:
+            if not isinstance(self.attribute_provenance, Mapping):
+                raise PersonRegistryError("ATTRIBUTE_PROVENANCE_OBJECT_REQUIRED")
+            object.__setattr__(
+                self,
+                "attribute_provenance",
+                {
+                    str(k): (dict(v) if isinstance(v, Mapping) else v)
+                    for k, v in self.attribute_provenance.items()
+                },
+            )
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        out: Dict[str, Any] = {
             "person_uid": self.person_uid,
             "canonical_name": self.canonical_name,
             "english_name": self.english_name,
@@ -538,6 +592,35 @@ class PersonBioProfile:
             ],
             "review_status": self.review_status,
         }
+        if self.alma_mater is not None:
+            out["alma_mater"] = self.alma_mater
+        if self.roster_status is not None:
+            out["roster_status"] = self.roster_status
+        if self.career_coverage_mode is not None:
+            out["career_coverage_mode"] = self.career_coverage_mode
+        if self.provenance is not None:
+            out["provenance"] = dict(self.provenance)
+        if self.attribute_provenance is not None:
+            out["attribute_provenance"] = {
+                k: (dict(v) if isinstance(v, Mapping) else v)
+                for k, v in self.attribute_provenance.items()
+            }
+        return out
+
+
+def _validate_provenance_record(prov: Any, label: str) -> None:
+    """Enforce REQ-242 P0-E6 provenance invariant: 64-hex raw_sha256 + source anchor."""
+    if not isinstance(prov, Mapping):
+        raise PersonRegistryError(f"BIO_PROVENANCE_MISSING:{label}")
+    raw_sha = prov.get("raw_sha256")
+    if not isinstance(raw_sha, str) or not _SHA256_64_HEX_RE.fullmatch(raw_sha.strip()):
+        raise PersonRegistryError(f"BIO_PROVENANCE_INVALID_SHA256:{label}")
+    source_url = prov.get("source_url")
+    bundle_id = prov.get("bundle_id")
+    has_url = isinstance(source_url, str) and bool(source_url.strip())
+    has_bundle = isinstance(bundle_id, str) and bool(bundle_id.strip())
+    if not (has_url or has_bundle):
+        raise PersonRegistryError(f"BIO_PROVENANCE_MISSING_ANCHOR:{label}")
 
 
 def _normalize_bio_profile_entry(entry: PersonBioProfile | Mapping[str, Any]) -> Dict[str, Any]:
@@ -562,6 +645,11 @@ def _normalize_bio_profile_entry(entry: PersonBioProfile | Mapping[str, Any]) ->
         honors=tuple(entry.get("honors") or ()),
         evidence_refs=tuple(entry.get("evidence_refs") or ()),
         review_status=entry.get("review_status", "VERIFIED"),
+        alma_mater=entry.get("alma_mater"),
+        roster_status=entry.get("roster_status"),
+        career_coverage_mode=entry.get("career_coverage_mode"),
+        provenance=entry.get("provenance"),
+        attribute_provenance=entry.get("attribute_provenance"),
     )
     return profile.to_dict()
 
@@ -571,7 +659,7 @@ def make_person_bio_profiles(
     *,
     schema: str = PERSON_BIO_PROFILES_SCHEMA,
 ) -> Dict[str, Any]:
-    """Build and validate a `cba-kb.person-bio-profiles.v1` dictionary."""
+    """Build and validate a person bio profiles dictionary (v1 or v2)."""
     if isinstance(profiles, (str, bytes)) or not isinstance(profiles, Sequence):
         raise PersonRegistryError("BIO_PROFILES_SEQUENCE_REQUIRED")
     raw_profiles = [
@@ -583,14 +671,23 @@ def make_person_bio_profiles(
     return validate_person_bio_profiles({"schema": schema, "profiles": raw_profiles})
 
 
-def validate_person_bio_profiles(bundle: Mapping[str, Any]) -> Dict[str, Any]:
-    """Validate person bio profiles schema and unique `PERS-*` person_uid entries."""
+def validate_person_bio_profiles(
+    bundle: Mapping[str, Any],
+    *,
+    strict: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Validate person bio profiles schema, unique `PERS-*` person_uid entries,
+    and REQ-242 P0-E6 v2 provenance gate (64-hex `raw_sha256` + source anchor)."""
     if not isinstance(bundle, Mapping):
         raise PersonRegistryError("PERSON_BIO_PROFILES_OBJECT_REQUIRED")
 
     schema = bundle.get("schema")
-    if schema != PERSON_BIO_PROFILES_SCHEMA:
+    if schema not in VALID_PERSON_BIO_PROFILES_SCHEMAS:
         raise PersonRegistryError(f"INVALID_PERSON_BIO_PROFILES_SCHEMA:{schema}")
+
+    enforce_provenance = (
+        strict if strict is not None else (schema == PERSON_BIO_PROFILE_V2_SCHEMA)
+    )
 
     profiles = bundle.get("profiles")
     if isinstance(profiles, (str, bytes)) or not isinstance(profiles, Sequence):
@@ -604,9 +701,24 @@ def validate_person_bio_profiles(bundle: Mapping[str, Any]) -> Dict[str, Any]:
         if puid in seen_person_uids:
             raise PersonRegistryError(f"DUPLICATE_BIO_PROFILE_PERSON_UID:{puid}")
         seen_person_uids.add(puid)
+
+        if enforce_provenance:
+            if str(profile.get("review_status") or "").strip().upper() == "VERIFIED":
+                _validate_provenance_record(profile.get("provenance"), f"{puid}.provenance")
+            attr_prov_map = profile.get("attribute_provenance")
+            if isinstance(attr_prov_map, Mapping):
+                for attr_name, attr_prov in attr_prov_map.items():
+                    if (
+                        isinstance(attr_prov, Mapping)
+                        and str(attr_prov.get("status") or "").strip().upper() == "VERIFIED"
+                    ):
+                        _validate_provenance_record(
+                            attr_prov, f"{puid}.attribute_provenance.{attr_name}"
+                        )
+
         normalized_profiles.append(profile)
 
     return {
-        "schema": PERSON_BIO_PROFILES_SCHEMA,
+        "schema": schema,
         "profiles": normalized_profiles,
     }

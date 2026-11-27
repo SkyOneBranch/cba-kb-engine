@@ -481,6 +481,40 @@ def _clean_wiki_field(value: Any) -> Optional[str]:
     return text
 
 
+_DEPARTED_CLUB_SENTINELS = frozenset({
+    "离队", "已离队", "转会", "转会离队", "自由球员", "自由身", "阶段性外援", "暂离", "departed", "transferred", "free_agent",
+})
+_DEPARTED_ROSTER_STATUSES = frozenset({
+    "DEPARTED", "DEPARTED_OR_TRANSFERRED", "TRANSFERRED", "STAGED",
+    "STAGED_FOREIGN", "STAGED_FOREIGN_25_26", "WAIVED", "FORMER", "INACTIVE",
+})
+_HONOR_TRANSACTION_RE = re.compile(
+    r"(?:加盟|签约|转会|租借|离队|注册|解约|退役|复出|上调一队|买断|被裁)"
+)
+_HONOR_AWARD_RE = re.compile(
+    r"(?:总冠军|冠军|MVP|最有价值球员|最佳|奖|金牌|银牌|铜牌|得分王|篮板王|助攻王|抢断王|盖帽王)"
+)
+
+
+def _classify_honors_for_lead(honors: Sequence[str]) -> tuple[List[str], List[str]]:
+    """Separate awards (曾获) from selections (曾入选), filtering out transfer/transaction lines."""
+    awards: List[str] = []
+    selections: List[str] = []
+    seen: set[str] = set()
+    for raw in honors:
+        item = raw.strip()
+        if not item or item in seen:
+            continue
+        if _HONOR_TRANSACTION_RE.search(item):
+            continue
+        seen.add(item)
+        if _HONOR_AWARD_RE.search(item):
+            awards.append(item)
+        else:
+            selections.append(item)
+    return awards, selections
+
+
 def _format_birth_date_zh(birth_date: Optional[str]) -> Optional[str]:
     cleaned = _clean_wiki_field(birth_date)
     if not cleaned:
@@ -620,12 +654,15 @@ def compose_wiki_lead_paragraph(
     )
     position = _clean_wiki_field(bio.get("position") or reg.get("position") or for_reg.get("position"))
     jersey = _clean_wiki_field(bio.get("jersey_number") or reg.get("jersey_number") or for_reg.get("jersey_number"))
-    club = _clean_wiki_field(
+    raw_club = _clean_wiki_field(
         bio.get("current_club")
         or dom_cur.get("club_official")
         or for_reg.get("club")
         or reg.get("current_club")
     )
+    roster_status = str(bio.get("roster_status") or reg.get("roster_status") or "").strip().upper()
+    is_departed_club_token = bool(raw_club and raw_club.casefold() in _DEPARTED_CLUB_SENTINELS)
+    club = None if is_departed_club_token else raw_club
     current_role_raw = _clean_wiki_field(bio.get("current_role"))
     youth_origin = _clean_wiki_field(bio.get("draft_or_youth_origin"))
     honors = [
@@ -644,66 +681,7 @@ def compose_wiki_lead_paragraph(
     if not coach_role_zh and current_role_raw:
         coach_role_zh = _WIKI_ROLE_ZH.get(current_role_raw.upper(), current_role_raw)
 
-    # Clauses: list of (plain_sentence, cite_indices_for_sentence)
-    clauses: List[tuple[str, List[int]]] = []
-
-    # Clause 1: Identity + Bio + Current Club/Role
-    bio_cites: List[int] = []
-    for ref in bio.get("evidence_refs") or ():
-        idx = _register_evidence_ref_item(citation_registry, ref)
-        if idx is not None and idx not in bio_cites:
-            bio_cites.append(idx)
-    if not bio_cites and facets_list:
-        for ref in facets_list[0].get("evidence_refs") or ():
-            idx = _register_evidence_ref_item(citation_registry, ref)
-            if idx is not None and idx not in bio_cites:
-                bio_cites.append(idx)
-
-    paren_parts: List[str] = []
-    if birth_zh:
-        paren_parts.append(f"{birth_zh}出生")
-    if nationality and birth_place:
-        paren_parts.append(f"{nationality}{birth_place}人")
-    elif nationality:
-        paren_parts.append(f"{nationality}籍")
-    elif birth_place:
-        paren_parts.append(f"{birth_place}人")
-
-    c1_parts: List[str] = [f"{name}（{'，'.join(paren_parts)}）" if paren_parts else name]
-    if coach_role_zh and (facets_list or any(k in coach_role_zh for k in ("教练", "主帅"))):
-        if club:
-            c1_parts.append(f"现担任{club}{coach_role_zh}")
-        else:
-            c1_parts.append(f"现担任{coach_role_zh}")
-    else:
-        if position:
-            c1_parts.append(f"司职{position}")
-        if valid_height and valid_weight:
-            c1_parts.append(f"身高{valid_height}厘米、体重{valid_weight}公斤")
-        elif valid_height:
-            c1_parts.append(f"身高{valid_height}厘米")
-        elif valid_weight:
-            c1_parts.append(f"体重{valid_weight}公斤")
-        if youth_origin:
-            c1_parts.append(f"出自{youth_origin}")
-        if club:
-            season_prefix = f"{season_label}赛季" if season_label else ""
-            jersey_part = f"身披{jersey}号球衣" if jersey else ""
-            c1_parts.append(f"{season_prefix}{jersey_part}效力于{club}")
-        elif contract_cat and season_label:
-            c1_parts.append(f"{season_label}赛季以{contract_cat}合同完成联赛注册")
-
-    # For coaches with valid height/youth_origin, include transition note if applicable
-    if coach_role_zh and (facets_list or any(k in coach_role_zh for k in ("教练", "主帅"))):
-        if unified.get("is_player_to_coach_transition"):
-            c1_parts.append("球员时期曾征战CBA联赛，退役后转型执教")
-        elif youth_origin:
-            c1_parts.append(f"出自{youth_origin}")
-
-    clause1 = _ensure_period("，".join(c1_parts))
-    clauses.append((clause1, bio_cites))
-
-    # Clause 2: Career Season Stats summary
+    # Pre-inspect career_season_stats so 4-template selection knows whether player has games played
     stats_cites: List[int] = []
     reg_summary: Optional[Mapping[str, Any]] = None
     seasons_count: Optional[int] = None
@@ -726,28 +704,163 @@ def compose_wiki_lead_paragraph(
                         stats_cites.append(idx)
                         break
 
-    if isinstance(reg_summary, Mapping):
+    reg_gp = reg_summary.get("games_played") if isinstance(reg_summary, Mapping) else None
+    has_played_games = isinstance(reg_gp, (int, float)) and reg_gp > 0
+
+    # Classify into one of 4 canonical lead templates (REQ-242 P0-E4)
+    is_coach_template = bool(
+        coach_role_zh and (facets_list or any(k in coach_role_zh for k in ("教练", "主帅")))
+    )
+    is_departed_or_staged = bool(
+        not is_coach_template
+        and (
+            is_departed_club_token
+            or roster_status in _DEPARTED_ROSTER_STATUSES
+        )
+    )
+    is_rookie_or_unplayed = bool(
+        not is_coach_template
+        and not is_departed_or_staged
+        and not has_played_games
+        and (
+            youth_origin
+            or (isinstance(career_season_stats, Mapping) and not career_season_stats.get("regular_season_rows"))
+        )
+    )
+
+    if is_coach_template:
+        lead_template = "COACH_OR_TRANSITIONED_HEAD_COACH"
+    elif is_departed_or_staged:
+        lead_template = "DEPARTED_OR_STAGED_PLAYER"
+    elif is_rookie_or_unplayed:
+        lead_template = "ROOKIE_OR_UNPLAYED_YOUTH"
+    else:
+        lead_template = "ACTIVE_ROSTER_PLAYER"
+
+    # Clauses: list of (plain_sentence, cite_indices_for_sentence)
+    clauses: List[tuple[str, List[int]]] = []
+
+    # Clause 1: Identity + Bio + Template-specific Club/Role
+    bio_cites: List[int] = []
+    for ref in bio.get("evidence_refs") or ():
+        idx = _register_evidence_ref_item(citation_registry, ref)
+        if idx is not None and idx not in bio_cites:
+            bio_cites.append(idx)
+    if not bio_cites and facets_list:
+        for ref in facets_list[0].get("evidence_refs") or ():
+            idx = _register_evidence_ref_item(citation_registry, ref)
+            if idx is not None and idx not in bio_cites:
+                bio_cites.append(idx)
+
+    paren_parts: List[str] = []
+    if birth_zh:
+        paren_parts.append(f"{birth_zh}出生")
+    if nationality and birth_place:
+        paren_parts.append(f"{nationality}{birth_place}人")
+    elif nationality:
+        paren_parts.append(f"{nationality}籍")
+    elif birth_place:
+        paren_parts.append(f"{birth_place}人")
+
+    c1_parts: List[str] = [f"{name}（{'，'.join(paren_parts)}）" if paren_parts else name]
+    if lead_template == "COACH_OR_TRANSITIONED_HEAD_COACH":
+        if club:
+            c1_parts.append(f"现担任{club}{coach_role_zh}")
+        else:
+            c1_parts.append(f"现担任{coach_role_zh}")
+        if unified.get("is_player_to_coach_transition"):
+            c1_parts.append("球员时期曾征战CBA联赛，退役后转型执教")
+        elif youth_origin:
+            c1_parts.append(f"出自{youth_origin}")
+    elif lead_template == "DEPARTED_OR_STAGED_PLAYER":
+        if position:
+            c1_parts.append(f"司职{position}")
+        if valid_height and valid_weight:
+            c1_parts.append(f"身高{valid_height}厘米、体重{valid_weight}公斤")
+        elif valid_height:
+            c1_parts.append(f"身高{valid_height}厘米")
+        elif valid_weight:
+            c1_parts.append(f"体重{valid_weight}公斤")
+        if roster_status in ("STAGED", "STAGED_FOREIGN", "STAGED_FOREIGN_25_26"):
+            if club:
+                c1_parts.append(f"曾阶段性注册并代表{club}出战CBA联赛")
+            else:
+                c1_parts.append("曾阶段性注册出战CBA联赛")
+        else:
+            if club:
+                c1_parts.append(f"曾效力于{club}，目前已离队")
+            else:
+                c1_parts.append("曾效力CBA联赛，目前已离队")
+    elif lead_template == "ROOKIE_OR_UNPLAYED_YOUTH":
+        if position:
+            c1_parts.append(f"司职{position}")
+        if valid_height and valid_weight:
+            c1_parts.append(f"身高{valid_height}厘米、体重{valid_weight}公斤")
+        elif valid_height:
+            c1_parts.append(f"身高{valid_height}厘米")
+        elif valid_weight:
+            c1_parts.append(f"体重{valid_weight}公斤")
+        if youth_origin:
+            c1_parts.append(f"出自{youth_origin}")
+        if club:
+            season_prefix = f"{season_label}赛季" if season_label else ""
+            c1_parts.append(f"{season_prefix}注册于{club}一队名单，系球队年轻球员")
+        else:
+            c1_parts.append("系CBA注册年轻球员")
+    else:
+        if position:
+            c1_parts.append(f"司职{position}")
+        if valid_height and valid_weight:
+            c1_parts.append(f"身高{valid_height}厘米、体重{valid_weight}公斤")
+        elif valid_height:
+            c1_parts.append(f"身高{valid_height}厘米")
+        elif valid_weight:
+            c1_parts.append(f"体重{valid_weight}公斤")
+        if youth_origin:
+            c1_parts.append(f"出自{youth_origin}")
+        if club:
+            season_prefix = f"{season_label}赛季" if season_label else ""
+            jersey_part = f"身披{jersey}号球衣" if jersey else ""
+            c1_parts.append(f"{season_prefix}{jersey_part}效力于{club}")
+        elif contract_cat and season_label:
+            c1_parts.append(f"{season_label}赛季以{contract_cat}合同完成联赛注册")
+
+    # Anti-duplication on clause 1 parts
+    dedup_c1: List[str] = []
+    for part in c1_parts:
+        if part and part not in dedup_c1:
+            dedup_c1.append(part)
+    clause1 = _ensure_period("，".join(dedup_c1))
+    clauses.append((clause1, bio_cites))
+
+    # Clause 2: Career Season Stats summary
+    if isinstance(reg_summary, Mapping) and has_played_games:
         gp = reg_summary.get("games_played")
         ppg = reg_summary.get("points_per_game")
         rpg = reg_summary.get("rebounds_per_game")
         apg = reg_summary.get("assists_per_game")
-        if isinstance(gp, (int, float)) and gp > 0:
-            stat_bits: List[str] = []
-            if isinstance(ppg, (int, float)):
-                stat_bits.append(f"{float(ppg):.1f}分")
-            if isinstance(rpg, (int, float)):
-                stat_bits.append(f"{float(rpg):.1f}个篮板")
-            if isinstance(apg, (int, float)):
-                stat_bits.append(f"{float(apg):.1f}次助攻")
-            season_txt = f"（{seasons_count}个赛季）" if seasons_count and seasons_count > 1 else ""
-            if stat_bits:
-                stat_sent = f"CBA常规赛累计出战{int(gp)}场{season_txt}，场均贡献{'、'.join(stat_bits)}。"
-                clauses.append((stat_sent, stats_cites))
+        stat_bits: List[str] = []
+        if isinstance(ppg, (int, float)):
+            stat_bits.append(f"{float(ppg):.1f}分")
+        if isinstance(rpg, (int, float)):
+            stat_bits.append(f"{float(rpg):.1f}个篮板")
+        if isinstance(apg, (int, float)):
+            stat_bits.append(f"{float(apg):.1f}次助攻")
+        season_txt = f"（{seasons_count}个赛季）" if seasons_count and seasons_count > 1 else ""
+        if stat_bits:
+            stat_sent = f"CBA常规赛累计出战{int(gp)}场{season_txt}，场均贡献{'、'.join(stat_bits)}。"
+            clauses.append((stat_sent, stats_cites))
 
-    # Clause 3: Honors
+    # Clause 3: Honors (with anti-duplication & grammar guard: no 曾入选2026年8月加盟 / no 曾入选多次CBA总冠军)
     if honors:
-        honor_sent = _ensure_period(f"曾入选{'、'.join(honors[:2])}")
-        clauses.append((honor_sent, []))
+        awards, selections = _classify_honors_for_lead(honors)
+        honor_bits: List[str] = []
+        if awards:
+            honor_bits.append(f"曾获{'、'.join(awards[:2])}")
+        if selections:
+            honor_bits.append(f"曾入选{'、'.join(selections[:2])}")
+        if honor_bits:
+            clauses.append((_ensure_period("，".join(honor_bits)), []))
 
     # Clause 4: Key Story
     if isinstance(projected_stories, Sequence) and not isinstance(projected_stories, (str, bytes)):
@@ -812,6 +925,7 @@ def compose_wiki_lead_paragraph(
     return {
         "lead_markdown": lead_markdown,
         "lead_plain_text": lead_plain_text,
+        "lead_template": lead_template,
         "char_count": len(lead_plain_text),
         "citation_indices": used_indices,
         "visibility": resolved_visibility,

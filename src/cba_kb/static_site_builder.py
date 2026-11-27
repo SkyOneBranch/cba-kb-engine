@@ -23,7 +23,11 @@ from .kc_visibility import validate_card_visibility, verify_public_safe_card_tex
 _SLUG_SAFE_RE = re.compile(r"[^a-z0-9_-]+")
 _URL_RE = re.compile(r"https?://[^\s<>\"')，。；：！？（）【】、]+")
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
-_INLINE_FN_REF_RE = re.compile(r"(?<!\])\[(\d+)\](?!\()")
+_INLINE_FN_REF_RE = re.compile(r"\[(\d+)\](?!\()")
+_PUBLIC_SITE_INTERNAL_TOKEN_RE = re.compile(
+    r"(?:\b[\w.-]+\.(?:csv|jsonl)\b|\bteam_staff_snapshots\b|\bclub_announcement:)",
+    re.IGNORECASE,
+)
 _DETAILS_OPEN_RE = re.compile(
     r'^<details(?:\s+class="(audit-drawer|gamelog-drawer)")?\s*>$'
 )
@@ -53,6 +57,8 @@ def _verify_public_text_strict(text: str, *, label: str) -> None:
         _fail_visibility(f"{label}:internal_clue_only_marker")
     if _TILDE_FENCE_MARKER in text:
         _fail_visibility(f"{label}:tilde_fenced_code_block")
+    if _PUBLIC_SITE_INTERNAL_TOKEN_RE.search(text):
+        _fail_visibility(f"{label}:internal_table_or_snapshot_token")
 
 
 def _validate_card_payload(card: Any, *, label: str) -> Tuple[str, List[Dict[str, str]]]:
@@ -223,8 +229,8 @@ def _replace_inline_fn_refs(
                 return m.group(0)
             if idx not in seen_fnrefs:
                 seen_fnrefs.add(idx)
-                return f'<sup><a class="fn-ref" href="#fn-{idx}" id="fnref-{idx}">[{idx}]</a></sup>'
-            return f'<sup><a class="fn-ref" href="#fn-{idx}">[{idx}]</a></sup>'
+                return f'<sup class="cite-ref"><a class="fn-ref" href="#fn-{idx}" id="fnref-{idx}">[{idx}]</a></sup>'
+            return f'<sup class="cite-ref"><a class="fn-ref" href="#fn-{idx}">[{idx}]</a></sup>'
 
         out.append(_INLINE_FN_REF_RE.sub(_sub_fn, part))
     return "".join(out)
@@ -770,6 +776,13 @@ def _extract_person_meta(card: Mapping[str, Any]) -> Dict[str, Any]:
         or ""
     ).strip()
     origin = str(bio_map.get("draft_or_youth_origin") or "").strip()
+    alma_mater = str(
+        bio_map.get("alma_mater")
+        or bio_map.get("school")
+        or bio_map.get("university")
+        or bio_map.get("college")
+        or ""
+    ).strip()
     story_ids = {
         str(st.get("story_id")).strip()
         for st in (card.get("projected_stories") or ())
@@ -782,6 +795,7 @@ def _extract_person_meta(card: Mapping[str, Any]) -> Dict[str, Any]:
         "is_coach": role.upper() in _COACH_ROLES_SET or role in _COACH_ROLES_SET or "COACH" in role.upper() or "教练" in role,
         "club": club,
         "origin": origin,
+        "alma_mater": alma_mater,
         "story_ids": story_ids,
     }
 
@@ -846,13 +860,21 @@ def compute_related_persons(
         relation_label = ""
         if shared_stories:
             score += 50 * len(shared_stories)
-            relation_label = "共同故事"
+            relation_label = "共同经历"
         if t_meta["is_coach"] != o_meta["is_coach"] and (
             t_meta["club"] and o_meta["club"] and t_meta["club"] == o_meta["club"]
         ):
             score += 30
             if not relation_label:
-                relation_label = "师徒"
+                relation_label = "同期教练与球员"
+        if (
+            t_meta["alma_mater"]
+            and o_meta["alma_mater"]
+            and t_meta["alma_mater"] == o_meta["alma_mater"]
+        ):
+            score += 25
+            if not relation_label:
+                relation_label = "大学校友"
         if t_meta["origin"] and o_meta["origin"] and t_meta["origin"] == o_meta["origin"]:
             score += 20
             if not relation_label:
