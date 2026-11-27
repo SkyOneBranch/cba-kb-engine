@@ -710,3 +710,158 @@ def test_mq2_3_minor_release_prepare_allows_crash_retry_when_already_renamed(
             carry_forward_artifacts=True,
             environment="sandbox",
         )
+
+
+# =============================================================================
+# Round 2 Q2 Remediation Regression Tests (M-R2-1, m-R2-1, m-R2-2)
+# =============================================================================
+
+
+def test_mr2_1_distinct_stories_and_events_sharing_canonical_source_id_are_not_merged() -> None:
+    from cba_kb.kc_render import (
+        dedup_reprints_and_preserve_discrepancies,
+        render_research_card,
+    )
+
+    # 1. Two distinct stories sharing canonical_source_id both render; reprint still dedups
+    stories = [
+        {
+            "story_id": "story_000000000000000000000001",
+            "occurred_season": "2024-2025",
+            "title": "合成季前拉练专题",
+            "summary": "合成主帅甲带队完成夏训体能储备。",
+            "canonical_source": {"source_id": "src-shared-portal", "source_kind": "public_media"},
+        },
+        {
+            "story_id": "story_000000000000000000000002",
+            "occurred_season": "2025-2026",
+            "title": "合成新援融入专题",
+            "summary": "合成新星乙在新赛季担任首发控卫。",
+            "canonical_source": {"source_id": "src-shared-portal", "source_kind": "public_media"},
+        },
+        {
+            "story_id": "story_000000000000000000000003",
+            "occurred_season": "2024-2025",
+            "title": "合成季前拉练专题",
+            "summary": "合成主帅甲带队完成夏训体能储备。",
+            "reprint_of": "src-shared-portal",
+            "canonical_source": {"source_id": "src-shared-portal", "source_kind": "public_media"},
+        },
+    ]
+    # 2. Two distinct timeline events sharing canonical_source_id both render
+    events = [
+        {
+            "event_id": "ev-1",
+            "canonical_source_id": "src-official-feed",
+            "summary": "2026-10-01 完成季前赛注册",
+        },
+        {
+            "event_id": "ev-2",
+            "canonical_source_id": "src-official-feed",
+            "summary": "2026-10-15 入选常规赛揭幕战大名单",
+        },
+        {
+            "event_id": "ev-3",
+            "canonical_source_id": "src-official-feed",
+            "reprint_of": "src-official-feed",
+            "summary": "2026-10-01 完成季前赛注册",
+        },
+    ]
+    dedup_ev = dedup_reprints_and_preserve_discrepancies(events)
+    assert len(dedup_ev["canonical_items"]) == 2
+    ev1 = next(x for x in dedup_ev["canonical_items"] if x["event_id"] == "ev-1")
+    assert len(ev1["deduped_reprints"]) == 1
+
+    payload: Dict[str, Any] = {
+        "metric": "points_per_game",
+        "grains": {"STATS": {"posture": "UNKNOWN", "season": "2026-2027"}},
+        "evidence_transparency": {
+            "posture": "UNKNOWN",
+            "unknown_subkind": "NO_SEASON_STATS_RECORDED_YET",
+            "scope_meta": {"player_name": "合成球员戊", "season": "2026-2027"},
+        },
+        "story_records": stories,
+        "timeline_events": events,
+    }
+    md = render_research_card(
+        payload, evidence_verified=True, visibility="public_safe", card_style="wiki_v240"
+    )
+    assert md.count("合成季前拉练专题") == 1
+    assert md.count("合成新援融入专题") == 1
+    assert md.count("2026-10-01 完成季前赛注册") == 1
+    assert md.count("2026-10-15 入选常规赛揭幕战大名单") == 1
+
+
+def test_mr2_1_minor_trailing_dot_drive_host_rejected() -> None:
+    from cba_kb.story_record import make_story_record, project_stories_for_entity
+
+    story = make_story_record(
+        title="合成FQDN尾点链接过滤",
+        occurred_season="2025-2026",
+        published_at="2026-10-01T00:00:00Z",
+        canonical_source={
+            "source_id": "src-drive-fqdn",
+            "title": "合成来源",
+            "url": "https://drive.google.com./file/d/synth_id/view",
+            "source_kind": "public_media",
+            "authority_scope": "PUBLIC_MEDIA",
+        },
+        participants=[
+            {
+                "person_uid": "PERS-SYNTH-P200",
+                "display_name": "合成球员丁",
+                "role": "SUBJECT_INTERVIEWEE",
+                "internal_verbatim_or_note": "内部备注",
+                "public_perspective_summary": "合成球员丁完成常规赛注册。",
+            }
+        ],
+        organization_ids=["ORG-SYNTH-ALPHA"],
+        visibility_policy={"public_export_allowed": True},
+    )
+    projected = project_stories_for_entity(
+        [story], entity_id="PERS-SYNTH-P200", entity_kind="person", visibility="public_safe"
+    )
+    assert len(projected) == 1
+    assert projected[0]["canonical_source"]["url"] == ""
+    assert "drive.google.com" not in json.dumps(projected, ensure_ascii=False)
+
+
+def test_mr2_2_minor_editorial_brief_no_space_split_and_abbreviations() -> None:
+    from cba_kb.editorial_brief import compose_verified_brief
+
+    # No-space English boundary splits into 2 sentences with 2 attributions
+    brief_nospace = compose_verified_brief(
+        [
+            {
+                "sentence": "First claim.Second claim.",
+                "status": "VERIFIED_PRESENT",
+                "source_kind": "official_stats",
+                "citation_label": "Official Feed",
+                "source_url": "https://example.invalid/cba/feed",
+            }
+        ],
+        entity_name="Synth Player",
+        max_chars=120,
+        visibility="public_safe",
+    )
+    assert len(brief_nospace["sentence_attributions"]) == 2
+    assert brief_nospace["sentence_attributions"][0]["sentence"] == "First claim."
+    assert brief_nospace["sentence_attributions"][1]["sentence"] == "Second claim."
+
+    # Common abbreviation + decimal stays 1 sentence with 1 attribution
+    brief_abbrev = compose_verified_brief(
+        [
+            {
+                "sentence": "Uses stats, e.g. 13.5 PPG.",
+                "status": "VERIFIED_PRESENT",
+                "source_kind": "official_stats",
+                "citation_label": "Official Feed",
+                "source_url": "https://example.invalid/cba/feed",
+            }
+        ],
+        entity_name="Synth Player",
+        max_chars=120,
+        visibility="public_safe",
+    )
+    assert len(brief_abbrev["sentence_attributions"]) == 1
+    assert brief_abbrev["sentence_attributions"][0]["sentence"] == "Uses stats, e.g. 13.5 PPG."

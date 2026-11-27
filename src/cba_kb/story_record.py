@@ -291,7 +291,7 @@ def _clean_public_https_url(value: Any) -> str:
     parsed = urlsplit(text)
     if parsed.scheme.lower() != "https" or not parsed.netloc:
         return ""
-    host = parsed.netloc.rsplit("@", 1)[-1].split(":", 1)[0].lower()
+    host = parsed.netloc.rsplit("@", 1)[-1].split(":", 1)[0].rstrip(".").lower()
     if host in ("drive.google.com", "docs.google.com") or host.endswith(
         (".drive.google.com", ".docs.google.com")
     ):

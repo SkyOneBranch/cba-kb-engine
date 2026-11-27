@@ -283,39 +283,103 @@ def filter_timeline_events_silence_not_cause(
     }
 
 
+def _normalize_dedup_content(item: Mapping[str, Any]) -> str:
+    parts = [
+        str(item.get(k) or "").strip()
+        for k in ("title", "claim", "summary", "public_perspective_summary")
+        if str(item.get(k) or "").strip()
+    ]
+    if not parts:
+        return ""
+    return re.sub(r"\s+", " ", " | ".join(parts)).casefold()
+
+
 def dedup_reprints_and_preserve_discrepancies(
     items: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
     """Editorial Iron Rule 3: deduplicate same-source reprints into a single canonical
-    entry with deduped_reprints while preserving independent conflicting sources
-    side-by-side."""
-    groups: Dict[str, List[Dict[str, Any]]] = {}
-    order: List[str] = []
+    entry with deduped_reprints while preserving distinct stories/events and
+    independent conflicting sources side-by-side."""
+    groups: List[Dict[str, Any]] = []
 
     for idx, raw in enumerate(items or ()):
         if not isinstance(raw, Mapping):
             continue
         item = dict(raw)
-        root_id = str(
-            item.get("reprint_of")
-            or item.get("canonical_source_id")
-            or item.get("item_id")
-            or f"anon-{idx}"
+        reprint_of = str(item.get("reprint_of") or "").strip()
+        src_id = str(item.get("canonical_source_id") or "").strip()
+        item_identity = str(
+            item.get("story_id") or item.get("item_id") or item.get("event_id") or ""
         ).strip()
-        if root_id not in groups:
-            groups[root_id] = []
-            order.append(root_id)
-        groups[root_id].append(item)
+        content_fp = _normalize_dedup_content(item)
+
+        target_group: Optional[Dict[str, Any]] = None
+        if reprint_of:
+            # Explicit reprint link: attach to matching source/item group (prefer content match).
+            for g in groups:
+                if (
+                    g["source_id"] == reprint_of or reprint_of in g["item_ids"]
+                ) and (not content_fp or not g["content_fp"] or g["content_fp"] == content_fp):
+                    target_group = g
+                    break
+            if target_group is None:
+                for g in groups:
+                    if g["source_id"] == reprint_of or reprint_of in g["item_ids"]:
+                        target_group = g
+                        break
+        elif src_id:
+            # Same canonical_source_id without reprint_of: merge ONLY if content matches,
+            # or an existing group for src_id contains only out-of-order reprints, or
+            # both lack content and share the same item/story identity.
+            for g in groups:
+                if g["source_id"] != src_id:
+                    continue
+                if content_fp and g["content_fp"]:
+                    if g["content_fp"] == content_fp:
+                        target_group = g
+                        break
+                elif g["reprint_only"]:
+                    target_group = g
+                    break
+                elif not content_fp and not g["content_fp"] and (
+                    not item_identity or item_identity in g["item_ids"]
+                ):
+                    target_group = g
+                    break
+        elif item_identity:
+            for g in groups:
+                if not g["source_id"] and item_identity in g["item_ids"]:
+                    target_group = g
+                    break
+
+        if target_group is None:
+            resolved_src = reprint_of or src_id or item_identity or f"anon-{idx}"
+            target_group = {
+                "source_id": resolved_src,
+                "content_fp": content_fp,
+                "item_ids": {item_identity} if item_identity else set(),
+                "reprint_only": bool(reprint_of),
+                "members": [item],
+            }
+            groups.append(target_group)
+        else:
+            target_group["members"].append(item)
+            if item_identity:
+                target_group["item_ids"].add(item_identity)
+            if not reprint_of:
+                target_group["reprint_only"] = False
+            if content_fp and not target_group["content_fp"]:
+                target_group["content_fp"] = content_fp
 
     canonical_items: List[Dict[str, Any]] = []
-    for root_id in order:
-        members = groups[root_id]
+    for g in groups:
+        members = g["members"]
         primary_idx = next(
             (i for i, m in enumerate(members) if not m.get("reprint_of")),
             0,
         )
         primary = dict(members[primary_idx])
-        primary["canonical_source_id"] = root_id
+        primary["canonical_source_id"] = g["source_id"]
         existing_reprints = list(primary.get("deduped_reprints") or [])
         for i, m in enumerate(members):
             if i == primary_idx:

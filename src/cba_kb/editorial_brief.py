@@ -34,12 +34,58 @@ _REQUIRED_HARD_CASES = (
 )
 
 
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？])(?![。！？])|(?<=[.!?])(?=\s+)")
+_COMMON_ABBREVIATIONS = frozenset({
+    "e.g",
+    "i.e",
+    "vs",
+    "dr",
+    "mr",
+    "ms",
+    "mrs",
+    "no",
+    "st",
+    "jr",
+    "sr",
+})
+_ABBREV_TOKEN_RE = re.compile(r"([A-Za-z](?:\.[A-Za-z])+|[A-Za-z]+)\Z")
 
 
 def _split_sentences(text: str) -> List[str]:
-    """Split multi-sentence text into individual sentences without splitting decimals."""
-    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(text.strip()) if p and p.strip()]
+    """Split multi-sentence text into individual sentences without splitting decimals
+    or common abbreviations (e.g., i.e., vs., Dr., Mr., Ms., No.)."""
+    s = text.strip()
+    if not s:
+        return []
+    parts: List[str] = []
+    start = 0
+    n = len(s)
+    i = 0
+    while i < n:
+        ch = s[i]
+        is_boundary = False
+        if ch in "。！？":
+            if i + 1 < n and s[i + 1] not in "。！？":
+                is_boundary = True
+        elif ch in ".!?":
+            next_ch = s[i + 1] if i + 1 < n else ""
+            prev_ch = s[i - 1] if i > 0 else ""
+            if next_ch and (next_ch.isspace() or (next_ch.isupper() and not prev_ch.isdigit())):
+                is_abbrev = False
+                if ch == ".":
+                    m = _ABBREV_TOKEN_RE.search(s[:i])
+                    if m and m.group(1).lower() in _COMMON_ABBREVIATIONS:
+                        is_abbrev = True
+                if not is_abbrev:
+                    is_boundary = True
+        if is_boundary:
+            chunk = s[start : i + 1].strip()
+            if chunk:
+                parts.append(chunk)
+            start = i + 1
+        i += 1
+    tail = s[start:].strip()
+    if tail:
+        parts.append(tail)
     return parts
 
 
