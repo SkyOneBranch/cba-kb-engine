@@ -414,3 +414,299 @@ def test_cli_v240_subcommands_fail_closed_and_output_paths(
     )
     assert code == 1
     assert "NO_VERIFIED_FACTS_FOR_BRIEF" in stderr
+
+
+# =============================================================================
+# Round 1 Q2 Remediation Regression Tests (B-Q2-1, M-Q2-1..3, m-Q2-1..4)
+# =============================================================================
+
+
+def test_bq2_1_sanitize_public_free_text_unclosed_fences_fail_closed() -> None:
+    from cba_kb.kc_render import _sanitize_public_free_text
+
+    # Unclosed ``` at line start discards opener and everything after it
+    out1 = _sanitize_public_free_text("公开摘要\n```\nSECRET VERBATIM INTERNAL NOTE")
+    assert "SECRET VERBATIM" not in out1
+    assert "```" not in out1
+    assert "公开摘要" in out1
+
+    # Unclosed ~~~ at line start discards opener and everything after it
+    out2 = _sanitize_public_free_text("公开摘要\n~~~\nSECRET TILDE BODY")
+    assert "SECRET TILDE BODY" not in out2
+    assert "~~~" not in out2
+    assert "公开摘要" in out2
+
+    # Inline unclosed ``` or ~~~ also truncates from opener to end
+    out3 = _sanitize_public_free_text("前文摘要 ```leaked tail")
+    assert "leaked tail" not in out3
+    assert "```" not in out3
+    out4 = _sanitize_public_free_text("前文摘要 ~~~leaked tilde tail")
+    assert "leaked tilde tail" not in out4
+    assert "~~~" not in out4
+
+
+def test_mq2_1_wiki_v240_wires_iron_rules_1_and_3() -> None:
+    from cba_kb.kc_render import render_research_card
+
+    payload: Dict[str, Any] = {
+        "metric": "points_per_game",
+        "grains": {"STATS": {"posture": "UNKNOWN", "season": "2026-2027"}},
+        "evidence_transparency": {
+            "posture": "UNKNOWN",
+            "unknown_subkind": "NO_SEASON_STATS_RECORDED_YET",
+            "scope_meta": {"player_name": "合成主帅甲", "season": "2026-2027"},
+        },
+        "role_tenures": [
+            {
+                "role": "HEAD_COACH",
+                "organization_name": "合成阿尔法俱乐部",
+                "season_start": "2025-2026",
+                "authority_scope": "LEAGUE_OFFICIAL",
+                "target_slot": "official_registration",
+            },
+            {
+                "role": "HEAD_COACH",
+                "organization_name": "合成谣言俱乐部",
+                "season_start": "2026-2027",
+                "authority_scope": "PUBLIC_MEDIA",
+                "target_slot": "official_registration",
+            },
+        ],
+        "timeline_events": [
+            {
+                "event_id": "e1",
+                "canonical_source_id": "src-A",
+                "source_name": "合成官方通告A",
+                "summary": "合成官方通告入选名单",
+            },
+            {
+                "event_id": "e2",
+                "canonical_source_id": "src-A",
+                "reprint_of": "src-A",
+                "source_name": "转载媒体A1",
+                "summary": "合成官方通告入选名单",
+            },
+            {
+                "event_id": "e3",
+                "canonical_source_id": "src-B",
+                "source_name": "合成俱乐部官微B",
+                "summary": "俱乐部官微称随队合练未登场",
+            },
+        ],
+    }
+    md = render_research_card(
+        payload, evidence_verified=True, visibility="public_safe", card_style="wiki_v240"
+    )
+    assert "合成阿尔法俱乐部" in md
+    assert "合成谣言俱乐部" not in md
+    assert md.count("合成官方通告入选名单") == 1
+    assert "俱乐部官微称随队合练未登场" in md
+
+
+def test_mq2_2_and_mq2_4_club_card_snapshot_discrepancy_and_seasonless_rows() -> None:
+    from cba_kb.club_card_builder import build_club_panorama_card
+
+    res = build_club_panorama_card(
+        "合成阿尔法俱乐部",
+        seasons=("2025-2026", "2026-2027"),
+        organization_profile={
+            "organization_id": "ORG-SYNTH-ALPHA",
+            "canonical_name": "合成阿尔法俱乐部",
+            "short_name": "合成阿尔法",
+        },
+        master_rows=[
+            {
+                "club_official": "合成阿尔法俱乐部",
+                "player": "合成无赛季国内球员",
+                "contract_category": "B类",
+            }
+        ],
+        foreign_rows=[
+            {
+                "club_official": "合成阿尔法俱乐部",
+                "player_name_en": "Synth Seasonless Foreign",
+                "player": "Synth Seasonless Foreign",
+                "registration_status": "已注册",
+            }
+        ],
+        staff_snapshots=[
+            {
+                "season": "2026-2027",
+                "organization_id": "ORG-SYNTH-ALPHA",
+                "person_uid": "PERS-SYNTH-COACH01",
+                "person_name": "合成主帅甲",
+                "league_listed_role": "ASSISTANT_COACH",
+                "club_appointed_role": "HEAD_COACH",
+            }
+        ],
+        visibility="public_safe",
+    )
+    md = res["markdown"]
+    assert res["status"] == "BUILT"
+    # M-Q2-2: snapshot-derived coach facets detect institutional discrepancy
+    assert "ASSISTANT_COACH" in md and "HEAD_COACH" in md
+    assert "Discrepancy" in md or "LEAGUE_VS_CLUB_ROLE_DISCREPANCY" in md
+    # m-Q2-4: both seasonless domestic and foreign rows handled consistently
+    assert "合成无赛季国内球员" in md
+    assert "Synth Seasonless Foreign" in md
+
+
+def test_mq2_3_editorial_brief_strict_one_to_one_sentence_attribution() -> None:
+    from cba_kb.editorial_brief import compose_verified_brief
+
+    facts = [
+        {
+            "sentence": "合成球员甲2026-2027赛季注册于合成阿尔法。常规赛场均13.5分4.2助攻。",
+            "status": "VERIFIED_PRESENT",
+            "source_kind": "official_stats",
+            "citation_label": "CBA官方统计",
+            "source_url": "https://example.invalid/cba/stats",
+        }
+    ]
+    brief = compose_verified_brief(facts, entity_name="合成球员甲", max_chars=120, visibility="public_safe")
+    assert len(brief["body"]) <= 120
+    assert len(brief["sentence_attributions"]) == 2
+    assert any("13.5" in a["sentence"] for a in brief["sentence_attributions"])
+    for attr in brief["sentence_attributions"]:
+        assert attr["sentence"] in brief["body"]
+
+
+def test_mq2_1_minor_role_facets_uid_bound_skips_uidless_homonym_snapshot() -> None:
+    from cba_kb.role_facets import OBSERVED_EMPTY, build_coach_role_facets
+
+    facets = build_coach_role_facets(
+        person_uid="PERS-SYNTH-COACH01",
+        person_name="合成同名教练",
+        season="2026-2027",
+        staff_snapshots=[
+            {
+                "season": "2026-2027",
+                "person_name": "合成同名教练",
+                "league_listed_role": "HEAD_COACH",
+                "captured_at": "2026-10-10T00:00:00Z",
+            }
+        ],
+    )
+    assert facets.league_listed_role == OBSERVED_EMPTY
+
+
+def test_mq2_2_minor_story_projection_strips_drive_and_non_https_urls() -> None:
+    from cba_kb.story_record import make_story_record, project_stories_for_entity
+
+    story = make_story_record(
+        title="合成公开故事带私有链接",
+        occurred_season="2024-2025",
+        published_at="2026-10-01T00:00:00Z",
+        canonical_source={
+            "source_id": "src-drive-leak",
+            "title": "合成专题",
+            "url": "https://drive.google.com/file/d/1AbCdEfGhIjKlMnOpQrStUvWxYz/view",
+            "source_kind": "public_media",
+            "authority_scope": "PUBLIC_MEDIA",
+        },
+        participants=[
+            {
+                "person_uid": "PERS-SYNTH-P100",
+                "display_name": "合成球员丙",
+                "role": "SUBJECT_INTERVIEWEE",
+                "internal_verbatim_or_note": "内部备注",
+                "public_perspective_summary": "合成球员丙在2024-2025赛季完成首秀。",
+            }
+        ],
+        organization_ids=["ORG-SYNTH-ALPHA"],
+        visibility_policy={"public_export_allowed": True},
+    )
+    projected = project_stories_for_entity(
+        [story], entity_id="PERS-SYNTH-P100", entity_kind="person", visibility="public_safe"
+    )
+    assert len(projected) == 1
+    assert projected[0]["canonical_source"].get("url") == ""
+    assert "drive.google.com" not in json.dumps(projected, ensure_ascii=False)
+
+
+def test_mq2_3_minor_release_prepare_allows_crash_retry_when_already_renamed(
+    tmp_path: Path,
+) -> None:
+    from cba_kb.common import digest
+    from cba_kb.release import prepare
+
+    old_name = "研究卡_合成球员甲_合成阿尔法_2025-2026_CURRENT.md"
+    new_name = "研究卡_合成球员甲_合成阿尔法_2025-2026_ARCHIVE.md"
+    body = b"# Card\nend_marker: true\n"
+    sha = digest(body)
+
+    def _make_drive(remote_name: str) -> _FakeRenameDrive:
+        return _FakeRenameDrive({
+            "f_synth_card01": {
+                "id": "f_synth_card01",
+                "name": remote_name,
+                "mimeType": "text/markdown",
+                "parents": ["p_synth_data"],
+                "version": "2",
+                "modifiedTime": "2026-11-01T00:00:00Z",
+                "content": body,
+            },
+            "f_synth_status": {
+                "id": "f_synth_status",
+                "name": "release_status.json",
+                "mimeType": "application/json",
+                "parents": ["p_synth_data"],
+                "version": "1",
+                "modifiedTime": "2026-11-01T00:00:00Z",
+                "content": json.dumps(
+                    {
+                        "state": "COMPLETE",
+                        "current_release_id": "v2.3.2-1",
+                        "artifacts": [{"id": "f_synth_card01", "name": remote_name, "sha256": sha}],
+                    },
+                    sort_keys=True,
+                ).encode("utf-8"),
+            },
+        })
+
+    cand = tmp_path / "cand.md"
+    cand.write_bytes(body)
+
+    # Already renamed to target new_name -> crash-retry idempotent PASS
+    plan = prepare(
+        _make_drive(new_name),
+        tmp_path / "outbox_retry_ok",
+        "v2.4.0-1",
+        [
+            {
+                "id": "f_synth_card01",
+                "name": new_name,
+                "rename_from": old_name,
+                "mime": "text/markdown",
+                "path": str(cand),
+                "publish_parent": "p_synth_data",
+            }
+        ],
+        "p_synth_archive",
+        "f_synth_status",
+        carry_forward_artifacts=True,
+        environment="sandbox",
+    )
+    assert plan["entries"][0]["name"] == new_name
+
+    # Unrelated remote name -> still fails closed with RENAME_SOURCE_MISMATCH
+    with pytest.raises(ValueError, match="RENAME_SOURCE_MISMATCH"):
+        prepare(
+            _make_drive("unrelated_other_name.md"),
+            tmp_path / "outbox_retry_bad",
+            "v2.4.0-1",
+            [
+                {
+                    "id": "f_synth_card01",
+                    "name": new_name,
+                    "rename_from": old_name,
+                    "mime": "text/markdown",
+                    "path": str(cand),
+                    "publish_parent": "p_synth_data",
+                }
+            ],
+            "p_synth_archive",
+            "f_synth_status",
+            carry_forward_artifacts=True,
+            environment="sandbox",
+        )

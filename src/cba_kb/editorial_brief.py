@@ -11,6 +11,7 @@ Enforces:
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Mapping, Sequence
 
 from .actor import validate_person_uid
@@ -31,6 +32,15 @@ _REQUIRED_HARD_CASES = (
     "case_3_story_one_to_three_projection",
     "case_4_multi_source_discrepancy_and_silence_not_cause",
 )
+
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？])(?![。！？])|(?<=[.!?])(?=\s+)")
+
+
+def _split_sentences(text: str) -> List[str]:
+    """Split multi-sentence text into individual sentences without splitting decimals."""
+    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(text.strip()) if p and p.strip()]
+    return parts
 
 
 def _join_sentences(existing: str, next_sentence: str) -> str:
@@ -99,16 +109,17 @@ def compose_verified_brief(
             or fact.get("source_kind")
             or "verified_source"
         ).strip()
-        eligible.append(
-            {
-                "sentence": sentence,
-                "citation_label": citation_label,
-                "source_url": fact.get("source_url"),
-                "source_kind": fact.get("source_kind"),
-                "authority_scope": fact.get("authority_scope"),
-                "status": status or "VERIFIED_PRESENT",
-            }
-        )
+        for atomic_sentence in _split_sentences(sentence):
+            eligible.append(
+                {
+                    "sentence": atomic_sentence,
+                    "citation_label": citation_label,
+                    "source_url": fact.get("source_url"),
+                    "source_kind": fact.get("source_kind"),
+                    "authority_scope": fact.get("authority_scope"),
+                    "status": status or "VERIFIED_PRESENT",
+                }
+            )
 
     if not eligible:
         raise ValueError("NO_VERIFIED_FACTS_FOR_BRIEF")

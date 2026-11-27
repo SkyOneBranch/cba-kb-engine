@@ -1166,7 +1166,11 @@ def prepare(
         prefetched = map_readonly(drive, _prefetch_entry, local_entries, max_workers=8)
         for (i, entry, name, new, mode), (old, meta, native_doc) in zip(local_entries, prefetched):
             rename_from = entry.get('rename_from')
-            if rename_from and meta.get('name') is not None and meta.get('name') != rename_from:
+            if (
+                rename_from
+                and meta.get('name') is not None
+                and meta.get('name') not in (rename_from, name)
+            ):
                 raise ValueError('RENAME_SOURCE_MISMATCH')
             clean(old, 'before/' + name)
             if native_doc is not None:

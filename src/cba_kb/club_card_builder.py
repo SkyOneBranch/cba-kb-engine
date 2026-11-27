@@ -16,6 +16,7 @@ from .common import atomic
 from .consumer_surface import scrub_raw_drive_ids_for_consumer
 from .kc_render import _safe_filename_part, _sanitize_public_free_text
 from .kc_visibility import validate_card_visibility, verify_public_safe_card_text
+from .role_facets import build_coach_role_facets
 
 
 def _norm_token(value: Any) -> str:
@@ -201,6 +202,8 @@ def build_club_panorama_card(
         row_season = str(row.get("season") or "").strip()
         if row_season in roster_by_season:
             roster_by_season[row_season]["domestic"].append(dict(row))
+        elif not row_season and season_list:
+            roster_by_season[season_list[-1]]["domestic"].append(dict(row))
 
     for row in foreign_rows or ():
         if not isinstance(row, Mapping):
@@ -243,22 +246,27 @@ def build_club_panorama_card(
         puid = str(snap.get("person_uid") or "").strip() or None
         if not pname and not puid:
             continue
-        key = (_norm_token(puid or pname), s_season)
+        eff_season = s_season or season_list[-1]
+        key = (_norm_token(puid or pname), eff_season)
         if key in seen_coach_keys:
             continue
         seen_coach_keys.add(key)
-        normalized_facets.append({
-            "person_uid": puid,
-            "person_name": pname or puid,
-            "organization_id": organization_id,
-            "season": s_season or season_list[-1],
-            "league_listed_role": str(snap.get("league_listed_role") or "OBSERVED_EMPTY"),
-            "club_appointed_role": str(snap.get("club_appointed_role") or "OBSERVED_EMPTY"),
-            "gameday_acting_role": str(snap.get("gameday_acting_role") or "OBSERVED_EMPTY"),
-            "has_institutional_discrepancy": False,
-            "discrepancy_code": None,
-            "discrepancy_explanation": None,
-        })
+        evidence_refs = [
+            str(snap.get(k)).strip()
+            for k in ("source_url", "evidence_ref")
+            if isinstance(snap.get(k), str) and str(snap.get(k)).strip()
+        ]
+        facet_obj = build_coach_role_facets(
+            person_uid=puid,
+            person_name=pname or str(puid or ""),
+            organization_id=organization_id,
+            season=eff_season,
+            league_listed_role=snap.get("league_listed_role") or snap.get("role"),
+            club_appointed_role=snap.get("club_appointed_role"),
+            gameday_acting_role=snap.get("gameday_acting_role"),
+            evidence_refs=evidence_refs,
+        )
+        normalized_facets.append(facet_obj.to_dict())
 
     # 3. Organization-projected story timeline
     projected_stories = _project_org_stories(
@@ -325,8 +333,8 @@ def build_club_panorama_card(
                 "| --- | --- | --- | --- |",
             ])
             for r in for_rows:
-                p_zh = str(r.get("player_zh") or "-").strip()
-                p_en = str(r.get("player_en") or "-").strip()
+                p_zh = str(r.get("player_zh") or r.get("player_name") or "-").strip()
+                p_en = str(r.get("player_en") or r.get("player_name_en") or r.get("player") or "-").strip()
                 pos = str(r.get("position") or "-").strip()
                 jersey = str(r.get("jersey_number") or "-").strip()
                 if is_public:

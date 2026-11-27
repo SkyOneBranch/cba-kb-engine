@@ -15,6 +15,7 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from urllib.parse import urlsplit
 
 from .actor import ActorError, validate_person_uid
 
@@ -281,14 +282,39 @@ def _is_public_export_allowed(story: Mapping[str, Any]) -> bool:
     return True
 
 
+def _clean_public_https_url(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text:
+        return ""
+    parsed = urlsplit(text)
+    if parsed.scheme.lower() != "https" or not parsed.netloc:
+        return ""
+    host = parsed.netloc.rsplit("@", 1)[-1].split(":", 1)[0].lower()
+    if host in ("drive.google.com", "docs.google.com") or host.endswith(
+        (".drive.google.com", ".docs.google.com")
+    ):
+        return ""
+    return text
+
+
 def _public_canonical_source(source: Any) -> Any:
+    if isinstance(source, str):
+        if "://" in source:
+            return _clean_public_https_url(source)
+        return source
     if not isinstance(source, Mapping):
         return source
-    return {
-        k: v
-        for k, v in source.items()
-        if k in {"source_id", "title", "url", "source_kind", "authority_scope"}
-    }
+    out: Dict[str, Any] = {}
+    for k, v in source.items():
+        if k not in {"source_id", "title", "url", "source_kind", "authority_scope"}:
+            continue
+        if k == "url":
+            out["url"] = _clean_public_https_url(v)
+        else:
+            out[k] = v
+    return out
 
 
 def project_stories_for_entity(

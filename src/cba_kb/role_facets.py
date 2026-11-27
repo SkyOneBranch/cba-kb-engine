@@ -87,8 +87,8 @@ def _select_matching_snapshot(
             continue
 
         snap_uid = snap.get("person_uid")
-        if person_uid and snap_uid:
-            if str(snap_uid).strip() != person_uid:
+        if person_uid:
+            if not snap_uid or str(snap_uid).strip() != person_uid:
                 continue
             matches.append(snap)
             continue

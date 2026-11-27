@@ -405,12 +405,17 @@ def _public_locator(value: Any) -> Optional[str]:
 
 def _sanitize_public_free_text(value: Any, *, fallback: str = "-") -> str:
     """Strip verbatim blockquotes (including lazy continuations & inline `>`),
-    fenced code blocks (``` and ~~~), private URIs, internal clues, and internal IDs for public_safe."""
+    fenced code blocks (``` and ~~~, fail-closed on unclosed fences), private URIs,
+    internal clues, and internal IDs for public_safe."""
     if not isinstance(value, str) or not value.strip():
         return fallback
     cleaned = _FENCED_BLOCK_RE.sub("", value)
     cleaned = _TILDE_FENCED_BLOCK_RE.sub("", cleaned)
-    cleaned = cleaned.replace("```", "").replace("~~~", "")
+    unclosed_positions = [
+        pos for marker in ("```", "~~~") if (pos := cleaned.find(marker)) != -1
+    ]
+    if unclosed_positions:
+        cleaned = cleaned[: min(unclosed_positions)]
     kept_lines: List[str] = []
     in_blockquote = False
     for raw_line in cleaned.splitlines():
@@ -1071,47 +1076,66 @@ def render_research_card(
                         else:
                             lines.append(f"  * Discrepancy [{d_code}]")
 
-        # 8b. Career Role Tenures (Player-to-Coach unified PERS-* profile)
+        # 8b. Career Role Tenures (Player-to-Coach unified PERS-* profile; Editorial Iron Rule 1)
         unified_prof = payload.get("unified_profile")
         tenures_raw = payload.get("role_tenures")
         if tenures_raw is None and isinstance(unified_prof, Mapping):
             tenures_raw = unified_prof.get("role_tenures")
         if isinstance(tenures_raw, (list, tuple)) and tenures_raw:
-            lines.extend([
-                "",
-                "## Career Role Tenures",
-            ])
-            if isinstance(unified_prof, Mapping):
-                p_uid = str(unified_prof.get("person_uid") or "").strip()
-                if p_uid:
-                    lines.append(f"- Person UID: {p_uid}")
-                linked_uids = unified_prof.get("linked_player_uids") or ()
-                if linked_uids:
-                    lines.append(
-                        f"- Linked Player UIDs: {', '.join(str(x) for x in linked_uids)}"
-                    )
-                if unified_prof.get("is_player_to_coach_transition"):
-                    lines.append("- Career Transition: PLAYER -> COACH (unified lifetime profile)")
+            tenure_dicts: List[Dict[str, Any]] = []
             for t in tenures_raw:
                 td = t.to_dict() if hasattr(t, "to_dict") and callable(t.to_dict) else (
                     dict(t) if isinstance(t, Mapping) else None
                 )
-                if not td:
-                    continue
-                t_role = str(td.get("role") or "-")
-                t_org = str(td.get("organization_name") or td.get("organization_id") or "-")
-                t_start = str(td.get("season_start") or td.get("start_date") or "-")
-                t_end = str(td.get("season_end") or td.get("end_date") or "PRESENT")
-                t_scope = str(td.get("authority_scope") or "LEAGUE_OFFICIAL")
-                lines.append(f"- {t_start}..{t_end} | {t_role} | {t_org} [{t_scope}]")
+                if td:
+                    tenure_dicts.append(td)
+            scoped_tenures = enforce_authority_scope(tenure_dicts)
+            accepted_tenures = [
+                *scoped_tenures["accepted_official"],
+                *scoped_tenures["accepted_non_official"],
+            ]
+            if accepted_tenures:
+                lines.extend([
+                    "",
+                    "## Career Role Tenures",
+                ])
+                if isinstance(unified_prof, Mapping):
+                    p_uid = str(unified_prof.get("person_uid") or "").strip()
+                    if p_uid:
+                        lines.append(f"- Person UID: {p_uid}")
+                    linked_uids = unified_prof.get("linked_player_uids") or ()
+                    if linked_uids:
+                        lines.append(
+                            f"- Linked Player UIDs: {', '.join(str(x) for x in linked_uids)}"
+                        )
+                    if unified_prof.get("is_player_to_coach_transition"):
+                        lines.append("- Career Transition: PLAYER -> COACH (unified lifetime profile)")
+                for td in accepted_tenures:
+                    t_role = str(td.get("role") or "-")
+                    t_org = str(td.get("organization_name") or td.get("organization_id") or "-")
+                    t_start = str(td.get("season_start") or td.get("start_date") or "-")
+                    t_end = str(td.get("season_end") or td.get("end_date") or "PRESENT")
+                    t_scope = str(td.get("authority_scope") or "").strip().upper()
+                    lines.append(f"- {t_start}..{t_end} | {t_role} | {t_org} [{t_scope}]")
 
-        # 8c. Narrative & Key Stories (1-to-3 projected StoryRecords)
+        # 8c. Narrative & Key Stories (1-to-3 projected StoryRecords; Editorial Iron Rule 3)
         proj_stories = payload.get("projected_stories")
+        if proj_stories is None:
+            proj_stories = payload.get("story_records")
         if isinstance(proj_stories, (list, tuple)) and proj_stories:
-            story_lines: List[str] = []
-            for st_item in proj_stories:
-                if not isinstance(st_item, Mapping):
+            normalized_stories: List[Dict[str, Any]] = []
+            for st_raw in proj_stories:
+                if not isinstance(st_raw, Mapping):
                     continue
+                st_copy = dict(st_raw)
+                if not st_copy.get("canonical_source_id") and isinstance(st_copy.get("canonical_source"), Mapping):
+                    c_src_id = str(st_copy["canonical_source"].get("source_id") or "").strip()
+                    if c_src_id:
+                        st_copy["canonical_source_id"] = c_src_id
+                normalized_stories.append(st_copy)
+            deduped_stories = dedup_reprints_and_preserve_discrepancies(normalized_stories)
+            story_lines: List[str] = []
+            for st_item in deduped_stories["canonical_items"]:
                 src_kind = str(
                     st_item.get("source_kind")
                     or (
@@ -1132,6 +1156,7 @@ def render_research_card(
                 raw_sum = str(
                     st_item.get("summary")
                     or st_item.get("public_perspective_summary")
+                    or st_item.get("claim")
                     or ""
                 ).strip()
                 if is_public:
@@ -1152,12 +1177,15 @@ def render_research_card(
                     *story_lines,
                 ])
 
-        # 8d. Timeline & Multi-Source Observations (Editorial Iron Rule 2)
+        # 8d. Timeline & Multi-Source Observations (Editorial Iron Rules 2 & 3)
         raw_timeline = payload.get("timeline_events")
         if isinstance(raw_timeline, (list, tuple)) and raw_timeline:
             filtered_tl = filter_timeline_events_silence_not_cause(raw_timeline)
+            deduped_tl = dedup_reprints_and_preserve_discrepancies(
+                filtered_tl["main_timeline"]
+            )
             tl_lines: List[str] = []
-            for ev in filtered_tl["main_timeline"]:
+            for ev in deduped_tl["canonical_items"]:
                 ev_src_kind = str(ev.get("source_kind") or "").strip().lower()
                 if is_public and ev_src_kind == "unreferenced_encyclopedia":
                     continue
