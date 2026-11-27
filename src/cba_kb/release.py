@@ -1135,6 +1135,10 @@ def prepare(
             name = entry['name']
             if Path(name).name != name:
                 raise ValueError('Unsafe artifact name')
+            rename_from = entry.get('rename_from')
+            if rename_from is not None:
+                if not isinstance(rename_from, str) or not rename_from or Path(rename_from).name != rename_from:
+                    raise ValueError('Unsafe artifact rename_from')
             new = Path(entry['path']).read_bytes()
             mode = entry.get('mode', 'binary')
             if mode not in ('binary', 'managed_doc'):
@@ -1161,6 +1165,9 @@ def prepare(
 
         prefetched = map_readonly(drive, _prefetch_entry, local_entries, max_workers=8)
         for (i, entry, name, new, mode), (old, meta, native_doc) in zip(local_entries, prefetched):
+            rename_from = entry.get('rename_from')
+            if rename_from and meta.get('name') is not None and meta.get('name') != rename_from:
+                raise ValueError('RENAME_SOURCE_MISMATCH')
             clean(old, 'before/' + name)
             if native_doc is not None:
                 clean(json.dumps(native_doc, ensure_ascii=False).encode(), 'native/' + name)
@@ -1170,7 +1177,7 @@ def prepare(
                 'id': entry['id'], 'name': name, 'mime': entry['mime'], 'mode': mode,
                 'before': f'before/{i}', 'candidate': f'candidate/{i}',
                 'before_hash': digest(old), 'after_hash': digest(new), 'meta': fingerprint(meta),
-                **{k: entry[k] for k in ('staging_parent', 'publish_parent', 'logical_key') if k in entry},
+                **{k: entry[k] for k in ('staging_parent', 'publish_parent', 'logical_key', 'rename_from') if k in entry and entry[k]},
             })
         save(root/'plan.json',plan)
         prepared_inventory = None
@@ -1217,6 +1224,23 @@ def relocate(drive, entry, destination):
     drive.move(entry['id'],destination,other)
     if destination not in drive.meta(entry['id']).get('parents',[]):
         raise RuntimeError('Object move verification failed')
+
+
+def _apply_controlled_rename(drive, entry):
+    """Apply an explicit controlled filename rename (O-232-01) and verify readback."""
+    rename_from = entry.get('rename_from')
+    if not rename_from or rename_from == entry['name']:
+        return
+    current_meta = drive.meta(entry['id'])
+    current_name = current_meta.get('name')
+    if current_name == entry['name']:
+        return
+    if current_name is not None and current_name != rename_from:
+        raise RuntimeError('Remote filename changed during publication: ' + entry['name'])
+    drive.rename(entry['id'], entry['name'])
+    after_meta = drive.meta(entry['id'])
+    if after_meta.get('name') != entry['name']:
+        raise RuntimeError('Rename verification failed: ' + entry['name'])
 
 
 def verified_local(root, entry, key):
@@ -1826,6 +1850,7 @@ def publish(drive, root, single_writer=False, execution_authority=None):
                 stage('publish',f'{index}/{len(plan["entries"])} {e["name"]}')
                 data=payload(drive,e)
                 if digest(data)==e['after_hash']:
+                    _apply_controlled_rename(drive, e)
                     journal.setdefault('uploaded',{})[e['id']]=True
                     save(root/'journal.json',journal); continue
                 if digest(data)!=e['before_hash']: raise RuntimeError('Remote changed during publication')
@@ -1857,6 +1882,7 @@ def publish(drive, root, single_writer=False, execution_authority=None):
                     journal['inflight']=None
                     save(root/'journal.json',journal)
                     raise exc
+                _apply_controlled_rename(drive, e)
                 journal.setdefault('uploaded',{})[e['id']]=True; journal['inflight']=None
                 save(root/'journal.json',journal)
             if journal['state'] == 'PUBLISHING':
@@ -2979,7 +3005,11 @@ def verify(drive, root, execution_authority=None):
         mode = e.get('mode', 'binary')
         meta = remote_index.get(e['id'])
         server_sha = _valid_server_sha256(meta, mode=mode) if meta is not None else None
-        if server_sha is not None and meta.get('mimeType') == e['mime'] and server_sha == e['after_hash']:
+        name_ok = (
+            not e.get('rename_from')
+            or (meta is not None and meta.get('name') == e['name'])
+        )
+        if server_sha is not None and meta.get('mimeType') == e['mime'] and server_sha == e['after_hash'] and name_ok:
             if mode == 'managed_doc':
                 fallback_specs.append((e, meta, True))
             continue
@@ -3004,6 +3034,8 @@ def verify(drive, root, execution_authority=None):
                 clean(json.dumps(native_doc, ensure_ascii=False).encode(), 'native/' + e['name'])
             if not native_only:
                 if actual_meta['mimeType'] != e['mime'] or digest(content) != e['after_hash']:
+                    raise RuntimeError('Remote verification failed: ' + e['name'])
+                if e.get('rename_from') and actual_meta.get('name') != e['name']:
                     raise RuntimeError('Remote verification failed: ' + e['name'])
     if plan.get('closure'):
         validate_closure(
@@ -3175,6 +3207,9 @@ def restore(
             readback = payload(drive,e)
             if digest(readback)!=e['before_hash']: raise RuntimeError('Rollback readback failed')
             clean(readback, 'restore/' + e['name'])
+            if e.get('rename_from') and hasattr(drive, 'rename'):
+                if drive.meta(e['id']).get('name') != e['rename_from']:
+                    drive.rename(e['id'], e['rename_from'])
             relocate(drive,e,e.get('staging_parent'))
         if plan.get('closure'):
             verify_protected(drive, root, plan)

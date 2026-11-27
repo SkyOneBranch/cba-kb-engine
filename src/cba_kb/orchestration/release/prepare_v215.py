@@ -107,6 +107,7 @@ V222_1_BASELINE_SHA = "29589e7d4d90a81a6507ecaa1ec73945a5eecfc1"
 V230_1_BASELINE_SHA = "3a7239361b2b81f763dce3477b3c3ad81f357b90"
 V231_1_BASELINE_SHA = "7afb18b1e867146ed99cc73fa16e53d990c54e95"
 V232_1_BASELINE_SHA = "985c647a459ef7a7c970445a9a37db082eaecc71"
+V240_1_BASELINE_SHA = "3b65bcfcc9365d3f081150f516b9dba679ec965b"
 
 V215_RELEASE_SPECS: dict[str, dict] = {
     "v2.1.5-1": {
@@ -163,6 +164,20 @@ V215_RELEASE_SPECS: dict[str, dict] = {
         "enable_on_demand_cards_v230": True,
         "enable_v231_surface_enhancements": True,
         "enable_v232_card_pipeline": True,
+        "active_league_season": "2026-2027",
+        "incremental_delta_only": True,
+        "archive_format": "bundle_v1",
+    },
+    "v2.4.0-1": {
+        "product_baseline_sha": V240_1_BASELINE_SHA,
+        "enable_consumer_surface_v215": True,
+        "enable_operational_kb_v220": True,
+        "enable_curated_compact_surface_v222": True,
+        "enable_observation_horizon_v230": True,
+        "enable_on_demand_cards_v230": True,
+        "enable_v231_surface_enhancements": True,
+        "enable_v232_card_pipeline": True,
+        "enable_v240_shenzhen_narrative_pilot": True,
         "active_league_season": "2026-2027",
         "incremental_delta_only": True,
         "archive_format": "bundle_v1",
@@ -394,6 +409,7 @@ def project_targets(
     ]
     declared_consumer_keys = set()
     updated_consumer_specs: dict[str, str] = {}
+    renamed_consumer_names: dict[str, str] = {}
     if declared_consumer_targets:
         if not isinstance(declared_consumer_targets, dict):
             raise ProjectionError("DECLARED_CONSUMER_TARGETS_INVALID")
@@ -425,6 +441,11 @@ def project_targets(
                 raise ProjectionError(f"DECLARED_CONSUMER_TARGET_HASH_REQUIRED:{ckey}")
             if is_existing_updatable:
                 updated_consumer_specs[ckey] = content_sha
+                target_name = str(spec["name"])
+                if Path(target_name).name != target_name:
+                    raise ProjectionError(f"DECLARED_CONSUMER_TARGET_INVALID:{ckey}")
+                if target_name != existing[ckey]["name"]:
+                    renamed_consumer_names[ckey] = target_name
             else:
                 target_parent = spec.get("publish_parent") or code_parent
                 declared_consumer_keys.add(ckey)
@@ -457,9 +478,15 @@ def project_targets(
             new_sha = updated_consumer_specs[logical_key]
             item["current_sha256"] = new_sha
             item["consumer_target_kind"] = "consumer_surface"
-            item["disposition"] = (
-                "unchanged" if item["previous_sha256"] == new_sha else "modified"
-            )
+            new_name = renamed_consumer_names.get(logical_key)
+            if new_name is not None and new_name != item["name"]:
+                item["rename_from"] = item["name"]
+                item["name"] = new_name
+                item["disposition"] = "modified"
+            else:
+                item["disposition"] = (
+                    "unchanged" if item["previous_sha256"] == new_sha else "modified"
+                )
         elif logical_key in control_keys:
             item["disposition"] = "metadata_update"
         elif logical_key in retiring_keys:
@@ -545,7 +572,7 @@ def project_targets(
     all_consumer_hashes.update(updated_consumer_specs)
     modified_consumer = sorted(
         k for k, sha in updated_consumer_specs.items()
-        if existing[k]["previous_sha256"] != sha
+        if existing[k]["previous_sha256"] != sha or k in renamed_consumer_names
     )
     projection["semantic_delta_signature"] = _json_hash({
         "keys": final_keys,
@@ -554,6 +581,7 @@ def project_targets(
         "removed": removed_code_keys,
         **({"retired": sorted(retiring_keys)} if retiring_keys else {}),
         **({"modified_consumer": modified_consumer} if modified_consumer else {}),
+        **({"renamed_consumer": renamed_consumer_names} if renamed_consumer_names else {}),
         **({"consumer_surface_hashes": all_consumer_hashes} if all_consumer_hashes else {}),
         "counts": {
             "previous": projection["previous_artifact_count"],
@@ -891,7 +919,7 @@ def _candidate_inputs(
         elif item.get("consumer_target_kind") == "consumer_surface":
             change_class = (
                 "CONSUMER_SURFACE_UPDATE"
-                if data != previous_by_key.get(logical_key)
+                if (data != previous_by_key.get(logical_key) or item.get("rename_from"))
                 else "CONSUMER_SURFACE_CARRY_FORWARD"
             )
         elif logical_key in CONTROL_KEYS:
@@ -915,6 +943,8 @@ def _candidate_inputs(
                 if logical_key in previous_by_key else None
             ),
         }
+        if item.get("rename_from"):
+            entry["rename_from"] = item["rename_from"]
         if logical_key in new_by_key:
             entry.update({
                 "allowed_parents": [
@@ -971,6 +1001,8 @@ def _manifest_candidate(
             row["source_type"] = row.get("source_type") or "generated"
             row["local_path"] = row.get("local_path") or logical_key
             row["status"] = "published"
+            if "name" in columns:
+                row["name"] = item_by_key[logical_key]["name"]
         mode = item_by_key[logical_key].get("mode", "binary")
         row["hash_scope"] = "managed_prefix" if mode == "managed_doc" else "bytes"
         if logical_key == "input/manifest.csv":

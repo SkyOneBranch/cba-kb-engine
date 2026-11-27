@@ -138,6 +138,7 @@ CARD_VISIBILITY_MODES = ("internal_full", "public_safe")
 _PUBLIC_SAFE_FORBIDDEN_SUBSTRINGS = (
     "web 剪藏",
     "## document passage",
+    "[internal_clue_only",
 )
 _PUBLIC_SAFE_TEN_SOURCES_RE = re.compile(r"10[\s_-]+sources", re.IGNORECASE)
 _PUBLIC_SAFE_SCHEME_RE = re.compile(r"(?:r2|s3|file)://", re.IGNORECASE)
@@ -191,7 +192,7 @@ def verify_public_safe_card_text(markdown: str) -> None:
         raise ValueError("PUBLIC_SAFE_REDACTION_VIOLATION:non_string_markdown")
 
     violations: List[str] = []
-    lowered = markdown.lower()
+    lowered = markdown.casefold()
 
     for forbidden in _PUBLIC_SAFE_FORBIDDEN_SUBSTRINGS:
         if forbidden in lowered:
@@ -215,7 +216,7 @@ def verify_public_safe_card_text(markdown: str) -> None:
     if _PUBLIC_SAFE_DOC_ID_RE.search(markdown):
         violations.append("internal_doc_id")
 
-    if "```" in markdown:
+    if "```" in markdown or "~~~" in markdown:
         violations.append("fenced_code_block")
 
     for line in markdown.splitlines():

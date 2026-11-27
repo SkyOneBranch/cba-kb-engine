@@ -1,0 +1,430 @@
+"""Club Panorama Card builder for CBA organizations (REQ-240 P0-2).
+
+Strictly local, zero-network, zero-Drive-API:
+- Aggregates multi-season domestic + foreign rosters, 3-facet coaching staff
+  governance, and organization-projected StoryRecords into a single markdown card.
+- Enforces validate_card_visibility() and verify_public_safe_card_text() under
+  visibility="public_safe".
+"""
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence
+
+from .common import atomic
+from .consumer_surface import scrub_raw_drive_ids_for_consumer
+from .kc_render import _safe_filename_part, _sanitize_public_free_text
+from .kc_visibility import validate_card_visibility, verify_public_safe_card_text
+
+
+def _norm_token(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().split()).casefold()
+
+
+def club_card_consumer_filename(
+    club_label: str,
+    seasons_label: str,
+    *,
+    visibility: str = "internal_full",
+) -> str:
+    """Build self-describing Chinese consumer filename for club panorama cards."""
+    vis = validate_card_visibility(visibility)
+    safe_club = _safe_filename_part(club_label, "club_name")
+    safe_seasons = _safe_filename_part(seasons_label, "seasons")
+    if vis == "public_safe":
+        return f"俱乐部全景卡_{safe_club}_{safe_seasons}_PUBLIC_CURRENT.md"
+    return f"俱乐部全景卡_{safe_club}_{safe_seasons}_CURRENT.md"
+
+
+def _normalize_org_profile(
+    club_query: str,
+    organization_profile: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    if organization_profile is None:
+        raw: Dict[str, Any] = {}
+    elif hasattr(organization_profile, "to_dict") and callable(organization_profile.to_dict):
+        raw = dict(organization_profile.to_dict())
+    elif isinstance(organization_profile, Mapping):
+        raw = dict(organization_profile)
+    else:
+        raw = {}
+
+    q = club_query.strip()
+    org_id = str(raw.get("organization_id") or "").strip() or q
+    canonical_name = str(raw.get("canonical_name") or "").strip() or q
+    short_name = str(raw.get("short_name") or "").strip() or canonical_name
+    aliases_raw = raw.get("aliases") or ()
+    aliases = [str(a).strip() for a in aliases_raw if str(a).strip()]
+    league = str(raw.get("league") or "CBA").strip() or "CBA"
+    city = str(raw.get("city") or "").strip() or None
+    return {
+        "organization_id": org_id,
+        "canonical_name": canonical_name,
+        "short_name": short_name,
+        "aliases": aliases,
+        "league": league,
+        "city": city,
+    }
+
+
+def _club_match_tokens(club_query: str, org: Mapping[str, Any]) -> set[str]:
+    tokens = {
+        _norm_token(club_query),
+        _norm_token(org.get("organization_id")),
+        _norm_token(org.get("canonical_name")),
+        _norm_token(org.get("short_name")),
+        *(_norm_token(a) for a in (org.get("aliases") or ())),
+    }
+    tokens.discard("")
+    return tokens
+
+
+def _row_matches_club(row: Mapping[str, Any], club_tokens: set[str]) -> bool:
+    row_tokens = {
+        _norm_token(row.get("organization_id")),
+        _norm_token(row.get("club_official")),
+        _norm_token(row.get("club")),
+        _norm_token(row.get("club_id")),
+        _norm_token(row.get("team_name")),
+        _norm_token(row.get("team_id")),
+    }
+    row_tokens.discard("")
+    if not row_tokens:
+        return False
+    return bool(row_tokens & club_tokens)
+
+
+def _normalize_facet_item(item: Any) -> Optional[Dict[str, Any]]:
+    if hasattr(item, "to_dict") and callable(item.to_dict):
+        return dict(item.to_dict())
+    if isinstance(item, Mapping):
+        return dict(item)
+    return None
+
+
+def _project_org_stories(
+    story_records: Sequence[Mapping[str, Any]],
+    *,
+    organization_id: str,
+    visibility: str,
+) -> List[Dict[str, Any]]:
+    if not story_records:
+        return []
+    try:
+        from .story_record import project_stories_for_entity
+
+        return project_stories_for_entity(
+            story_records,
+            entity_id=organization_id,
+            entity_kind="organization",
+            visibility=visibility,
+        )
+    except ImportError:
+        projected: List[Dict[str, Any]] = []
+        is_public = visibility == "public_safe"
+        for st in story_records:
+            if not isinstance(st, Mapping):
+                continue
+            org_ids = [str(x).strip() for x in (st.get("organization_ids") or ())]
+            if organization_id not in org_ids:
+                continue
+            src = st.get("canonical_source") if isinstance(st.get("canonical_source"), Mapping) else {}
+            if is_public and str(src.get("source_kind") or "").strip().lower() == "unreferenced_encyclopedia":
+                continue
+            vis_pol = st.get("visibility_policy") if isinstance(st.get("visibility_policy"), Mapping) else {}
+            if is_public and vis_pol.get("public_export_allowed") is False:
+                continue
+            summaries = [
+                str(p.get("public_perspective_summary") or "").strip()
+                for p in (st.get("participants") or ())
+                if isinstance(p, Mapping) and str(p.get("public_perspective_summary") or "").strip()
+            ]
+            projected.append({
+                "story_id": st.get("story_id"),
+                "title": st.get("title"),
+                "occurred_season": st.get("occurred_season"),
+                "occurred_date": st.get("occurred_date"),
+                "published_at": st.get("published_at"),
+                "summary": " ".join(summaries) or str(st.get("title") or ""),
+            })
+        return projected
+
+
+def build_club_panorama_card(
+    club_query: str,
+    *,
+    seasons: Sequence[str] = ("2025-2026", "2026-2027"),
+    organization_profile: Optional[Mapping[str, Any]] = None,
+    master_rows: Optional[Sequence[Mapping[str, Any]]] = None,
+    foreign_rows: Optional[Sequence[Mapping[str, Any]]] = None,
+    staff_snapshots: Optional[Sequence[Mapping[str, Any]]] = None,
+    coach_role_facets: Optional[Sequence[Any]] = None,
+    story_records: Optional[Sequence[Mapping[str, Any]]] = None,
+    visibility: str = "internal_full",
+    output_dir: Optional[str | Path] = None,
+    observed_until: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Assemble and render a multi-season Club Panorama Card.
+
+    Aggregates 2-season roster (domestic + foreign), 3-facet coaching staff,
+    and organization-projected story timeline.
+    """
+    if not isinstance(club_query, str) or not club_query.strip():
+        raise ValueError("CLUB_QUERY_REQUIRED")
+
+    vis = validate_card_visibility(visibility)
+    is_public = vis == "public_safe"
+
+    org = _normalize_org_profile(club_query, organization_profile)
+    organization_id = org["organization_id"]
+    club_name = org["canonical_name"]
+    short_name = org["short_name"]
+    club_tokens = _club_match_tokens(club_query, org)
+
+    season_list = [str(s).strip() for s in (seasons or ()) if str(s).strip()]
+    if not season_list:
+        season_list = ["2025-2026", "2026-2027"]
+    seasons_label = "_".join(season_list)
+
+    # 1. Multi-season roster aggregation (domestic + foreign)
+    roster_by_season: Dict[str, Dict[str, List[Dict[str, Any]]]] = {
+        s: {"domestic": [], "foreign": []} for s in season_list
+    }
+    for row in master_rows or ():
+        if not isinstance(row, Mapping):
+            continue
+        if not _row_matches_club(row, club_tokens):
+            continue
+        row_season = str(row.get("season") or "").strip()
+        if row_season in roster_by_season:
+            roster_by_season[row_season]["domestic"].append(dict(row))
+
+    for row in foreign_rows or ():
+        if not isinstance(row, Mapping):
+            continue
+        if not _row_matches_club(row, club_tokens):
+            continue
+        row_season = str(row.get("season") or "").strip()
+        if row_season in roster_by_season:
+            roster_by_season[row_season]["foreign"].append(dict(row))
+        elif not row_season and season_list:
+            roster_by_season[season_list[-1]]["foreign"].append(dict(row))
+
+    # 2. 3-facet coaching staff aggregation
+    normalized_facets: List[Dict[str, Any]] = []
+    seen_coach_keys: set[tuple[str, str]] = set()
+    for raw_facet in coach_role_facets or ():
+        fd = _normalize_facet_item(raw_facet)
+        if not fd:
+            continue
+        f_org = _norm_token(fd.get("organization_id"))
+        if f_org and f_org not in club_tokens:
+            continue
+        f_season = str(fd.get("season") or "").strip()
+        if f_season and f_season not in season_list:
+            continue
+        key = (_norm_token(fd.get("person_uid") or fd.get("person_name")), f_season)
+        seen_coach_keys.add(key)
+        normalized_facets.append(fd)
+
+    for snap in staff_snapshots or ():
+        if not isinstance(snap, Mapping):
+            continue
+        s_org = _norm_token(snap.get("organization_id") or snap.get("club_official") or snap.get("club"))
+        if s_org and s_org not in club_tokens:
+            continue
+        s_season = str(snap.get("season") or "").strip()
+        if s_season and s_season not in season_list:
+            continue
+        pname = str(snap.get("person_name") or "").strip()
+        puid = str(snap.get("person_uid") or "").strip() or None
+        if not pname and not puid:
+            continue
+        key = (_norm_token(puid or pname), s_season)
+        if key in seen_coach_keys:
+            continue
+        seen_coach_keys.add(key)
+        normalized_facets.append({
+            "person_uid": puid,
+            "person_name": pname or puid,
+            "organization_id": organization_id,
+            "season": s_season or season_list[-1],
+            "league_listed_role": str(snap.get("league_listed_role") or "OBSERVED_EMPTY"),
+            "club_appointed_role": str(snap.get("club_appointed_role") or "OBSERVED_EMPTY"),
+            "gameday_acting_role": str(snap.get("gameday_acting_role") or "OBSERVED_EMPTY"),
+            "has_institutional_discrepancy": False,
+            "discrepancy_code": None,
+            "discrepancy_explanation": None,
+        })
+
+    # 3. Organization-projected story timeline
+    projected_stories = _project_org_stories(
+        story_records or (),
+        organization_id=organization_id,
+        visibility=vis,
+    )
+
+    # 4. Render Markdown
+    lines: List[str] = [
+        f"# 俱乐部全景卡｜{club_name}（{organization_id}）｜{seasons_label}｜CURRENT"
+    ]
+    if is_public:
+        lines.append("- Visibility: PUBLIC_SAFE")
+    lines.append("")
+
+    lines.extend([
+        "## Observation Horizon",
+        f"- observed_until: {observed_until or 'UNKNOWN'}",
+        f"- seasons_covered: {', '.join(season_list)}",
+        "",
+        "## Organization Profile",
+        f"- Organization ID: {organization_id}",
+        f"- Canonical Name: {club_name}",
+        f"- Short Name: {short_name}",
+        f"- League: {org['league']}",
+    ])
+    if org.get("city"):
+        lines.append(f"- City: {org['city']}")
+
+    lines.extend([
+        "",
+        f"## Multi-Season Roster ({', '.join(season_list)})",
+    ])
+    for s in season_list:
+        dom_rows = roster_by_season[s]["domestic"]
+        for_rows = roster_by_season[s]["foreign"]
+        lines.extend([
+            "",
+            f"### {s} Domestic Roster",
+        ])
+        if dom_rows:
+            lines.extend([
+                "| Player | Contract Category | Registration Status |",
+                "| --- | --- | --- |",
+            ])
+            for r in dom_rows:
+                p_disp = str(r.get("player") or r.get("player_name") or "-").strip()
+                cat = str(r.get("contract_category") or "未公示 (UNKNOWN)").strip() or "未公示 (UNKNOWN)"
+                reg_st = str(r.get("registration_status") or "-").strip() or "-"
+                if is_public:
+                    p_disp = _sanitize_public_free_text(p_disp, fallback="-")
+                    cat = _sanitize_public_free_text(cat, fallback="-")
+                    reg_st = _sanitize_public_free_text(reg_st, fallback="-")
+                lines.append(f"| {p_disp} | {cat} | {reg_st} |")
+        else:
+            lines.append("- No domestic roster records observed in local snapshot.")
+
+        if for_rows:
+            lines.extend([
+                "",
+                f"### {s} Foreign Roster",
+                "| Player (ZH) | Player (EN) | Position | Jersey |",
+                "| --- | --- | --- | --- |",
+            ])
+            for r in for_rows:
+                p_zh = str(r.get("player_zh") or "-").strip()
+                p_en = str(r.get("player_en") or "-").strip()
+                pos = str(r.get("position") or "-").strip()
+                jersey = str(r.get("jersey_number") or "-").strip()
+                if is_public:
+                    p_zh = _sanitize_public_free_text(p_zh, fallback="-")
+                    p_en = _sanitize_public_free_text(p_en, fallback="-")
+                lines.append(f"| {p_zh} | {p_en} | {pos} | {jersey} |")
+
+    lines.extend([
+        "",
+        "## Coaching Staff (3-Facet Role Governance)",
+    ])
+    if normalized_facets:
+        for fd in normalized_facets:
+            c_name = str(fd.get("person_name") or fd.get("person_uid") or "-")
+            c_season = str(fd.get("season") or "-")
+            l_role = str(fd.get("league_listed_role") or "OBSERVED_EMPTY")
+            c_role = str(fd.get("club_appointed_role") or "OBSERVED_EMPTY")
+            g_role = str(fd.get("gameday_acting_role") or "OBSERVED_EMPTY")
+            lines.append(
+                f"- {c_name} ({c_season}): "
+                f"league_listed_role={l_role} | "
+                f"club_appointed_role={c_role} | "
+                f"gameday_acting_role={g_role}"
+            )
+            if fd.get("has_institutional_discrepancy"):
+                d_code = str(fd.get("discrepancy_code") or "LEAGUE_VS_CLUB_ROLE_DISCREPANCY")
+                raw_expl = str(fd.get("discrepancy_explanation") or "").strip()
+                expl = (
+                    _sanitize_public_free_text(raw_expl, fallback="-")
+                    if is_public
+                    else raw_expl
+                )
+                if expl and expl != "-":
+                    lines.append(f"  * Discrepancy [{d_code}]: {expl}")
+                else:
+                    lines.append(f"  * Discrepancy [{d_code}]")
+    else:
+        lines.append("- No coaching staff facets observed in local snapshot.")
+
+    lines.extend([
+        "",
+        "## Organization Narrative & Story Timeline",
+    ])
+    if projected_stories:
+        for st in projected_stories:
+            st_season = str(st.get("occurred_season") or "-")
+            st_title = str(st.get("title") or "-")
+            raw_sum = str(
+                st.get("summary") or st.get("public_perspective_summary") or "-"
+            ).strip()
+            if is_public:
+                st_title = _sanitize_public_free_text(st_title, fallback="-")
+                st_sum = _sanitize_public_free_text(raw_sum, fallback="-")
+            else:
+                st_sum = raw_sum or "-"
+            lines.append(f"- [{st_season}] {st_title}: {st_sum}")
+            if not is_public and st.get("internal_verbatim_or_note"):
+                lines.append(f"  * Internal Note: {st['internal_verbatim_or_note']}")
+    else:
+        lines.append("- No organization stories projected in local snapshot.")
+
+    body_text = scrub_raw_drive_ids_for_consumer("\n".join(lines))
+    markdown = body_text.rstrip() + "\n\nend_marker: true\n"
+
+    if is_public:
+        verify_public_safe_card_text(markdown)
+
+    filename = club_card_consumer_filename(
+        short_name or club_name,
+        seasons_label,
+        visibility=vis,
+    )
+    card_bytes = markdown.encode("utf-8")
+    card_sha256 = hashlib.sha256(card_bytes).hexdigest()
+    card_path_str: Optional[str] = None
+
+    if output_dir is not None:
+        out_path = Path(output_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+        card_file = out_path / filename
+        atomic(card_file, card_bytes)
+        card_path_str = str(card_file)
+
+    return {
+        "status": "BUILT",
+        "club_query": club_query.strip(),
+        "organization_id": organization_id,
+        "club_name": club_name,
+        "seasons": season_list,
+        "visibility": vis,
+        "observed_until": observed_until,
+        "roster_by_season": roster_by_season,
+        "coaching_staff": normalized_facets,
+        "projected_stories": projected_stories,
+        "filename": filename,
+        "card_path": card_path_str,
+        "card_sha256": card_sha256,
+        "markdown": markdown,
+        "drive_api_called": False,
+        "network_called": False,
+    }
