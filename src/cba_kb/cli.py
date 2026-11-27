@@ -411,10 +411,17 @@ def main():
     q.add_argument('--register-for-sync',action='store_true',default=False)
     q.add_argument('--format',choices=('json','markdown'),default='json')
     q.add_argument('--visibility',choices=('internal_full','public_safe'),default='internal_full')
+    q.add_argument('--card-style',choices=('classic','wiki_v240','wiki_v241'),default='classic')
     q.add_argument('--entity-role',default=None)
     q.add_argument('--master-csv',type=Path,default=None)
     q.add_argument('--foreign-csv',type=Path,default=None)
     q.add_argument('--identity-registry',type=Path,default=None)
+    q.add_argument('--person-registry',type=Path,default=None)
+    q.add_argument('--bio-profiles','--person-bio-profiles',dest='bio_profiles',type=Path,default=None)
+    q.add_argument('--story-records',type=Path,default=None)
+    q.add_argument('--coach-role-facets',type=Path,default=None)
+    q.add_argument('--role-tenures',type=Path,default=None)
+    q.add_argument('--timeline-events',type=Path,default=None)
     q.add_argument('--season-stats',type=Path,default=None)
     q.add_argument('--game-logs-dir',type=Path,default=None)
     q.add_argument('--ops-checkpoint',type=Path,default=None)
@@ -486,7 +493,9 @@ def main():
     q.add_argument('--club',required=True)
     q.add_argument('--seasons',default='2025-2026,2026-2027')
     q.add_argument('--visibility',choices=('internal_full','public_safe'),default='internal_full')
+    q.add_argument('--card-style',choices=('classic','wiki_v240','wiki_v241'),default='classic')
     q.add_argument('--organization-profiles',type=Path,default=None)
+    q.add_argument('--person-registry',type=Path,default=None)
     q.add_argument('--master-csv',type=Path,default=None)
     q.add_argument('--foreign-csv',type=Path,default=None)
     q.add_argument('--staff-snapshots',type=Path,default=None)
@@ -501,12 +510,18 @@ def main():
     q.add_argument('--output-dir',type=Path,required=True)
     q.add_argument('--site-title',default=None)
     q.add_argument('--observed-until',default=None)
+    q.add_argument('--base-url',default=None)
+    q.add_argument('--story-records',type=Path,default=None)
     q=sub.add_parser('compose-verified-brief')
     q.add_argument('--entity',required=True)
     q.add_argument('--facts',type=Path,required=True)
     q.add_argument('--max-chars',type=int,default=120)
     q.add_argument('--visibility',choices=('internal_full','public_safe'),default='public_safe')
     q.add_argument('--output',type=Path,default=None)
+    q=sub.add_parser('draft-wiki-candidates')
+    q.add_argument('--sources-dir',type=Path,required=True)
+    q.add_argument('--person-registry',type=Path,required=True)
+    q.add_argument('--output',type=Path,required=True)
     q=sub.add_parser('mcp-serve')
     q.add_argument('--season',default='2026-2027')
     q=sub.add_parser('plan'); q.add_argument('--entries',type=Path,required=True); q.add_argument('--release-id',required=True)
@@ -1930,6 +1945,36 @@ def main():
                 if a.negative_receipts is not None
                 else None
             )
+            person_reg = (
+                json.loads(a.person_registry.read_text(encoding='utf-8'))
+                if a.person_registry is not None
+                else None
+            )
+            bio_profiles = (
+                json.loads(a.bio_profiles.read_text(encoding='utf-8'))
+                if a.bio_profiles is not None
+                else None
+            )
+            story_recs = (
+                _read_json_or_jsonl(a.story_records)
+                if a.story_records is not None
+                else None
+            )
+            coach_facets = (
+                _read_json_or_jsonl(a.coach_role_facets)
+                if a.coach_role_facets is not None
+                else None
+            )
+            role_tenures = (
+                _read_json_or_jsonl(a.role_tenures)
+                if a.role_tenures is not None
+                else None
+            )
+            timeline_events = (
+                _read_json_or_jsonl(a.timeline_events)
+                if a.timeline_events is not None
+                else None
+            )
             result = build_person_card(
                 a.person,
                 season=a.season,
@@ -1946,6 +1991,13 @@ def main():
                 register_for_sync=a.register_for_sync,
                 entity_role=a.entity_role,
                 visibility=a.visibility,
+                card_style=a.card_style,
+                person_registry=person_reg,
+                person_bio_profiles=bio_profiles,
+                story_records=story_recs,
+                coach_role_facets=coach_facets,
+                role_tenures=role_tenures,
+                timeline_events=timeline_events,
             )
             if a.format == 'markdown':
                 stage(a.command, 'done')
@@ -2263,6 +2315,11 @@ def main():
             staff_snaps = _read_json_or_jsonl(a.staff_snapshots) if a.staff_snapshots is not None else None
             coach_facets = _read_json_or_jsonl(a.coach_role_facets) if a.coach_role_facets is not None else None
             story_recs = _read_json_or_jsonl(a.story_records) if a.story_records is not None else None
+            person_reg = (
+                json.loads(a.person_registry.read_text(encoding='utf-8'))
+                if a.person_registry is not None
+                else None
+            )
             result = build_club_panorama_card(
                 a.club,
                 seasons=seasons,
@@ -2273,6 +2330,8 @@ def main():
                 coach_role_facets=coach_facets,
                 story_records=story_recs,
                 visibility=a.visibility,
+                card_style=a.card_style,
+                person_registry=person_reg,
                 output_dir=a.output_dir,
                 observed_until=a.observed_until,
             )
@@ -2284,6 +2343,7 @@ def main():
                     print(json.dumps(result, ensure_ascii=False, indent=2))
                 return
         elif a.command == 'build-public-site':
+            from .person_card_builder import _read_json_or_jsonl
             from .static_site_builder import build_public_site
             if not a.club_card.is_file():
                 raise ValueError(f'CLUB_CARD_NOT_FOUND:{a.club_card}')
@@ -2297,12 +2357,19 @@ def main():
                     person_cards.append(loaded)
                 elif isinstance(loaded, list):
                     person_cards.extend(item for item in loaded if isinstance(item, dict))
+            story_recs = (
+                _read_json_or_jsonl(a.story_records)
+                if a.story_records is not None
+                else None
+            )
             result = build_public_site(
                 club_card=club_card,
                 person_cards=person_cards,
                 output_dir=a.output_dir,
                 site_title=a.site_title,
                 observed_until=a.observed_until,
+                base_url=a.base_url,
+                story_records=story_recs,
             )
         elif a.command == 'compose-verified-brief':
             from .editorial_brief import compose_verified_brief
@@ -2330,6 +2397,13 @@ def main():
             )
             if a.output is not None:
                 save(a.output, result)
+        elif a.command == 'draft-wiki-candidates':
+            from .wiki_draft_extractor import extract_wiki_candidates
+            result = extract_wiki_candidates(
+                sources_dir=a.sources_dir,
+                person_registry=a.person_registry,
+                output_path=a.output,
+            )
         elif a.command == 'mcp-serve':
             from .cloud_state import R2CloudStateStore, R2Config
             from .mcp_server import SnowballMCPServer

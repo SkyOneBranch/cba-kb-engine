@@ -367,6 +367,7 @@ def _bundle_allowlisted_exact_names() -> frozenset[str]:
         "curation_profile.yaml",
         "team_staff_snapshots.jsonl",
         "person_registry.json",
+        "person_bio_profiles.json",
         "story_records.jsonl",
         "organization_profiles.json",
     })

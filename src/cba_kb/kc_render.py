@@ -159,7 +159,7 @@ _INTERNAL_ID_TOKEN_RE = re.compile(
 )
 _PRIVATE_URI_TOKEN_RE = re.compile(r"(?:r2|s3|file)://[^\s)\]<>\"']+", re.IGNORECASE)
 
-CARD_STYLES = ("classic", "wiki_v240")
+CARD_STYLES = ("classic", "wiki_v240", "wiki_v241")
 COACH_ENTITY_ROLES = frozenset({
     "COACH",
     "HEAD_COACH",
@@ -178,6 +178,146 @@ _REJECTED_CAUSE_STATUSES = frozenset({
     "RUMOR",
     "INFERRED_FROM_ABSENCE",
 })
+_DOC_HEX_ID_RE = re.compile(r"\bdoc_[0-9a-f]{16,64}\b", re.IGNORECASE)
+_PID_HEX_ID_RE = re.compile(r"\bpid_[0-9a-f]{32}\b", re.IGNORECASE)
+_UNASSIGNED_PAREN_RE = re.compile(r"\(unassigned\)", re.IGNORECASE)
+
+
+def _resolve_team_name_zh(team_id_or_name: Any, fallback_name: Optional[str] = None) -> str:
+    """Resolve numeric CBA team ID or club_id to Chinese team name via aliases."""
+    try:
+        from .aliases import resolve_cba_team_name
+
+        return resolve_cba_team_name(team_id_or_name, fallback_name=fallback_name)
+    except ImportError:
+        from .aliases import resolve_team_id_zh
+
+        resolved = resolve_team_id_zh(team_id_or_name)
+        if resolved:
+            return resolved
+        if isinstance(fallback_name, str) and fallback_name.strip():
+            return fallback_name.strip()
+        raw = "" if team_id_or_name is None else str(team_id_or_name).strip()
+        return raw or "-"
+
+
+class CitationRegistry:
+    """Unified sentence-level citation registry with URL & URL-less deduplication (REQ-241 P0-3)."""
+
+    def __init__(self, *, visibility: str = "public_safe") -> None:
+        self.visibility = validate_card_visibility(visibility)
+        self._is_public = self.visibility == "public_safe"
+        self._entries: List[Dict[str, Any]] = []
+        self._key_to_index: Dict[Any, int] = {}
+
+    def register(
+        self,
+        *,
+        label: str,
+        url: Optional[str] = None,
+        source_kind: Optional[str] = None,
+        published_at: Optional[str] = None,
+        publisher: Optional[str] = None,
+        source_id: Optional[str] = None,
+    ) -> Optional[int]:
+        raw_label = str(label or "").strip()
+        raw_url = str(url or "").strip()
+        raw_kind = str(source_kind or "").strip()
+        kind_lower = raw_kind.lower()
+        raw_pub = str(publisher or "").strip()
+        raw_date = str(published_at or "").strip()
+        raw_sid = str(source_id or "").strip()
+
+        if self._is_public:
+            if kind_lower == "unreferenced_encyclopedia":
+                return None
+            if raw_url:
+                low_url = raw_url.lower()
+                if not (low_url.startswith("https://") or low_url.startswith("http://")):
+                    return None
+                if any(
+                    bad in low_url
+                    for bad in ("drive.google.com", "docs.google.com", "r2://", "s3://", "file://")
+                ):
+                    return None
+            combined = f"{raw_label}\n{raw_url}\n{raw_pub}"
+            if (
+                _TEN_SOURCES_RE.search(combined)
+                or _PRIVATE_URI_TOKEN_RE.search(combined)
+                or _DOC_HEX_ID_RE.search(combined)
+                or "[internal_clue_only" in combined.lower()
+                or "web 剪藏" in combined.lower()
+                or "doc:" in combined.lower()
+                or "doc_id:" in combined.lower()
+            ):
+                return None
+            clean_label = _sanitize_public_free_text(raw_label, fallback="")
+            clean_pub = _sanitize_public_free_text(raw_pub, fallback="") if raw_pub else ""
+        else:
+            clean_label = raw_label
+            clean_pub = raw_pub
+
+        if not clean_label and not raw_url:
+            return None
+
+        display_label = clean_label or raw_url
+        if raw_url:
+            dedup_key: Any = ("url", raw_url.rstrip("/").casefold())
+        else:
+            dedup_key = (
+                "urlless",
+                display_label.casefold(),
+                clean_pub.casefold(),
+                raw_date.casefold(),
+            )
+
+        existing_idx = self._key_to_index.get(dedup_key)
+        if existing_idx is not None:
+            return existing_idx
+
+        idx = len(self._entries) + 1
+        self._entries.append(
+            {
+                "index": idx,
+                "label": display_label,
+                "url": raw_url or None,
+                "source_kind": raw_kind or None,
+                "published_at": raw_date or None,
+                "publisher": clean_pub or None,
+                "source_id": None if self._is_public else (raw_sid or None),
+            }
+        )
+        self._key_to_index[dedup_key] = idx
+        return idx
+
+    def entries(self) -> List[Dict[str, Any]]:
+        return [dict(item) for item in self._entries]
+
+    def format_ref(self, index: int) -> str:
+        return f"[{int(index)}]"
+
+    def render_markdown_references(self, heading: str = "## 参考资料") -> str:
+        if not self._entries:
+            return ""
+        lines: List[str] = [heading]
+        for item in self._entries:
+            idx = item["index"]
+            label = str(item.get("label") or "").strip()
+            publisher = str(item.get("publisher") or "").strip()
+            published_at = str(item.get("published_at") or "").strip()
+            url = str(item.get("url") or "").strip()
+
+            parts: List[str] = [label] if label else []
+            if publisher and publisher not in label:
+                parts.append(publisher)
+            if published_at:
+                parts.append(published_at)
+            text = " · ".join(parts) if parts else (url or f"参考资料 {idx}")
+            if url:
+                lines.append(f"{idx}. [{text}]({url})")
+            else:
+                lines.append(f"{idx}. {text}")
+        return "\n".join(lines)
 
 
 def validate_card_style(card_style: str) -> str:
@@ -507,6 +647,575 @@ def _sanitize_public_free_text(value: Any, *, fallback: str = "-") -> str:
     return joined or fallback
 
 
+def _register_citation_obj(
+    reg: CitationRegistry,
+    item: Any,
+    *,
+    default_label: str = "参考资料",
+) -> Optional[int]:
+    if isinstance(item, str):
+        s = item.strip()
+        if not s:
+            return None
+        if s.startswith(("https://", "http://")):
+            return reg.register(label=default_label, url=s)
+        return reg.register(label=s)
+    if not isinstance(item, Mapping):
+        return None
+    url = item.get("url") or item.get("canonical_url") or item.get("source_url")
+    label = (
+        item.get("label")
+        or item.get("title")
+        or item.get("source_name")
+        or item.get("publisher")
+        or default_label
+    )
+    return reg.register(
+        label=str(label or default_label),
+        url=str(url) if url else None,
+        source_kind=str(item.get("source_kind") or item.get("source_tier") or "") or None,
+        published_at=str(item.get("published_at") or item.get("publication_date") or "") or None,
+        publisher=str(item.get("publisher") or item.get("source_name") or "") or None,
+        source_id=str(item.get("source_id") or item.get("doc_id") or "") or None,
+    )
+
+
+def _fmt_wiki_metric(val: Any) -> str:
+    if val is None:
+        return "-"
+    if isinstance(val, float):
+        return f"{val:.1f}"
+    return str(val)
+
+
+def _render_wiki_career_table_lines(
+    rows: Sequence[Mapping[str, Any]],
+    summary: Optional[Mapping[str, Any]] = None,
+) -> List[str]:
+    if not rows:
+        return []
+    headers = [
+        "赛季", "球队", "场次", "首发", "时间", "得分",
+        "篮板", "助攻", "抢断", "盖帽", "失误", "投篮%", "三分%", "罚球%",
+    ]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(["---"] * len(headers)) + " |",
+    ]
+    for r in rows:
+        if not isinstance(r, Mapping):
+            continue
+        metrics = r.get("metrics") if isinstance(r.get("metrics"), Mapping) else r
+        s_val = str(r.get("season") or "-")
+        raw_tname = str(r.get("team_name") or "").strip()
+        raw_tid = r.get("team_id")
+        if raw_tname and not raw_tname.isdigit():
+            team_disp = raw_tname
+        elif raw_tid is not None and str(raw_tid).strip():
+            team_disp = _resolve_team_name_zh(raw_tid, fallback_name=raw_tname or None)
+        elif raw_tname:
+            team_disp = _resolve_team_name_zh(raw_tname, fallback_name=raw_tname)
+        else:
+            team_disp = "-"
+        cells = [
+            s_val,
+            team_disp,
+            *(_fmt_wiki_metric(metrics.get(col)) for col in CORE_SEASON_STATS_COLUMNS),
+        ]
+        lines.append("| " + " | ".join(cells) + " |")
+    if isinstance(summary, Mapping) and summary.get("games_played") is not None:
+        sum_cells = [
+            "生涯总计/场均",
+            "-",
+            *(_fmt_wiki_metric(summary.get(col)) for col in CORE_SEASON_STATS_COLUMNS),
+        ]
+        lines.append("| " + " | ".join(sum_cells) + " |")
+    return lines
+
+
+def _compute_overall_verification_status(
+    domain_horizons: Any,
+    *,
+    has_career_stats: bool = False,
+    has_coach_facets: bool = False,
+    has_bio: bool = False,
+) -> str:
+    if isinstance(domain_horizons, Mapping) and domain_horizons:
+        statuses = [
+            str(v.get("status") or "").strip().upper()
+            for v in domain_horizons.values()
+            if isinstance(v, Mapping)
+        ]
+        applicable = [s for s in statuses if s and s != "NOT_APPLICABLE"]
+        if any(s == "VERIFIED_PRESENT" for s in statuses):
+            if applicable and all(s == "VERIFIED_PRESENT" for s in applicable):
+                return "VERIFIED_DOMAIN_PRESENT"
+            return "PARTIALLY_VERIFIED"
+    if has_career_stats or has_coach_facets or has_bio:
+        return "PARTIALLY_VERIFIED"
+    return "UNKNOWN"
+
+
+def _render_wiki_v241_card(
+    payload: Dict[str, Any],
+    *,
+    vis: str,
+    max_external_citations_per_card: int = 10,
+) -> str:
+    """Render Wikipedia 2.0 Chinese person card (`card_style='wiki_v241'`)."""
+    is_public = vis == "public_safe"
+    grains = payload.get("grains", {})
+    stats_layer = grains.get("STATS", {})
+    doc_layer = grains.get("DOCUMENT", {})
+    transparency = payload.get("evidence_transparency", {})
+    scope_meta = transparency.get("scope_meta") or {}
+    reg_profile = payload.get("registration_profile") if isinstance(payload.get("registration_profile"), Mapping) else {}
+    unified_prof = payload.get("unified_profile") if isinstance(payload.get("unified_profile"), Mapping) else {}
+    bio_profile = payload.get("bio_profile")
+    if hasattr(bio_profile, "to_dict") and callable(bio_profile.to_dict):
+        bio_profile = bio_profile.to_dict()
+    if not isinstance(bio_profile, Mapping):
+        bio_profile = {}
+
+    posture = transparency.get("posture") or (
+        stats_layer.get("posture") if isinstance(stats_layer, dict) else None
+    ) or "UNKNOWN"
+    season = scope_meta.get("season") or stats_layer.get("season", "-")
+
+    person_name = (
+        str(bio_profile.get("canonical_name") or "").strip()
+        or str(unified_prof.get("canonical_name") or "").strip()
+        or str(scope_meta.get("player_name") or "").strip()
+        or str(reg_profile.get("player_name") or "").strip()
+        or "未知人物"
+    )
+    person_name = _UNASSIGNED_PAREN_RE.sub("", _PID_HEX_ID_RE.sub("", person_name)).strip() or "未知人物"
+
+    raw_reg = payload.get("citation_registry")
+    cit_reg = raw_reg if isinstance(raw_reg, CitationRegistry) else CitationRegistry(visibility=vis)
+
+    lines: List[str] = [f"# {person_name}"]
+
+    # Lead paragraph (inverted pyramid with inline [1][2] superscripts)
+    lead_raw = payload.get("lead_paragraph")
+    lead_md = ""
+    if isinstance(lead_raw, Mapping):
+        lead_md = str(lead_raw.get("lead_markdown") or "").strip()
+    elif isinstance(lead_raw, str):
+        lead_md = lead_raw.strip()
+    if lead_md:
+        lines.extend(["", lead_md])
+
+    # Register bio evidence_refs (if not already registered by lead)
+    for ref in bio_profile.get("evidence_refs") or ():
+        _register_citation_obj(cit_reg, ref, default_label=f"{person_name}个人档案")
+
+    # 1. Career Season Stats (Regular Season + Playoffs) — omitted gracefully for pure coaches
+    entity_role_norm = str(payload.get("entity_role") or "").strip().upper()
+    career_stats = payload.get("career_season_stats") if isinstance(payload.get("career_season_stats"), Mapping) else {}
+    reg_rows = list(career_stats.get("regular_season_rows") or [])
+    po_rows = list(career_stats.get("playoffs_rows") or [])
+    reg_summary = career_stats.get("regular_career_summary")
+    po_summary = career_stats.get("playoffs_career_summary")
+
+    if not reg_rows and not po_rows:
+        fallback_table = payload.get("season_stats_table")
+        if isinstance(fallback_table, list) and fallback_table:
+            for r in fallback_table:
+                if not isinstance(r, Mapping):
+                    continue
+                if _match_type_sort_rank(r.get("match_type")) == 1:
+                    po_rows.append(dict(r))
+                else:
+                    reg_rows.append(dict(r))
+
+    recent_games = payload.get("recent_games_summary")
+    has_career_stats = bool(reg_rows or po_rows)
+    has_game_stats = isinstance(recent_games, Mapping) and bool(recent_games.get("games"))
+    is_pure_coach = (
+        entity_role_norm in COACH_ENTITY_ROLES
+        and not has_career_stats
+        and not has_game_stats
+    )
+
+    if has_career_stats and not is_pure_coach:
+        stats_ref_indices: List[int] = []
+        for r in [*reg_rows, *po_rows]:
+            loc = r.get("locator")
+            if isinstance(loc, str) and loc.strip().startswith(("https://", "http://")):
+                idx = cit_reg.register(
+                    label=f"CBA官方技术统计（{r.get('season') or season}）",
+                    url=loc.strip(),
+                    source_kind="league_official",
+                    published_at=str(r.get("captured_at") or "")[:10] or None,
+                )
+                if idx is not None and idx not in stats_ref_indices:
+                    stats_ref_indices.append(idx)
+        stats_ref_suffix = "".join(cit_reg.format_ref(i) for i in stats_ref_indices[:2])
+        lines.extend(["", f"## 球员生涯数据{stats_ref_suffix}"])
+        if reg_rows:
+            reg_tbl = _render_wiki_career_table_lines(reg_rows, summary=reg_summary)
+            if reg_tbl:
+                lines.extend(["", "### 常规赛", *reg_tbl])
+        if po_rows:
+            po_tbl = _render_wiki_career_table_lines(po_rows, summary=po_summary)
+            if po_tbl:
+                lines.extend(["", "### 季后赛", *po_tbl])
+
+    # 2. Recent Single-Game Log (default-collapsed <details class="gamelog-drawer">)
+    if has_game_stats and not is_pure_coach:
+        games_list = recent_games.get("games") or []
+        played_n = recent_games.get("played_games_in_window", len(games_list))
+        avgs = recent_games.get("averages") or {}
+
+        def _fmt_g(v: Any) -> str:
+            if v is None:
+                return "-"
+            if isinstance(v, float):
+                return f"{v:.1f}"
+            return str(v)
+
+        lines.extend([
+            "",
+            "## 近期单场数据",
+            '<details class="gamelog-drawer">',
+            f"<summary>展开查看近 {played_n} 场单场数据（场均 {_fmt_g(avgs.get('points'))} 分 / {_fmt_g(avgs.get('rebounds'))} 篮板 / {_fmt_g(avgs.get('assists'))} 助攻）</summary>",
+            "",
+            "| 日期 | 轮次 | 对手 | 时间 | 得分-篮板-助攻 | 投篮 / 三分 / 罚球 |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ])
+        for g in games_list:
+            if not isinstance(g, Mapping):
+                continue
+            m = g.get("metrics") or {}
+            g_date = str(g.get("game_date") or "-")
+            rnd = str(g.get("round_label") or "-")
+            raw_opp_name = str(g.get("opponent_team_name") or "").strip()
+            raw_opp_id = g.get("opponent_team_id")
+            if raw_opp_name and not raw_opp_name.isdigit():
+                opp = raw_opp_name
+            elif raw_opp_id is not None and str(raw_opp_id).strip():
+                opp = _resolve_team_name_zh(raw_opp_id, fallback_name=raw_opp_name or None)
+            else:
+                opp = raw_opp_name or "-"
+            mins = _fmt_g(m.get("minutes_played"))
+            pts = "-" if m.get("points") is None else str(m.get("points"))
+            reb = "-" if m.get("rebounds") is None else str(m.get("rebounds"))
+            ast = "-" if m.get("assists") is None else str(m.get("assists"))
+            fg_s = (
+                f"{m.get('field_goals_made')}-{m.get('field_goals_attempted')}"
+                if m.get("field_goals_made") is not None and m.get("field_goals_attempted") is not None
+                else "-"
+            )
+            tp_s = (
+                f"{m.get('three_point_made')}-{m.get('three_point_attempted')}"
+                if m.get("three_point_made") is not None and m.get("three_point_attempted") is not None
+                else "-"
+            )
+            ft_s = (
+                f"{m.get('free_throws_made')}-{m.get('free_throws_attempted')}"
+                if m.get("free_throws_made") is not None and m.get("free_throws_attempted") is not None
+                else "-"
+            )
+            lines.append(f"| {g_date} | {rnd} | {opp} | {mins} | {pts}-{reb}-{ast} | {fg_s} / {tp_s} / {ft_s} |")
+        lines.extend(["", "</details>"])
+
+    # 3. Coaching Role Facets
+    raw_facets = payload.get("coach_role_facets")
+    facet_dicts: List[Dict[str, Any]] = []
+    if raw_facets is not None:
+        facets_seq = list(raw_facets) if isinstance(raw_facets, (list, tuple)) else [raw_facets]
+        for f_item in facets_seq:
+            if hasattr(f_item, "to_dict") and callable(f_item.to_dict):
+                facet_dicts.append(dict(f_item.to_dict()))
+            elif isinstance(f_item, Mapping):
+                facet_dicts.append(dict(f_item))
+    if facet_dicts:
+        lines.extend(["", "## 执教履历与角色"])
+        for fd in facet_dicts:
+            f_season = str(fd.get("season") or season or "-")
+            l_role = str(fd.get("league_listed_role") or "OBSERVED_EMPTY")
+            c_role = str(fd.get("club_appointed_role") or "OBSERVED_EMPTY")
+            g_role = str(fd.get("gameday_acting_role") or "OBSERVED_EMPTY")
+            ref_marks: List[str] = []
+            for ev_ref in fd.get("evidence_refs") or ():
+                idx = _register_citation_obj(cit_reg, ev_ref, default_label=f"{f_season}教练组注册/任命来源")
+                if idx is not None:
+                    mark = cit_reg.format_ref(idx)
+                    if mark not in ref_marks:
+                        ref_marks.append(mark)
+            ref_s = "".join(ref_marks)
+            lines.append(
+                f"- {f_season} 赛季：联赛注册角色 `{l_role}`｜俱乐部任命角色 `{c_role}`｜临场执教角色 `{g_role}`{ref_s}"
+            )
+            if fd.get("has_institutional_discrepancy"):
+                d_code = str(fd.get("discrepancy_code") or "LEAGUE_VS_CLUB_ROLE_DISCREPANCY")
+                raw_expl = str(fd.get("discrepancy_explanation") or "").strip()
+                expl = _sanitize_public_free_text(raw_expl, fallback="-") if is_public else raw_expl
+                if expl and expl != "-":
+                    lines.append(f"  * 制度口径差异（{d_code}）：{expl}")
+
+    # 4. Career Role Tenures (## 职业履历)
+    tenures_raw = payload.get("role_tenures")
+    if tenures_raw is None and unified_prof:
+        tenures_raw = unified_prof.get("role_tenures")
+    if isinstance(tenures_raw, (list, tuple)) and tenures_raw:
+        tenure_dicts: List[Dict[str, Any]] = []
+        for t in tenures_raw:
+            td = t.to_dict() if hasattr(t, "to_dict") and callable(t.to_dict) else (
+                dict(t) if isinstance(t, Mapping) else None
+            )
+            if td:
+                tenure_dicts.append(td)
+        scoped_tenures = enforce_authority_scope(tenure_dicts)
+        accepted_tenures = [
+            *scoped_tenures["accepted_official"],
+            *scoped_tenures["accepted_non_official"],
+        ]
+        if accepted_tenures:
+            lines.extend(["", "## 职业履历"])
+            if unified_prof.get("is_player_to_coach_transition"):
+                lines.append("- 职业轨迹：由球员转型教练（统一生涯档案）")
+            for td in accepted_tenures:
+                t_role = str(td.get("role") or "-")
+                t_org = str(td.get("organization_name") or td.get("organization_id") or "-")
+                t_start = str(td.get("season_start") or td.get("start_date") or "-")
+                t_end = str(td.get("season_end") or td.get("end_date") or "至今")
+                ref_marks = []
+                for ev_ref in td.get("evidence_refs") or ():
+                    idx = _register_citation_obj(cit_reg, ev_ref, default_label=f"{t_org}履历来源")
+                    if idx is not None:
+                        mark = cit_reg.format_ref(idx)
+                        if mark not in ref_marks:
+                            ref_marks.append(mark)
+                lines.append(f"- {t_start}–{t_end}：{t_org}（{t_role}）{''.join(ref_marks)}")
+
+    # 5. Registration & Contract Information (## 注册与合同信息)
+    dom_cur = reg_profile.get("domestic_current") if isinstance(reg_profile.get("domestic_current"), Mapping) else None
+    dom_hist = reg_profile.get("domestic_history") if isinstance(reg_profile.get("domestic_history"), list) else []
+    for_reg = reg_profile.get("foreign_registration") if isinstance(reg_profile.get("foreign_registration"), Mapping) else None
+    if dom_cur or for_reg or reg_profile.get("current_club"):
+        reg_lines: List[str] = []
+        club_disp = str(
+            (dom_cur or {}).get("club_official")
+            or (for_reg or {}).get("club")
+            or reg_profile.get("current_club")
+            or ""
+        ).strip()
+        if club_disp:
+            reg_lines.append(f"- 现效力俱乐部：{club_disp}")
+        if dom_cur:
+            cat = str(dom_cur.get("contract_category") or "").strip()
+            term = str(dom_cur.get("contract_term_official") or "").strip()
+            reg_st = str(dom_cur.get("registration_status") or "").strip()
+            if cat:
+                reg_lines.append(f"- 合同类别：{cat}")
+            if term:
+                reg_lines.append(f"- 官方合同期限：{term}")
+            if reg_st:
+                reg_lines.append(f"- 注册状态：{reg_st}")
+            reg_lines.append("- 薪资说明：官方仅公示合同类别与期限，个人实领薪资未公开")
+        if for_reg:
+            if for_reg.get("nationality"):
+                reg_lines.append(f"- 国籍：{for_reg['nationality']}")
+            if for_reg.get("published_at"):
+                reg_lines.append(f"- 外援注册公示时间：{for_reg['published_at']}")
+        if dom_hist:
+            for h in dom_hist[:3]:
+                if not isinstance(h, Mapping):
+                    continue
+                h_s = str(h.get("season") or "-")
+                h_c = str(h.get("club_official") or "-")
+                h_cat = str(h.get("contract_category") or "").strip() or "未公示"
+                reg_lines.append(f"- 历史注册（{h_s}）：{h_c}｜{h_cat}")
+        if reg_lines:
+            lines.extend(["", "## 注册与合同信息", *reg_lines])
+
+    # 6. Narrative & Key Stories (## 人物故事与关键事件)
+    proj_stories = payload.get("projected_stories")
+    if proj_stories is None:
+        proj_stories = payload.get("story_records")
+    if isinstance(proj_stories, (list, tuple)) and proj_stories:
+        normalized_stories: List[Dict[str, Any]] = []
+        for st_raw in proj_stories:
+            if not isinstance(st_raw, Mapping):
+                continue
+            st_copy = dict(st_raw)
+            if not st_copy.get("canonical_source_id") and isinstance(st_copy.get("canonical_source"), Mapping):
+                c_src_id = str(st_copy["canonical_source"].get("source_id") or "").strip()
+                if c_src_id:
+                    st_copy["canonical_source_id"] = c_src_id
+            normalized_stories.append(st_copy)
+        deduped_stories = dedup_reprints_and_preserve_discrepancies(normalized_stories)
+        story_lines: List[str] = []
+        for st_item in deduped_stories["canonical_items"]:
+            c_src = st_item.get("canonical_source")
+            src_kind = str(
+                st_item.get("source_kind")
+                or (c_src.get("source_kind") if isinstance(c_src, Mapping) else "")
+                or ""
+            ).strip().lower()
+            if is_public and src_kind == "unreferenced_encyclopedia":
+                continue
+            vis_pol = st_item.get("visibility_policy")
+            if is_public and isinstance(vis_pol, Mapping) and vis_pol.get("public_export_allowed") is False:
+                continue
+            st_season = str(st_item.get("occurred_season") or "-")
+            st_title = str(st_item.get("title") or "-")
+            raw_sum = str(
+                st_item.get("summary")
+                or st_item.get("public_perspective_summary")
+                or st_item.get("claim")
+                or ""
+            ).strip()
+            if is_public:
+                st_title = _sanitize_public_free_text(st_title, fallback="-")
+                st_sum = _sanitize_public_free_text(raw_sum, fallback="-")
+            else:
+                st_sum = raw_sum or "-"
+            ref_idx = _register_citation_obj(cit_reg, c_src, default_label=st_title)
+            ref_s = cit_reg.format_ref(ref_idx) if ref_idx is not None else ""
+            story_lines.append(f"- [{st_season}] {st_title}：{st_sum}{ref_s}")
+            if not is_public and st_item.get("internal_verbatim_or_note"):
+                story_lines.append(f"  * 内部摘录：{st_item['internal_verbatim_or_note']}")
+        if story_lines:
+            lines.extend(["", "## 人物故事与关键事件", *story_lines])
+
+    # 7. Timeline & Multi-Source Observations (## 动态时间线)
+    raw_timeline = payload.get("timeline_events")
+    if isinstance(raw_timeline, (list, tuple)) and raw_timeline:
+        filtered_tl = filter_timeline_events_silence_not_cause(raw_timeline)
+        deduped_tl = dedup_reprints_and_preserve_discrepancies(filtered_tl["main_timeline"])
+        tl_lines: List[str] = []
+        for ev in deduped_tl["canonical_items"]:
+            ev_src_kind = str(ev.get("source_kind") or "").strip().lower()
+            if is_public and ev_src_kind == "unreferenced_encyclopedia":
+                continue
+            ev_kind = str(ev.get("event_kind") or "EVENT")
+            raw_ev_sum = str(ev.get("summary") or ev.get("claim") or "-")
+            ev_sum = _sanitize_public_free_text(raw_ev_sum, fallback="-") if is_public else raw_ev_sum
+            ref_marks = []
+            for src_obj in (ev.get("sources") or ()):
+                idx = _register_citation_obj(cit_reg, src_obj, default_label=ev_kind)
+                if idx is not None:
+                    mark = cit_reg.format_ref(idx)
+                    if mark not in ref_marks:
+                        ref_marks.append(mark)
+            if not ref_marks and (ev.get("source_url") or ev.get("source_name") or ev.get("publisher")):
+                idx = _register_citation_obj(cit_reg, ev, default_label=ev_kind)
+                if idx is not None:
+                    ref_marks.append(cit_reg.format_ref(idx))
+            tl_lines.append(f"- [{ev_kind}] {ev_sum}{''.join(ref_marks)}")
+        if tl_lines:
+            lines.extend(["", "## 动态时间线", *tl_lines])
+
+    # 8. Internal clues quarantine (stripped 100% in public_safe)
+    raw_clues = payload.get("encyclopedia_clues")
+    if isinstance(raw_clues, (list, tuple)) and raw_clues:
+        clue_lines = quarantine_unreferenced_encyclopedia_clues(raw_clues, visibility=vis)
+        if clue_lines:
+            lines.extend(["", "## 内部线索（隔离区）", *clue_lines])
+
+    # Register external_citations into unified CitationRegistry (NO duplicate ## External Citations)
+    raw_external_citations = payload.get("external_citations")
+    if isinstance(raw_external_citations, (list, tuple)) and raw_external_citations:
+        effective_citations = (
+            [c for c in raw_external_citations if _is_public_safe_citation(c)]
+            if is_public
+            else list(raw_external_citations)
+        )
+        if effective_citations:
+            from .consumer_surface import select_external_citations
+
+            selection = select_external_citations(
+                effective_citations,
+                max_external_citations_per_card=max_external_citations_per_card,
+            )
+            for cite in selection["selected"]:
+                raw_cite_title = str(cite.get("title") or "").strip()
+                raw_cite_doc_id = str(cite.get("doc_id") or "").strip()
+                if is_public and raw_cite_doc_id and raw_cite_title.casefold() == raw_cite_doc_id.casefold():
+                    raw_cite_title = ""
+                cit_reg.register(
+                    label=raw_cite_title or str(cite.get("canonical_url") or "官方公告"),
+                    url=str(cite.get("canonical_url") or "") or None,
+                    source_kind=str(cite.get("source_tier") or "official_announcement"),
+                    published_at=str(cite.get("published_at") or "") or None,
+                    source_id=raw_cite_doc_id or None,
+                )
+
+    # 9. Single Unified References Section (## 参考资料)
+    ref_md = cit_reg.render_markdown_references(heading="## 参考资料")
+    if ref_md:
+        lines.extend(["", ref_md])
+
+    # 10. Default-Collapsed Audit Drawer (<details class="audit-drawer">)
+    obs_horizon = payload.get("observation_horizon")
+    has_obs_horizon = isinstance(obs_horizon, dict) and bool(obs_horizon)
+    domain_horizons = payload.get("domain_horizons")
+    has_domain_horizons = isinstance(domain_horizons, dict) and bool(domain_horizons)
+    computed_status = _compute_overall_verification_status(
+        domain_horizons,
+        has_career_stats=has_career_stats,
+        has_coach_facets=bool(facet_dicts),
+        has_bio=bool(bio_profile),
+    )
+    caller_status = str(payload.get("overall_verification_status") or "").strip().upper()
+    if computed_status != "UNKNOWN" and (not caller_status or caller_status == "UNKNOWN"):
+        overall_status = computed_status
+    else:
+        overall_status = caller_status or computed_status
+    audit_lines: List[str] = [
+        "",
+        '<details class="audit-drawer">',
+        f"<summary>数据审计与观测边界（状态：{overall_status}）</summary>",
+        "",
+        f"- overall_verification_status: {overall_status}",
+        f"- Posture: {posture}",
+    ]
+    if is_public:
+        audit_lines.append("- Visibility: PUBLIC_SAFE")
+    p_uid_audit = str(unified_prof.get("person_uid") or bio_profile.get("person_uid") or "").strip()
+    if p_uid_audit:
+        audit_lines.append(f"- Person UID: {p_uid_audit}")
+    if has_obs_horizon:
+        obs_until = obs_horizon.get("observed_until") or "UNKNOWN"
+        cov_status = obs_horizon.get("overall_status") or obs_horizon.get("coverage_status") or "UNKNOWN"
+        audit_lines.append(f"- observed_until: {obs_until}")
+        audit_lines.append(f"- coverage_status: {cov_status}")
+    if has_domain_horizons:
+        ordered_doms = ["registration", "statistics", "official_announcements"]
+        extra_doms = sorted(k for k in domain_horizons if k not in ordered_doms)
+        for dom_key in [*ordered_doms, *extra_doms]:
+            dom_val = domain_horizons.get(dom_key)
+            if not isinstance(dom_val, dict):
+                continue
+            d_status = dom_val.get("status") or "SOURCE_GAP_UNKNOWN"
+            d_obs = dom_val.get("observed_until") or "UNKNOWN"
+            audit_lines.append(f"- domain[{dom_key}]: status={d_status}, observed_until={d_obs}")
+    locator = scope_meta.get("locator") or (doc_layer.get("locator") if isinstance(doc_layer, dict) else None)
+    if locator and not (is_public and _is_internal_locator(locator)):
+        if not is_public or _public_locator(locator):
+            audit_lines.append(f"- Locator: {locator}")
+    audit_lines.extend(["", "</details>"])
+    lines.extend(audit_lines)
+
+    from .consumer_surface import scrub_raw_drive_ids_for_consumer
+
+    body_text = scrub_raw_drive_ids_for_consumer("\n".join(lines))
+    final_text = body_text + "\n\nend_marker: true\n"
+
+    if has_obs_horizon:
+        from .consumer_surface import assert_no_exaggerated_coverage_claims
+
+        assert_no_exaggerated_coverage_claims(final_text, obs_horizon)
+
+    if is_public:
+        verify_public_safe_card_text(final_text)
+
+    return final_text
+
+
 def render_research_card(
     payload: Dict[str, Any],
     *,
@@ -526,6 +1235,12 @@ def render_research_card(
     is_wiki = style == "wiki_v240"
     if evidence_verified is not True:
         raise KcRenderError("RESEARCH_CARD_NOT_VERIFIED")
+    if style == "wiki_v241":
+        return _render_wiki_v241_card(
+            payload,
+            vis=vis,
+            max_external_citations_per_card=max_external_citations_per_card,
+        )
 
     grains = payload.get("grains", {})
     stats_layer = grains.get("STATS", {})

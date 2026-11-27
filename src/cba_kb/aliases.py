@@ -69,6 +69,70 @@ def resolve_team_id_zh(team_id: object) -> Optional[str]:
     return CBA_TEAM_ID_TO_ZH.get(key)
 
 
+CBA_TEAM_ID_TO_SHORT_ZH: MappingProxyType[str, str] = MappingProxyType({
+    '29115': '北京',
+    '29117': '新疆',
+    '29118': '江苏',
+    '29124': '广东',
+    '29125': '上海',
+    '29127': '四川',
+    '29128': '浙江广厦',
+    '29129': '辽宁',
+    '29130': '山东',
+    '29131': '深圳',
+    '29132': '山西',
+    '29133': '南京',
+    '29134': '福建',
+    '29135': '青岛',
+    '29136': '北控',
+    '29137': '吉林',
+    '29138': '天津',
+    '29139': '广州',
+    '29140': '浙江稠州',
+    '100074683': '宁波',
+})
+
+_CANONICAL_ID_TO_ZH: MappingProxyType[str, str] = MappingProxyType({
+    canonical_id: CBA_TEAM_ID_TO_ZH[team_id]
+    for team_id, canonical_id in CBA_TEAM_ID_TO_CANONICAL_ID.items()
+    if team_id in CBA_TEAM_ID_TO_ZH
+})
+
+_CANONICAL_ID_TO_SHORT_ZH: MappingProxyType[str, str] = MappingProxyType({
+    canonical_id: CBA_TEAM_ID_TO_SHORT_ZH[team_id]
+    for team_id, canonical_id in CBA_TEAM_ID_TO_CANONICAL_ID.items()
+    if team_id in CBA_TEAM_ID_TO_SHORT_ZH
+})
+
+
+def resolve_cba_team_name(
+    team_id_or_name: object,
+    *,
+    fallback_name: Optional[str] = None,
+    prefer_short: bool = False,
+) -> str:
+    """Resolve a numeric CBA team_id or canonical club_id to its Chinese standard name.
+
+    When `prefer_short=True`, returns a concise short Chinese club name.
+    Falls back honestly to `fallback_name` (if non-empty) or the raw stripped input.
+    """
+    fb = fallback_name.strip() if isinstance(fallback_name, str) and fallback_name.strip() else ""
+    if team_id_or_name is None or isinstance(team_id_or_name, bool):
+        return fb
+    key = str(team_id_or_name).strip()
+    if not key:
+        return fb
+    id_map = CBA_TEAM_ID_TO_SHORT_ZH if prefer_short else CBA_TEAM_ID_TO_ZH
+    canonical_map = _CANONICAL_ID_TO_SHORT_ZH if prefer_short else _CANONICAL_ID_TO_ZH
+    resolved = id_map.get(key)
+    if resolved:
+        return resolved
+    by_canonical = canonical_map.get(key.lower())
+    if by_canonical:
+        return by_canonical
+    return fb or key
+
+
 def format_club_team_display(team_id: object, team_name: object = None) -> Optional[str]:
     """Format a human-readable club display string with honest unknown fallback."""
     id_str = '' if (team_id is None or isinstance(team_id, bool)) else str(team_id).strip()

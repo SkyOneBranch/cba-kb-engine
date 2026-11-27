@@ -31,10 +31,13 @@ from .consumer_surface import (
     find_boundary_safe_name_spans,
     scrub_raw_drive_ids_for_consumer,
 )
-from .game_stats import summarize_recent_games
+from .game_stats import GameStatsValidationError, summarize_recent_games
 from .instance import Instance
 from .kc_render import (
     COACH_ENTITY_ROLES,
+    CitationRegistry,
+    _compute_overall_verification_status,
+    _resolve_team_name_zh,
     render_research_card,
     research_card_consumer_filename,
     research_card_public_consumer_filename,
@@ -925,6 +928,184 @@ def _build_season_stats_table_rows(
     return rows
 
 
+_CAREER_WEIGHTED_AVG_METRICS = (
+    "minutes_per_game",
+    "points_per_game",
+    "rebounds_per_game",
+    "assists_per_game",
+    "steals_per_game",
+    "blocks_per_game",
+    "turnovers_per_game",
+    "field_goals_percentage",
+    "three_point_percentage",
+    "free_throws_percentage",
+)
+
+
+def _to_number(val: Any) -> Optional[float]:
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    try:
+        return float(str(val).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _compute_career_summary(rows: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Compute deduplicated career totals & GP-weighted averages without double-counting
+    WHOLE_SEASON vs TEAM_SPLIT rows in the same season."""
+    if not rows:
+        return None
+    by_season: Dict[str, List[Mapping[str, Any]]] = {}
+    for r in rows:
+        s_key = str(r.get("season") or "").strip() or "UNKNOWN"
+        by_season.setdefault(s_key, []).append(r)
+
+    deduped: List[Mapping[str, Any]] = []
+    for s_key in sorted(by_season.keys(), key=lambda s: (_parse_season_start_year(s) or -1, s)):
+        s_rows = by_season[s_key]
+        whole_rows = [
+            r for r in s_rows
+            if str(r.get("scope") or "").strip().upper() == "WHOLE_SEASON"
+        ]
+        if whole_rows:
+            deduped.append(whole_rows[0])
+        else:
+            deduped.extend(s_rows)
+
+    total_gp = 0
+    total_gs = 0
+    has_gs = False
+    weighted_sums: Dict[str, float] = {m: 0.0 for m in _CAREER_WEIGHTED_AVG_METRICS}
+    weighted_gps: Dict[str, float] = {m: 0.0 for m in _CAREER_WEIGHTED_AVG_METRICS}
+
+    for r in deduped:
+        metrics = r.get("metrics") if isinstance(r.get("metrics"), Mapping) else r
+        gp_num = _to_number(metrics.get("games_played"))
+        if gp_num is None or gp_num <= 0:
+            continue
+        gp_int = int(round(gp_num))
+        total_gp += gp_int
+        gs_num = _to_number(metrics.get("games_started"))
+        if gs_num is not None and gs_num >= 0:
+            has_gs = True
+            total_gs += int(round(gs_num))
+        for col in _CAREER_WEIGHTED_AVG_METRICS:
+            m_val = _to_number(metrics.get(col))
+            if m_val is not None:
+                weighted_sums[col] += m_val * gp_num
+                weighted_gps[col] += gp_num
+
+    if total_gp <= 0:
+        return None
+
+    summary: Dict[str, Any] = {
+        "games_played": total_gp,
+        "games_started": total_gs if has_gs else None,
+    }
+    for col in _CAREER_WEIGHTED_AVG_METRICS:
+        if weighted_gps[col] > 0:
+            summary[col] = round(weighted_sums[col] / weighted_gps[col], 1)
+        else:
+            summary[col] = None
+    return summary
+
+
+def build_career_season_stats_tables(
+    person: Mapping[str, Any],
+    season_stats_records: Sequence[Mapping[str, Any]],
+    *,
+    linked_player_uids: Sequence[str] = (),
+) -> Dict[str, Any]:
+    """Assemble multi-season Regular Season + Playoffs career tables with Chinese team names
+    and zero double-counting between WHOLE_SEASON and TEAM_SPLIT rows (REQ-241 P0-2)."""
+    uids = {
+        _norm_key(person.get("player_uid")),
+        *(_norm_key(u) for u in (linked_player_uids or ())),
+    }
+    uids.discard("")
+    pid = _norm_key(person.get("player_id"))
+    pname = _norm_key(person.get("player_name") or person.get("canonical_name"))
+
+    matched: List[Dict[str, Any]] = []
+    for rec in season_stats_records or ():
+        if not isinstance(rec, Mapping):
+            continue
+        r_uid = _norm_key(rec.get("player_uid"))
+        r_pid = _norm_key(rec.get("provider_player_id") or rec.get("player_id"))
+        r_name = _norm_key(rec.get("player_name"))
+        if (
+            (uids and r_uid in uids)
+            or (pid and r_pid == pid)
+            or (not uids and not pid and pname and r_name == pname)
+        ):
+            matched.append(dict(rec))
+
+    def _career_sort_key(rec: Mapping[str, Any]) -> tuple[int, str, int, str, str]:
+        s_str = str(rec.get("season") or "").strip()
+        s_year = _parse_season_start_year(s_str)
+        sc = str(rec.get("scope") or "").strip().upper()
+        sc_rank = 0 if sc == "WHOLE_SEASON" else (1 if sc == "TEAM_SPLIT" else 2)
+        team_k = str(rec.get("team_name") or rec.get("team_id") or "")
+        rec_id = str(rec.get("record_id") or "")
+        return (s_year if s_year is not None else 9999, s_str, sc_rank, team_k, rec_id)
+
+    regular_rows: List[Dict[str, Any]] = []
+    playoffs_rows: List[Dict[str, Any]] = []
+    seasons_seen: set[str] = set()
+
+    for rec in sorted(matched, key=_career_sort_key):
+        s_str = str(rec.get("season") or "").strip()
+        rec_metrics = rec.get("metrics") if isinstance(rec.get("metrics"), Mapping) else {}
+        prov = rec.get("provenance") if isinstance(rec.get("provenance"), Mapping) else {}
+        core_metrics = {col: rec_metrics.get(col) for col in CORE_SEASON_STATS_COLUMNS}
+        raw_tname = str(rec.get("team_name") or "").strip()
+        raw_tid = rec.get("team_id")
+        if raw_tname and not raw_tname.isdigit():
+            resolved_team_name = raw_tname
+        elif raw_tid is not None and str(raw_tid).strip():
+            resolved_team_name = _resolve_team_name_zh(raw_tid, fallback_name=raw_tname or None)
+        elif raw_tname:
+            resolved_team_name = _resolve_team_name_zh(raw_tname, fallback_name=raw_tname)
+        else:
+            resolved_team_name = "-"
+
+        mt_raw = str(rec.get("match_type") or "").strip()
+        mt_norm = mt_raw.upper()
+        if mt_norm in ("PLAYOFFS", "PLAYOFF", "2", "季后赛"):
+            bucket = playoffs_rows
+        elif mt_norm in ("REGULAR", "REGULAR_SEASON", "1", "常规赛"):
+            bucket = regular_rows
+        else:
+            continue
+
+        if s_str:
+            seasons_seen.add(s_str)
+
+        row_obj: Dict[str, Any] = {
+            "season": s_str,
+            "match_type": mt_raw,
+            "scope": str(rec.get("scope") or "").strip() or "UNKNOWN",
+            "team_id": raw_tid,
+            "team_name": resolved_team_name,
+            "record_id": rec.get("record_id"),
+            "captured_at": prov.get("captured_at"),
+            "locator": prov.get("locator") or rec.get("record_id"),
+            "metrics": core_metrics,
+        }
+        bucket.append(row_obj)
+
+    return {
+        "regular_season_rows": regular_rows,
+        "playoffs_rows": playoffs_rows,
+        "regular_career_summary": _compute_career_summary(regular_rows),
+        "playoffs_career_summary": _compute_career_summary(playoffs_rows),
+        "seasons_count": len(seasons_seen),
+    }
+
+
 def _match_game_stats(
     person: Dict[str, Any],
     game_stats_records: Sequence[Dict[str, Any]],
@@ -1138,6 +1319,95 @@ def _match_document_bundles(
     return matched
 
 
+def _summarize_recent_games_safe(
+    records: Sequence[Dict[str, Any]],
+    *,
+    window: int = 5,
+) -> Dict[str, Any]:
+    """Summarize recent games via strict `summarize_recent_games`, with a clean
+    fallback for lightweight game-log dicts (e.g. `played=True` without full v1 schema)."""
+    try:
+        return summarize_recent_games(records, window=window)
+    except GameStatsValidationError:
+        if not records or not all(isinstance(r, Mapping) and isinstance(r.get("metrics"), Mapping) for r in records):
+            raise
+        ordered = sorted(
+            (dict(r) for r in records),
+            key=lambda r: (str(r.get("game_date") or ""), str(r.get("game_id") or "")),
+            reverse=True,
+        )
+        played: List[Dict[str, Any]] = []
+        dnp_count = 0
+        for rec in ordered:
+            is_dnp = rec.get("dnp") is True or rec.get("played") is False
+            if is_dnp:
+                dnp_count += 1
+            else:
+                played.append(rec)
+        window_games = played[:window]
+        avg_keys = ("points", "rebounds", "assists", "steals", "blocks", "minutes_played")
+        averages: Dict[str, Optional[float]] = {}
+        for k in avg_keys:
+            vals = [
+                float(g["metrics"][k])
+                for g in window_games
+                if isinstance(g.get("metrics"), Mapping) and g["metrics"].get(k) is not None
+            ]
+            averages[k] = round(sum(vals) / len(vals), 4) if vals else None
+
+        def _sum_pair(made_key: str, att_key: str) -> tuple[Optional[int], Optional[int], Optional[float]]:
+            m_vals = [
+                int(g["metrics"][made_key])
+                for g in window_games
+                if isinstance(g.get("metrics"), Mapping) and g["metrics"].get(made_key) is not None
+            ]
+            a_vals = [
+                int(g["metrics"][att_key])
+                for g in window_games
+                if isinstance(g.get("metrics"), Mapping) and g["metrics"].get(att_key) is not None
+            ]
+            tm = sum(m_vals) if m_vals else None
+            ta = sum(a_vals) if a_vals else None
+            pct = round(tm / ta, 4) if tm is not None and ta is not None and ta > 0 else None
+            return tm, ta, pct
+
+        fg_m, fg_a, fg_p = _sum_pair("field_goals_made", "field_goals_attempted")
+        tp_m, tp_a, tp_p = _sum_pair("three_point_made", "three_point_attempted")
+        ft_m, ft_a, ft_p = _sum_pair("free_throws_made", "free_throws_attempted")
+        latest_game_date = (
+            max((str(g.get("game_date") or "") for g in window_games), default=None)
+            or None
+        )
+        captured_dates = [
+            str(g["provenance"]["captured_at"]).strip()
+            for g in ordered
+            if isinstance(g.get("provenance"), Mapping) and g["provenance"].get("captured_at")
+        ]
+        return {
+            "semantic_grain": "PLAYER_GAME_STATS",
+            "window": window,
+            "played_games_in_window": len(window_games),
+            "total_played_games": len(played),
+            "dnp_games_count": dnp_count,
+            "averages": averages,
+            "shooting_totals": {
+                "fg_made": fg_m,
+                "fg_attempted": fg_a,
+                "fg_pct": fg_p,
+                "tp_made": tp_m,
+                "tp_attempted": tp_a,
+                "tp_pct": tp_p,
+                "ft_made": ft_m,
+                "ft_attempted": ft_a,
+                "ft_pct": ft_p,
+            },
+            "latest_game_date": latest_game_date,
+            "latest_captured_at": max(captured_dates) if captured_dates else None,
+            "games": [{**g, "is_revised": False} for g in window_games],
+            "revision_summaries": [],
+        }
+
+
 def build_person_card(
     query: str,
     *,
@@ -1166,6 +1436,8 @@ def build_person_card(
     story_records: Optional[Sequence[Mapping[str, Any]]] = None,
     timeline_events: Optional[Sequence[Mapping[str, Any]]] = None,
     encyclopedia_clues: Optional[Sequence[Mapping[str, Any]]] = None,
+    bio_profile: Optional[Any] = None,
+    person_bio_profiles: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Assemble and render an on-demand research card for any player in local KB.
 
@@ -1214,6 +1486,51 @@ def build_person_card(
         data_cutoff=discovered.get("data_cutoff"),
     )
 
+    if resolution["status"] == "NOT_FOUND_IN_LOCAL_KB" and isinstance(person_registry, Mapping):
+        from .person_registry import resolve_person_identity
+
+        pr_res = resolve_person_identity(query, person_registry=person_registry)
+        if pr_res.get("status") == "RESOLVED" and isinstance(pr_res.get("person"), Mapping):
+            pr_person = dict(pr_res["person"])
+            linked_uids = list(pr_person.get("linked_player_uids") or [])
+            tenures = list(pr_person.get("role_tenures") or [])
+            clubs_hist: List[str] = []
+            for t in tenures:
+                if isinstance(t, Mapping):
+                    org_n = str(t.get("organization_name") or t.get("organization_id") or "").strip()
+                    if org_n and org_n not in clubs_hist:
+                        clubs_hist.append(org_n)
+            latest_role = (
+                str(tenures[-1].get("role") or "").strip()
+                if tenures and isinstance(tenures[-1], Mapping)
+                else None
+            )
+            synth_person: Dict[str, Any] = {
+                "person_uid": pr_person.get("person_uid"),
+                "player_uid": linked_uids[0] if linked_uids else None,
+                "player_id": None,
+                "player_name": pr_person.get("canonical_name") or query.strip(),
+                "player_name_en": None,
+                "aliases": list(pr_person.get("aliases") or []),
+                "current_club": clubs_hist[-1] if clubs_hist else None,
+                "clubs_history": clubs_hist,
+                "registration_type": None,
+                "jersey_number": None,
+                "position": None,
+                "domestic_records": [],
+                "foreign_records": [],
+                "entity_role": entity_role or latest_role or "PLAYER",
+            }
+            resolution = {
+                "status": "RESOLVED",
+                "query": resolution["query"],
+                "person": synth_person,
+                "candidates": [synth_person],
+                "local_data_cutoff": resolution["local_data_cutoff"],
+                "negative_receipt_hit": False,
+                "negative_receipt": None,
+            }
+
     if resolution["status"] != "RESOLVED":
         return {
             "status": resolution["status"],
@@ -1239,7 +1556,7 @@ def build_person_card(
     matched_season = _match_season_stats(person, s_stats, season=season)
     matched_games = _match_game_stats(person, g_stats, season=season)
     recent_summary = (
-        summarize_recent_games(matched_games, window=recent_games_window)
+        _summarize_recent_games_safe(matched_games, window=recent_games_window)
         if matched_games
         else None
     )
@@ -1257,7 +1574,12 @@ def build_person_card(
     )
 
     player_name = str(person.get("player_name") or query.strip())
-    player_id = person.get("player_id") or person.get("player_uid") or "unassigned"
+    player_id = (
+        person.get("player_id")
+        or person.get("player_uid")
+        or person.get("person_uid")
+        or ("" if style == "wiki_v241" else "unassigned")
+    )
     domestic_current, domestic_history = _build_domestic_registration_blocks(
         person.get("domestic_records") or (),
         target_season=season,
@@ -1410,7 +1732,7 @@ def build_person_card(
     if recent_summary is not None:
         payload["recent_games_summary"] = recent_summary
     elif not (
-        style == "wiki_v240"
+        style in ("wiki_v240", "wiki_v241")
         and effective_role.strip().upper() in COACH_ENTITY_ROLES
         and not matched_season
     ):
@@ -1423,11 +1745,21 @@ def build_person_card(
     if obs_horizon is not None:
         payload["observation_horizon"] = obs_horizon
 
-    if style == "wiki_v240":
+    resolved_person_uid: Optional[str] = (
+        str(person.get("person_uid")).strip()
+        if isinstance(person.get("person_uid"), str) and person.get("person_uid").strip()
+        else None
+    )
+    resolved_bio: Optional[Dict[str, Any]] = None
+    career_season_stats: Optional[Dict[str, Any]] = None
+    lead_paragraph_dict: Optional[Dict[str, Any]] = None
+    overall_verification_status: Optional[str] = None
+    cit_reg: Optional[CitationRegistry] = None
+
+    if style in ("wiki_v240", "wiki_v241"):
         payload["entity_role"] = effective_role
         if coach_role_facets is not None:
             payload["coach_role_facets"] = coach_role_facets
-        resolved_person_uid: Optional[str] = None
         if isinstance(person_registry, Mapping):
             from .person_registry import (
                 resolve_person_identity,
@@ -1435,7 +1767,7 @@ def build_person_card(
             )
 
             reg_res = resolve_person_identity(
-                player_name,
+                resolved_person_uid or player_name,
                 person_registry=person_registry,
                 player_uid=person.get("player_uid"),
             )
@@ -1466,6 +1798,69 @@ def build_person_card(
             payload["timeline_events"] = list(timeline_events)
         if encyclopedia_clues is not None:
             payload["encyclopedia_clues"] = list(encyclopedia_clues)
+
+    if style == "wiki_v241":
+        # Resolve bio_profile
+        if bio_profile is not None:
+            if hasattr(bio_profile, "to_dict") and callable(bio_profile.to_dict):
+                resolved_bio = dict(bio_profile.to_dict())
+            elif isinstance(bio_profile, Mapping):
+                resolved_bio = dict(bio_profile)
+        elif isinstance(person_bio_profiles, Mapping):
+            raw_profiles = person_bio_profiles.get("profiles") or ()
+            for prof in raw_profiles:
+                pd = (
+                    dict(prof.to_dict())
+                    if hasattr(prof, "to_dict") and callable(prof.to_dict)
+                    else (dict(prof) if isinstance(prof, Mapping) else None)
+                )
+                if not pd:
+                    continue
+                if resolved_person_uid and pd.get("person_uid") == resolved_person_uid:
+                    resolved_bio = pd
+                    break
+                if _norm_key(pd.get("canonical_name")) == _norm_key(player_name):
+                    resolved_bio = pd
+                    break
+        if resolved_bio is not None:
+            payload["bio_profile"] = resolved_bio
+
+        linked_uids = tuple(
+            (payload.get("unified_profile") or {}).get("linked_player_uids") or ()
+        )
+        career_season_stats = build_career_season_stats_tables(
+            person, s_stats, linked_player_uids=linked_uids
+        )
+        payload["career_season_stats"] = career_season_stats
+
+        cit_reg = CitationRegistry(visibility=vis)
+        payload["citation_registry"] = cit_reg
+
+        from .editorial_brief import compose_wiki_lead_paragraph
+
+        lead_paragraph_dict = compose_wiki_lead_paragraph(
+            person_name=player_name,
+            bio_profile=resolved_bio,
+            registration_profile=reg_profile,
+            coach_role_facets=coach_role_facets,
+            unified_profile=payload.get("unified_profile"),
+            career_season_stats=career_season_stats,
+            projected_stories=payload.get("projected_stories"),
+            citation_registry=cit_reg,
+            visibility=vis,
+        )
+        payload["lead_paragraph"] = lead_paragraph_dict
+
+        overall_verification_status = _compute_overall_verification_status(
+            domain_horizons,
+            has_career_stats=bool(
+                career_season_stats.get("regular_season_rows")
+                or career_season_stats.get("playoffs_rows")
+            ),
+            has_coach_facets=coach_role_facets is not None,
+            has_bio=resolved_bio is not None,
+        )
+        payload["overall_verification_status"] = overall_verification_status
 
     raw_markdown = render_research_card(
         payload,
@@ -1535,7 +1930,11 @@ def build_person_card(
         "query": resolution["query"],
         "season": season,
         "visibility": vis,
+        "card_style": style,
         "person": person,
+        "person_uid": resolved_person_uid or person.get("person_uid") or person.get("player_uid"),
+        "person_name": player_name,
+        "entity_role": effective_role,
         "candidates": resolution["candidates"],
         "posture": posture,
         "unknown_subkind": unknown_subkind,
@@ -1549,6 +1948,19 @@ def build_person_card(
         "drive_api_called": False,
         "network_called": False,
     }
+    if style == "wiki_v241":
+        result["career_season_stats"] = career_season_stats
+        result["lead_paragraph"] = lead_paragraph_dict
+        result["lead_plain_text"] = (
+            lead_paragraph_dict.get("lead_plain_text", "")
+            if isinstance(lead_paragraph_dict, Mapping)
+            else ""
+        )
+        result["bio_profile"] = resolved_bio
+        result["citations"] = cit_reg.entries() if cit_reg is not None else []
+        result["overall_verification_status"] = overall_verification_status
+        result["projected_stories"] = list(payload.get("projected_stories") or [])
+        result["registration_profile"] = reg_profile
     if obs_horizon is not None:
         result["observation_horizon"] = obs_horizon
     return result
