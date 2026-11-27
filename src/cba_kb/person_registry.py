@@ -16,6 +16,7 @@ from .actor import ActorError, validate_person_uid
 from .player_identity import normalize_name
 
 PERSON_REGISTRY_SCHEMA = "cba-kb.person-registry.v1"
+PERSON_BIO_PROFILES_SCHEMA = "cba-kb.person-bio-profiles.v1"
 PERSON_UID_RE = re.compile(r"PERS-[A-Za-z0-9_-]{8,64}\Z")
 
 PLAYER_ROLES = frozenset({"PLAYER"})
@@ -424,4 +425,188 @@ def unify_player_and_coach_profile(
         "has_coach_tenure": has_coach_tenure,
         "is_player_to_coach_transition": is_player_to_coach_transition,
         "status": target["status"],
+    }
+
+
+def _clean_positive_optional_int(value: Any, label: str) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise PersonRegistryError(f"{label}_POSITIVE_INT_REQUIRED")
+    return value
+
+
+def _clean_evidence_refs_tuple(values: Any, label: str) -> Tuple[Any, ...]:
+    if values is None:
+        return ()
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise PersonRegistryError(f"{label}_SEQUENCE_REQUIRED")
+    cleaned: List[Any] = []
+    for item in values:
+        if isinstance(item, str):
+            cleaned.append(_clean_required_str(item, f"{label}_ITEM"))
+        elif isinstance(item, Mapping):
+            cleaned.append(dict(item))
+        else:
+            raise PersonRegistryError(f"{label}_ITEM_INVALID")
+    return tuple(cleaned)
+
+
+@dataclass(frozen=True)
+class PersonBioProfile:
+    person_uid: str
+    canonical_name: str
+    english_name: Optional[str] = None
+    birth_date: Optional[str] = None
+    birth_place: Optional[str] = None
+    nationality: Optional[str] = None
+    height_cm: Optional[int] = None
+    weight_kg: Optional[int] = None
+    position: Optional[str] = None
+    jersey_number: Optional[str] = None
+    current_club: Optional[str] = None
+    current_role: Optional[str] = None
+    draft_or_youth_origin: Optional[str] = None
+    honors: Tuple[str, ...] = ()
+    evidence_refs: Tuple[Any, ...] = ()
+    review_status: str = "VERIFIED"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "person_uid", _validate_pers_uid(self.person_uid))
+        object.__setattr__(
+            self, "canonical_name", _clean_required_str(self.canonical_name, "CANONICAL_NAME")
+        )
+        object.__setattr__(
+            self, "english_name", _clean_optional_str(self.english_name, "ENGLISH_NAME")
+        )
+        object.__setattr__(
+            self, "birth_date", _clean_optional_str(self.birth_date, "BIRTH_DATE")
+        )
+        object.__setattr__(
+            self, "birth_place", _clean_optional_str(self.birth_place, "BIRTH_PLACE")
+        )
+        object.__setattr__(
+            self, "nationality", _clean_optional_str(self.nationality, "NATIONALITY")
+        )
+        object.__setattr__(
+            self, "height_cm", _clean_positive_optional_int(self.height_cm, "HEIGHT_CM")
+        )
+        object.__setattr__(
+            self, "weight_kg", _clean_positive_optional_int(self.weight_kg, "WEIGHT_KG")
+        )
+        object.__setattr__(self, "position", _clean_optional_str(self.position, "POSITION"))
+        object.__setattr__(
+            self, "jersey_number", _clean_optional_str(self.jersey_number, "JERSEY_NUMBER")
+        )
+        object.__setattr__(
+            self, "current_club", _clean_optional_str(self.current_club, "CURRENT_CLUB")
+        )
+        object.__setattr__(
+            self, "current_role", _clean_optional_str(self.current_role, "CURRENT_ROLE")
+        )
+        object.__setattr__(
+            self,
+            "draft_or_youth_origin",
+            _clean_optional_str(self.draft_or_youth_origin, "DRAFT_OR_YOUTH_ORIGIN"),
+        )
+        object.__setattr__(self, "honors", _clean_str_tuple(self.honors, "HONORS"))
+        object.__setattr__(
+            self, "evidence_refs", _clean_evidence_refs_tuple(self.evidence_refs, "EVIDENCE_REFS")
+        )
+        object.__setattr__(
+            self, "review_status", _clean_required_str(self.review_status, "REVIEW_STATUS")
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "person_uid": self.person_uid,
+            "canonical_name": self.canonical_name,
+            "english_name": self.english_name,
+            "birth_date": self.birth_date,
+            "birth_place": self.birth_place,
+            "nationality": self.nationality,
+            "height_cm": self.height_cm,
+            "weight_kg": self.weight_kg,
+            "position": self.position,
+            "jersey_number": self.jersey_number,
+            "current_club": self.current_club,
+            "current_role": self.current_role,
+            "draft_or_youth_origin": self.draft_or_youth_origin,
+            "honors": list(self.honors),
+            "evidence_refs": [
+                dict(ref) if isinstance(ref, Mapping) else ref for ref in self.evidence_refs
+            ],
+            "review_status": self.review_status,
+        }
+
+
+def _normalize_bio_profile_entry(entry: PersonBioProfile | Mapping[str, Any]) -> Dict[str, Any]:
+    if isinstance(entry, PersonBioProfile):
+        return entry.to_dict()
+    if not isinstance(entry, Mapping):
+        raise PersonRegistryError("BIO_PROFILE_OBJECT_REQUIRED")
+    profile = PersonBioProfile(
+        person_uid=entry.get("person_uid", ""),
+        canonical_name=entry.get("canonical_name", ""),
+        english_name=entry.get("english_name"),
+        birth_date=entry.get("birth_date"),
+        birth_place=entry.get("birth_place"),
+        nationality=entry.get("nationality"),
+        height_cm=entry.get("height_cm"),
+        weight_kg=entry.get("weight_kg"),
+        position=entry.get("position"),
+        jersey_number=entry.get("jersey_number"),
+        current_club=entry.get("current_club"),
+        current_role=entry.get("current_role"),
+        draft_or_youth_origin=entry.get("draft_or_youth_origin"),
+        honors=tuple(entry.get("honors") or ()),
+        evidence_refs=tuple(entry.get("evidence_refs") or ()),
+        review_status=entry.get("review_status", "VERIFIED"),
+    )
+    return profile.to_dict()
+
+
+def make_person_bio_profiles(
+    profiles: Sequence[PersonBioProfile | Mapping[str, Any]] = (),
+    *,
+    schema: str = PERSON_BIO_PROFILES_SCHEMA,
+) -> Dict[str, Any]:
+    """Build and validate a `cba-kb.person-bio-profiles.v1` dictionary."""
+    if isinstance(profiles, (str, bytes)) or not isinstance(profiles, Sequence):
+        raise PersonRegistryError("BIO_PROFILES_SEQUENCE_REQUIRED")
+    raw_profiles = [
+        p.to_dict() if isinstance(p, PersonBioProfile) else dict(p)
+        if isinstance(p, Mapping)
+        else p
+        for p in profiles
+    ]
+    return validate_person_bio_profiles({"schema": schema, "profiles": raw_profiles})
+
+
+def validate_person_bio_profiles(bundle: Mapping[str, Any]) -> Dict[str, Any]:
+    """Validate person bio profiles schema and unique `PERS-*` person_uid entries."""
+    if not isinstance(bundle, Mapping):
+        raise PersonRegistryError("PERSON_BIO_PROFILES_OBJECT_REQUIRED")
+
+    schema = bundle.get("schema")
+    if schema != PERSON_BIO_PROFILES_SCHEMA:
+        raise PersonRegistryError(f"INVALID_PERSON_BIO_PROFILES_SCHEMA:{schema}")
+
+    profiles = bundle.get("profiles")
+    if isinstance(profiles, (str, bytes)) or not isinstance(profiles, Sequence):
+        raise PersonRegistryError("BIO_PROFILES_SEQUENCE_REQUIRED")
+
+    seen_person_uids: set[str] = set()
+    normalized_profiles: List[Dict[str, Any]] = []
+    for entry in profiles:
+        profile = _normalize_bio_profile_entry(entry)
+        puid = profile["person_uid"]
+        if puid in seen_person_uids:
+            raise PersonRegistryError(f"DUPLICATE_BIO_PROFILE_PERSON_UID:{puid}")
+        seen_person_uids.add(puid)
+        normalized_profiles.append(profile)
+
+    return {
+        "schema": PERSON_BIO_PROFILES_SCHEMA,
+        "profiles": normalized_profiles,
     }

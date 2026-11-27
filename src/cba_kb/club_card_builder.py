@@ -14,7 +14,12 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from .common import atomic
 from .consumer_surface import scrub_raw_drive_ids_for_consumer
-from .kc_render import _safe_filename_part, _sanitize_public_free_text
+from .kc_render import (
+    CitationRegistry,
+    _safe_filename_part,
+    _sanitize_public_free_text,
+    validate_card_style,
+)
 from .kc_visibility import validate_card_visibility, verify_public_safe_card_text
 from .role_facets import build_coach_role_facets
 
@@ -138,18 +143,35 @@ def _project_org_stories(
             vis_pol = st.get("visibility_policy") if isinstance(st.get("visibility_policy"), Mapping) else {}
             if is_public and vis_pol.get("public_export_allowed") is False:
                 continue
-            summaries = [
-                str(p.get("public_perspective_summary") or "").strip()
-                for p in (st.get("participants") or ())
-                if isinstance(p, Mapping) and str(p.get("public_perspective_summary") or "").strip()
-            ]
+            org_summary = str(st.get("organization_summary") or "").strip()
+            if org_summary:
+                chosen_summary = org_summary
+            else:
+                parts = [p for p in (st.get("participants") or ()) if isinstance(p, Mapping)]
+                chosen_summary = ""
+                for preferred_role in ("ACTION_INITIATOR", "SUBJECT_INTERVIEWEE"):
+                    for p in parts:
+                        if str(p.get("role") or "").strip() == preferred_role:
+                            cand = str(p.get("public_perspective_summary") or "").strip()
+                            if cand:
+                                chosen_summary = cand
+                                break
+                    if chosen_summary:
+                        break
+                if not chosen_summary:
+                    for p in parts:
+                        cand = str(p.get("public_perspective_summary") or "").strip()
+                        if cand:
+                            chosen_summary = cand
+                            break
             projected.append({
                 "story_id": st.get("story_id"),
                 "title": st.get("title"),
                 "occurred_season": st.get("occurred_season"),
                 "occurred_date": st.get("occurred_date"),
                 "published_at": st.get("published_at"),
-                "summary": " ".join(summaries) or str(st.get("title") or ""),
+                "canonical_source": src,
+                "summary": chosen_summary or str(st.get("title") or ""),
             })
         return projected
 
@@ -165,19 +187,23 @@ def build_club_panorama_card(
     coach_role_facets: Optional[Sequence[Any]] = None,
     story_records: Optional[Sequence[Mapping[str, Any]]] = None,
     visibility: str = "internal_full",
+    card_style: str = "classic",
+    person_registry: Optional[Mapping[str, Any]] = None,
     output_dir: Optional[str | Path] = None,
     observed_until: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Assemble and render a multi-season Club Panorama Card.
 
     Aggregates 2-season roster (domestic + foreign), 3-facet coaching staff,
-    and organization-projected story timeline.
+    offseason roster changes, and organization-projected story timeline.
     """
     if not isinstance(club_query, str) or not club_query.strip():
         raise ValueError("CLUB_QUERY_REQUIRED")
 
     vis = validate_card_visibility(visibility)
+    style = validate_card_style(card_style)
     is_public = vis == "public_safe"
+    is_wiki_v241 = style == "wiki_v241"
 
     org = _normalize_org_profile(club_query, organization_profile)
     organization_id = org["organization_id"]
@@ -275,126 +301,316 @@ def build_club_panorama_card(
         visibility=vis,
     )
 
-    # 4. Render Markdown
-    lines: List[str] = [
-        f"# 俱乐部全景卡｜{club_name}（{organization_id}）｜{seasons_label}｜CURRENT"
-    ]
-    if is_public:
-        lines.append("- Visibility: PUBLIC_SAFE")
-    lines.append("")
-
-    lines.extend([
-        "## Observation Horizon",
-        f"- observed_until: {observed_until or 'UNKNOWN'}",
-        f"- seasons_covered: {', '.join(season_list)}",
-        "",
-        "## Organization Profile",
-        f"- Organization ID: {organization_id}",
-        f"- Canonical Name: {club_name}",
-        f"- Short Name: {short_name}",
-        f"- League: {org['league']}",
-    ])
-    if org.get("city"):
-        lines.append(f"- City: {org['city']}")
-
-    lines.extend([
-        "",
-        f"## Multi-Season Roster ({', '.join(season_list)})",
-    ])
+    # 3b. Offseason roster changes & all_roster_members (REQ-241 P0-2 D-02)
+    season_player_sets: Dict[str, set[str]] = {}
+    all_members_set: set[str] = set()
     for s in season_list:
-        dom_rows = roster_by_season[s]["domestic"]
-        for_rows = roster_by_season[s]["foreign"]
+        pset: set[str] = set()
+        for r in roster_by_season[s]["domestic"]:
+            nm = str(r.get("player") or r.get("player_name") or "").strip()
+            if nm:
+                pset.add(nm)
+                all_members_set.add(nm)
+        for r in roster_by_season[s]["foreign"]:
+            nm = str(r.get("player_zh") or r.get("player_name") or r.get("player_en") or r.get("player") or "").strip()
+            if nm:
+                pset.add(nm)
+                all_members_set.add(nm)
+        season_player_sets[s] = pset
+
+    for fd in normalized_facets:
+        c_nm = str(fd.get("person_name") or "").strip()
+        if c_nm:
+            all_members_set.add(c_nm)
+
+    if isinstance(person_registry, Mapping):
+        for p_entry in person_registry.get("persons") or ():
+            if not isinstance(p_entry, Mapping):
+                continue
+            cname = str(p_entry.get("canonical_name") or "").strip()
+            if not cname:
+                continue
+            for t in p_entry.get("role_tenures") or ():
+                if not isinstance(t, Mapping):
+                    continue
+                t_tokens = {
+                    _norm_token(t.get("organization_id")),
+                    _norm_token(t.get("organization_name")),
+                }
+                t_tokens.discard("")
+                if t_tokens & club_tokens:
+                    all_members_set.add(cname)
+                    break
+
+    from_season = season_list[0]
+    to_season = season_list[-1]
+    prev_players = season_player_sets.get(from_season, set())
+    curr_players = season_player_sets.get(to_season, set())
+    if len(season_list) >= 2:
+        retained_players = sorted(prev_players & curr_players)
+        joined_players = sorted(curr_players - prev_players)
+        departed_players = sorted(prev_players - curr_players)
+    else:
+        retained_players = sorted(curr_players)
+        joined_players = []
+        departed_players = []
+
+    offseason_roster_changes: Dict[str, Any] = {
+        "from_season": from_season,
+        "to_season": to_season,
+        "retained": retained_players,
+        "joined": joined_players,
+        "departed": departed_players,
+    }
+    all_roster_members: List[str] = sorted(all_members_set)
+
+    # 4. Render Markdown
+    cit_reg = CitationRegistry(visibility=vis)
+    if is_wiki_v241:
+        lines: List[str] = [f"# {club_name}"]
         lines.extend([
             "",
-            f"### {s} Domestic Roster",
+            "## 俱乐部概况",
+            f"- 俱乐部全称：{club_name}",
+            f"- 简称：{short_name}",
+            f"- 所属联赛：{org['league']}",
         ])
-        if dom_rows:
-            lines.extend([
-                "| Player | Contract Category | Registration Status |",
-                "| --- | --- | --- |",
-            ])
-            for r in dom_rows:
-                p_disp = str(r.get("player") or r.get("player_name") or "-").strip()
-                cat = str(r.get("contract_category") or "未公示 (UNKNOWN)").strip() or "未公示 (UNKNOWN)"
-                reg_st = str(r.get("registration_status") or "-").strip() or "-"
-                if is_public:
-                    p_disp = _sanitize_public_free_text(p_disp, fallback="-")
-                    cat = _sanitize_public_free_text(cat, fallback="-")
-                    reg_st = _sanitize_public_free_text(reg_st, fallback="-")
-                lines.append(f"| {p_disp} | {cat} | {reg_st} |")
-        else:
-            lines.append("- No domestic roster records observed in local snapshot.")
+        if org.get("city"):
+            lines.append(f"- 所在城市：{org['city']}")
 
-        if for_rows:
+        lines.extend([
+            "",
+            "## 休赛期阵容变动",
+            f"- 对比周期：{from_season} -> {to_season}",
+            f"- 留队球员（{len(retained_players)}）：{'、'.join(retained_players) if retained_players else '无'}",
+            f"- 新援与上调（{len(joined_players)}）：{'、'.join(joined_players) if joined_players else '无'}",
+            f"- 离队球员（{len(departed_players)}）：{'、'.join(departed_players) if departed_players else '无'}",
+        ])
+
+        lines.extend([
+            "",
+            f"## 跨赛季阵容名单（{'、'.join(season_list)}）",
+        ])
+        for s in season_list:
+            dom_rows = roster_by_season[s]["domestic"]
+            for_rows = roster_by_season[s]["foreign"]
+            lines.extend(["", f"### {s} 国内球员名单"])
+            if dom_rows:
+                lines.extend([
+                    "| 球员 | 合同类别 | 注册状态 |",
+                    "| --- | --- | --- |",
+                ])
+                for r in dom_rows:
+                    p_disp = str(r.get("player") or r.get("player_name") or "-").strip()
+                    cat = str(r.get("contract_category") or "未公示").strip() or "未公示"
+                    reg_st = str(r.get("registration_status") or "-").strip() or "-"
+                    if is_public:
+                        p_disp = _sanitize_public_free_text(p_disp, fallback="-")
+                        cat = _sanitize_public_free_text(cat, fallback="-")
+                        reg_st = _sanitize_public_free_text(reg_st, fallback="-")
+                    lines.append(f"| {p_disp} | {cat} | {reg_st} |")
+            else:
+                lines.append("- 当前快照暂无国内球员注册记录。")
+
+            if for_rows:
+                lines.extend([
+                    "",
+                    f"### {s} 外籍球员名单",
+                    "| 中文名 | 英文名 | 位置 | 球衣号码 |",
+                    "| --- | --- | --- | --- |",
+                ])
+                for r in for_rows:
+                    p_zh = str(r.get("player_zh") or r.get("player_name") or "-").strip()
+                    p_en = str(r.get("player_en") or r.get("player_name_en") or r.get("player") or "-").strip()
+                    pos = str(r.get("position") or "-").strip()
+                    jersey = str(r.get("jersey_number") or "-").strip()
+                    if is_public:
+                        p_zh = _sanitize_public_free_text(p_zh, fallback="-")
+                        p_en = _sanitize_public_free_text(p_en, fallback="-")
+                    lines.append(f"| {p_zh} | {p_en} | {pos} | {jersey} |")
+
+        if normalized_facets:
+            lines.extend(["", "## 教练组与治理角色"])
+            for fd in normalized_facets:
+                c_name = str(fd.get("person_name") or fd.get("person_uid") or "-")
+                c_season = str(fd.get("season") or "-")
+                l_role = str(fd.get("league_listed_role") or "OBSERVED_EMPTY")
+                c_role = str(fd.get("club_appointed_role") or "OBSERVED_EMPTY")
+                g_role = str(fd.get("gameday_acting_role") or "OBSERVED_EMPTY")
+                lines.append(
+                    f"- {c_name}（{c_season}）：联赛注册 `{l_role}`｜俱乐部任命 `{c_role}`｜临场执教 `{g_role}`"
+                )
+                if fd.get("has_institutional_discrepancy"):
+                    d_code = str(fd.get("discrepancy_code") or "LEAGUE_VS_CLUB_ROLE_DISCREPANCY")
+                    raw_expl = str(fd.get("discrepancy_explanation") or "").strip()
+                    expl = _sanitize_public_free_text(raw_expl, fallback="-") if is_public else raw_expl
+                    if expl and expl != "-":
+                        lines.append(f"  * 制度口径差异（{d_code}）：{expl}")
+
+        if projected_stories:
+            lines.extend(["", "## 球队故事与关键事件"])
+            for st in projected_stories:
+                st_season = str(st.get("occurred_season") or "-")
+                st_title = str(st.get("title") or "-")
+                raw_sum = str(st.get("summary") or st.get("public_perspective_summary") or "-").strip()
+                if is_public:
+                    st_title = _sanitize_public_free_text(st_title, fallback="-")
+                    st_sum = _sanitize_public_free_text(raw_sum, fallback="-")
+                else:
+                    st_sum = raw_sum or "-"
+                c_src = st.get("canonical_source")
+                ref_s = ""
+                if isinstance(c_src, Mapping):
+                    idx = cit_reg.register(
+                        label=str(c_src.get("title") or c_src.get("label") or st_title),
+                        url=str(c_src.get("url") or "") or None,
+                        source_kind=str(c_src.get("source_kind") or "") or None,
+                        published_at=str(c_src.get("published_at") or "") or None,
+                        publisher=str(c_src.get("publisher") or "") or None,
+                        source_id=str(c_src.get("source_id") or "") or None,
+                    )
+                    if idx is not None:
+                        ref_s = cit_reg.format_ref(idx)
+                lines.append(f"- [{st_season}] {st_title}：{st_sum}{ref_s}")
+                if not is_public and st.get("internal_verbatim_or_note"):
+                    lines.append(f"  * 内部摘录：{st['internal_verbatim_or_note']}")
+
+        ref_md = cit_reg.render_markdown_references(heading="## 参考资料")
+        if ref_md:
+            lines.extend(["", ref_md])
+
+        lines.extend([
+            "",
+            '<details class="audit-drawer">',
+            "<summary>数据审计与观测边界</summary>",
+            "",
+            f"- Organization ID: {organization_id}",
+            f"- observed_until: {observed_until or 'UNKNOWN'}",
+            f"- seasons_covered: {', '.join(season_list)}",
+            *(["- Visibility: PUBLIC_SAFE"] if is_public else []),
+            "",
+            "</details>",
+        ])
+    else:
+        lines = [
+            f"# 俱乐部全景卡｜{club_name}（{organization_id}）｜{seasons_label}｜CURRENT"
+        ]
+        if is_public:
+            lines.append("- Visibility: PUBLIC_SAFE")
+        lines.append("")
+
+        lines.extend([
+            "## Observation Horizon",
+            f"- observed_until: {observed_until or 'UNKNOWN'}",
+            f"- seasons_covered: {', '.join(season_list)}",
+            "",
+            "## Organization Profile",
+            f"- Organization ID: {organization_id}",
+            f"- Canonical Name: {club_name}",
+            f"- Short Name: {short_name}",
+            f"- League: {org['league']}",
+        ])
+        if org.get("city"):
+            lines.append(f"- City: {org['city']}")
+
+        lines.extend([
+            "",
+            f"## Multi-Season Roster ({', '.join(season_list)})",
+        ])
+        for s in season_list:
+            dom_rows = roster_by_season[s]["domestic"]
+            for_rows = roster_by_season[s]["foreign"]
             lines.extend([
                 "",
-                f"### {s} Foreign Roster",
-                "| Player (ZH) | Player (EN) | Position | Jersey |",
-                "| --- | --- | --- | --- |",
+                f"### {s} Domestic Roster",
             ])
-            for r in for_rows:
-                p_zh = str(r.get("player_zh") or r.get("player_name") or "-").strip()
-                p_en = str(r.get("player_en") or r.get("player_name_en") or r.get("player") or "-").strip()
-                pos = str(r.get("position") or "-").strip()
-                jersey = str(r.get("jersey_number") or "-").strip()
-                if is_public:
-                    p_zh = _sanitize_public_free_text(p_zh, fallback="-")
-                    p_en = _sanitize_public_free_text(p_en, fallback="-")
-                lines.append(f"| {p_zh} | {p_en} | {pos} | {jersey} |")
-
-    lines.extend([
-        "",
-        "## Coaching Staff (3-Facet Role Governance)",
-    ])
-    if normalized_facets:
-        for fd in normalized_facets:
-            c_name = str(fd.get("person_name") or fd.get("person_uid") or "-")
-            c_season = str(fd.get("season") or "-")
-            l_role = str(fd.get("league_listed_role") or "OBSERVED_EMPTY")
-            c_role = str(fd.get("club_appointed_role") or "OBSERVED_EMPTY")
-            g_role = str(fd.get("gameday_acting_role") or "OBSERVED_EMPTY")
-            lines.append(
-                f"- {c_name} ({c_season}): "
-                f"league_listed_role={l_role} | "
-                f"club_appointed_role={c_role} | "
-                f"gameday_acting_role={g_role}"
-            )
-            if fd.get("has_institutional_discrepancy"):
-                d_code = str(fd.get("discrepancy_code") or "LEAGUE_VS_CLUB_ROLE_DISCREPANCY")
-                raw_expl = str(fd.get("discrepancy_explanation") or "").strip()
-                expl = (
-                    _sanitize_public_free_text(raw_expl, fallback="-")
-                    if is_public
-                    else raw_expl
-                )
-                if expl and expl != "-":
-                    lines.append(f"  * Discrepancy [{d_code}]: {expl}")
-                else:
-                    lines.append(f"  * Discrepancy [{d_code}]")
-    else:
-        lines.append("- No coaching staff facets observed in local snapshot.")
-
-    lines.extend([
-        "",
-        "## Organization Narrative & Story Timeline",
-    ])
-    if projected_stories:
-        for st in projected_stories:
-            st_season = str(st.get("occurred_season") or "-")
-            st_title = str(st.get("title") or "-")
-            raw_sum = str(
-                st.get("summary") or st.get("public_perspective_summary") or "-"
-            ).strip()
-            if is_public:
-                st_title = _sanitize_public_free_text(st_title, fallback="-")
-                st_sum = _sanitize_public_free_text(raw_sum, fallback="-")
+            if dom_rows:
+                lines.extend([
+                    "| Player | Contract Category | Registration Status |",
+                    "| --- | --- | --- |",
+                ])
+                for r in dom_rows:
+                    p_disp = str(r.get("player") or r.get("player_name") or "-").strip()
+                    cat = str(r.get("contract_category") or "未公示 (UNKNOWN)").strip() or "未公示 (UNKNOWN)"
+                    reg_st = str(r.get("registration_status") or "-").strip() or "-"
+                    if is_public:
+                        p_disp = _sanitize_public_free_text(p_disp, fallback="-")
+                        cat = _sanitize_public_free_text(cat, fallback="-")
+                        reg_st = _sanitize_public_free_text(reg_st, fallback="-")
+                    lines.append(f"| {p_disp} | {cat} | {reg_st} |")
             else:
-                st_sum = raw_sum or "-"
-            lines.append(f"- [{st_season}] {st_title}: {st_sum}")
-            if not is_public and st.get("internal_verbatim_or_note"):
-                lines.append(f"  * Internal Note: {st['internal_verbatim_or_note']}")
-    else:
-        lines.append("- No organization stories projected in local snapshot.")
+                lines.append("- No domestic roster records observed in local snapshot.")
+
+            if for_rows:
+                lines.extend([
+                    "",
+                    f"### {s} Foreign Roster",
+                    "| Player (ZH) | Player (EN) | Position | Jersey |",
+                    "| --- | --- | --- | --- |",
+                ])
+                for r in for_rows:
+                    p_zh = str(r.get("player_zh") or r.get("player_name") or "-").strip()
+                    p_en = str(r.get("player_en") or r.get("player_name_en") or r.get("player") or "-").strip()
+                    pos = str(r.get("position") or "-").strip()
+                    jersey = str(r.get("jersey_number") or "-").strip()
+                    if is_public:
+                        p_zh = _sanitize_public_free_text(p_zh, fallback="-")
+                        p_en = _sanitize_public_free_text(p_en, fallback="-")
+                    lines.append(f"| {p_zh} | {p_en} | {pos} | {jersey} |")
+
+        lines.extend([
+            "",
+            "## Coaching Staff (3-Facet Role Governance)",
+        ])
+        if normalized_facets:
+            for fd in normalized_facets:
+                c_name = str(fd.get("person_name") or fd.get("person_uid") or "-")
+                c_season = str(fd.get("season") or "-")
+                l_role = str(fd.get("league_listed_role") or "OBSERVED_EMPTY")
+                c_role = str(fd.get("club_appointed_role") or "OBSERVED_EMPTY")
+                g_role = str(fd.get("gameday_acting_role") or "OBSERVED_EMPTY")
+                lines.append(
+                    f"- {c_name} ({c_season}): "
+                    f"league_listed_role={l_role} | "
+                    f"club_appointed_role={c_role} | "
+                    f"gameday_acting_role={g_role}"
+                )
+                if fd.get("has_institutional_discrepancy"):
+                    d_code = str(fd.get("discrepancy_code") or "LEAGUE_VS_CLUB_ROLE_DISCREPANCY")
+                    raw_expl = str(fd.get("discrepancy_explanation") or "").strip()
+                    expl = (
+                        _sanitize_public_free_text(raw_expl, fallback="-")
+                        if is_public
+                        else raw_expl
+                    )
+                    if expl and expl != "-":
+                        lines.append(f"  * Discrepancy [{d_code}]: {expl}")
+                    else:
+                        lines.append(f"  * Discrepancy [{d_code}]")
+        else:
+            lines.append("- No coaching staff facets observed in local snapshot.")
+
+        lines.extend([
+            "",
+            "## Organization Narrative & Story Timeline",
+        ])
+        if projected_stories:
+            for st in projected_stories:
+                st_season = str(st.get("occurred_season") or "-")
+                st_title = str(st.get("title") or "-")
+                raw_sum = str(
+                    st.get("summary") or st.get("public_perspective_summary") or "-"
+                ).strip()
+                if is_public:
+                    st_title = _sanitize_public_free_text(st_title, fallback="-")
+                    st_sum = _sanitize_public_free_text(raw_sum, fallback="-")
+                else:
+                    st_sum = raw_sum or "-"
+                lines.append(f"- [{st_season}] {st_title}: {st_sum}")
+                if not is_public and st.get("internal_verbatim_or_note"):
+                    lines.append(f"  * Internal Note: {st['internal_verbatim_or_note']}")
+        else:
+            lines.append("- No organization stories projected in local snapshot.")
 
     body_text = scrub_raw_drive_ids_for_consumer("\n".join(lines))
     markdown = body_text.rstrip() + "\n\nend_marker: true\n"
@@ -425,10 +641,14 @@ def build_club_panorama_card(
         "club_name": club_name,
         "seasons": season_list,
         "visibility": vis,
+        "card_style": style,
         "observed_until": observed_until,
         "roster_by_season": roster_by_season,
+        "offseason_roster_changes": offseason_roster_changes,
+        "all_roster_members": all_roster_members,
         "coaching_staff": normalized_facets,
         "projected_stories": projected_stories,
+        "citations": cit_reg.entries() if is_wiki_v241 else [],
         "filename": filename,
         "card_path": card_path_str,
         "card_sha256": card_sha256,

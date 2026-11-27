@@ -107,6 +107,7 @@ V230_1_BASELINE_SHA = "3a7239361b2b81f763dce3477b3c3ad81f357b90"
 V231_1_BASELINE_SHA = "7afb18b1e867146ed99cc73fa16e53d990c54e95"
 V232_1_BASELINE_SHA = "985c647a459ef7a7c970445a9a37db082eaecc71"
 V240_1_BASELINE_SHA = "3b65bcfcc9365d3f081150f516b9dba679ec965b"
+V241_1_BASELINE_SHA = "aeb630c8211799fe91f05cd06b18301a55c823f2"
 
 V215_RELEASE_SPECS: dict[str, dict] = {
     "v2.1.5-1": {
@@ -195,6 +196,36 @@ V215_RELEASE_SPECS: dict[str, dict] = {
         "incremental_delta_only": True,
         "archive_format": "bundle_v1",
     },
+    "v2.4.1-1": {
+        "product_baseline_sha": V241_1_BASELINE_SHA,
+        "enable_consumer_surface_v215": True,
+        "enable_operational_kb_v220": True,
+        "enable_curated_compact_surface_v222": True,
+        "enable_observation_horizon_v230": True,
+        "enable_on_demand_cards_v230": True,
+        "enable_v231_surface_enhancements": True,
+        "enable_v232_card_pipeline": True,
+        "enable_v240_shenzhen_narrative_pilot": True,
+        "enable_v241_wikipedia_site_v2": True,
+        "active_league_season": "2026-2027",
+        "incremental_delta_only": True,
+        "archive_format": "bundle_v1",
+    },
+    "v2.4.1-2": {
+        "product_baseline_sha": V241_1_BASELINE_SHA,
+        "enable_consumer_surface_v215": True,
+        "enable_operational_kb_v220": True,
+        "enable_curated_compact_surface_v222": True,
+        "enable_observation_horizon_v230": True,
+        "enable_on_demand_cards_v230": True,
+        "enable_v231_surface_enhancements": True,
+        "enable_v232_card_pipeline": True,
+        "enable_v240_shenzhen_narrative_pilot": True,
+        "enable_v241_wikipedia_site_v2": True,
+        "active_league_season": "2026-2027",
+        "incremental_delta_only": True,
+        "archive_format": "bundle_v1",
+    },
 }
 
 _POST_ROLLBACK_RECOVERY_ALLOWLIST = frozenset({
@@ -202,6 +233,7 @@ _POST_ROLLBACK_RECOVERY_ALLOWLIST = frozenset({
     ("v1.8.1-3", "v1.8.1-2"),
     ("v1.9.0-1", "v1.8.1-2"),
     ("v2.4.0-2", "v2.4.0-1"),
+    ("v2.4.1-2", "v2.4.1-1"),
 })
 
 

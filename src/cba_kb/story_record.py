@@ -215,6 +215,9 @@ def validate_story_record(record: Mapping[str, Any]) -> Dict[str, Any]:
     if not isinstance(visibility_policy_raw, Mapping):
         raise StoryRecordError("VISIBILITY_POLICY_OBJECT_REQUIRED")
     visibility_policy = dict(visibility_policy_raw)
+    organization_summary = _optional_str(
+        record.get("organization_summary"), "ORGANIZATION_SUMMARY"
+    )
 
     return {
         "schema": STORY_RECORD_SCHEMA,
@@ -227,6 +230,7 @@ def validate_story_record(record: Mapping[str, Any]) -> Dict[str, Any]:
         "deduped_reprints": deduped_reprints,
         "participants": participants,
         "organization_ids": organization_ids,
+        "organization_summary": organization_summary,
         "visibility_policy": visibility_policy,
     }
 
@@ -239,6 +243,7 @@ def make_story_record(
     canonical_source: Mapping[str, Any] | str,
     participants: Sequence[Mapping[str, Any]],
     organization_ids: Sequence[str] = (),
+    organization_summary: Optional[str] = None,
     occurred_date: Optional[str] = None,
     deduped_reprints: Sequence[Any] = (),
     visibility_policy: Optional[Mapping[str, Any]] = None,
@@ -267,6 +272,7 @@ def make_story_record(
         "deduped_reprints": list(deduped_reprints),
         "participants": list(participants),
         "organization_ids": list(organization_ids),
+        "organization_summary": organization_summary,
         "visibility_policy": policy,
     })
 
@@ -308,7 +314,15 @@ def _public_canonical_source(source: Any) -> Any:
         return source
     out: Dict[str, Any] = {}
     for k, v in source.items():
-        if k not in {"source_id", "title", "url", "source_kind", "authority_scope"}:
+        if k not in {
+            "source_id",
+            "title",
+            "url",
+            "source_kind",
+            "authority_scope",
+            "publisher",
+            "published_at",
+        }:
             continue
         if k == "url":
             out["url"] = _clean_public_https_url(v)
@@ -371,7 +385,10 @@ def project_stories_for_entity(
             if clean_entity_id not in story["organization_ids"]:
                 continue
             projected_participants: List[Dict[str, Any]] = []
-            summaries: List[str] = []
+            primary_summary = story.get("organization_summary") or ""
+            initiator_summary = ""
+            interviewee_summary = ""
+            first_summary = ""
             for participant in story["participants"]:
                 p_view: Dict[str, Any] = {
                     "person_uid": participant["person_uid"],
@@ -382,8 +399,18 @@ def project_stories_for_entity(
                 if visibility == "internal_full":
                     p_view["internal_verbatim_or_note"] = participant["internal_verbatim_or_note"]
                 projected_participants.append(p_view)
-                if participant["public_perspective_summary"]:
-                    summaries.append(participant["public_perspective_summary"])
+                p_sum = participant["public_perspective_summary"]
+                if p_sum:
+                    if not first_summary:
+                        first_summary = p_sum
+                    if participant["role"] == "ACTION_INITIATOR" and not initiator_summary:
+                        initiator_summary = p_sum
+                    elif participant["role"] == "SUBJECT_INTERVIEWEE" and not interviewee_summary:
+                        interviewee_summary = p_sum
+
+            resolved_org_summary = (
+                primary_summary or initiator_summary or interviewee_summary or first_summary
+            )
 
             projected.append({
                 "story_id": story["story_id"],
@@ -393,7 +420,8 @@ def project_stories_for_entity(
                 "published_at": story["published_at"],
                 "entity_id": clean_entity_id,
                 "entity_kind": "organization",
-                "summary": " ".join(summaries),
+                "summary": resolved_org_summary,
+                "organization_summary": story.get("organization_summary"),
                 "participants": projected_participants,
                 "organization_ids": list(story["organization_ids"]),
                 "canonical_source": source_payload,

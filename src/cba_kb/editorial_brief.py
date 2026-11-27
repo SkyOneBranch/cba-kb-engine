@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from .actor import validate_person_uid
 from .kc_visibility import validate_card_visibility, verify_public_safe_card_text
@@ -449,4 +449,370 @@ def verify_shenzhen_pilot_hard_cases(bundle: Mapping[str, Any]) -> Dict[str, Any
         "status": "PASS",
         "passed_cases": passed_cases,
         "failed_cases": failed_cases,
+    }
+
+
+# ---------------------------------------------------------------------------
+# REQ-241 P0-1: Wikipedia 2.0 Inverted-Pyramid Chinese Lead Paragraph
+# ---------------------------------------------------------------------------
+
+_WIKI_ROLE_ZH: Dict[str, str] = {
+    "HEAD_COACH": "主教练",
+    "ASSISTANT_COACH": "助理教练",
+    "ACTING_HEAD_COACH": "代理主教练",
+    "COACH": "教练",
+    "PLAYER": "球员",
+    "STAFF": "教练组成员",
+    "EXECUTIVE": "俱乐部管理层",
+}
+_WIKI_PLACEHOLDER_VALUES = frozenset({"", "0", "-", "none", "null", "unknown", "unassigned", "observed_empty"})
+_WIKI_PID_RE = re.compile(r"\bpid_[0-9a-f]{16,64}\b", re.IGNORECASE)
+_WIKI_INLINE_CITE_RE = re.compile(r"\[\d+\]")
+
+
+def _clean_wiki_field(value: Any) -> Optional[str]:
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text or text.casefold() in _WIKI_PLACEHOLDER_VALUES:
+        return None
+    if "(unassigned)" in text.casefold() or _WIKI_PID_RE.search(text):
+        return None
+    return text
+
+
+def _format_birth_date_zh(birth_date: Optional[str]) -> Optional[str]:
+    cleaned = _clean_wiki_field(birth_date)
+    if not cleaned:
+        return None
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", cleaned)
+    if m:
+        return f"{int(m.group(1))}年{int(m.group(2))}月{int(m.group(3))}日"
+    return cleaned
+
+
+def _register_cite_duck(
+    citation_registry: Optional[Any],
+    *,
+    label: str,
+    url: Optional[str] = None,
+    source_kind: Optional[str] = None,
+    published_at: Optional[str] = None,
+    publisher: Optional[str] = None,
+    source_id: Optional[str] = None,
+) -> Optional[int]:
+    if citation_registry is None or not hasattr(citation_registry, "register"):
+        return None
+    clean_label = _clean_wiki_field(label)
+    if not clean_label:
+        return None
+    idx = citation_registry.register(
+        label=clean_label,
+        url=url,
+        source_kind=source_kind,
+        published_at=published_at,
+        publisher=publisher,
+        source_id=source_id,
+    )
+    return idx if isinstance(idx, int) and idx > 0 else None
+
+
+def _register_evidence_ref_item(citation_registry: Optional[Any], ref: Any) -> Optional[int]:
+    if citation_registry is None or not hasattr(citation_registry, "register"):
+        return None
+    if isinstance(ref, Mapping):
+        label = str(ref.get("label") or ref.get("title") or ref.get("url") or "").strip()
+        return _register_cite_duck(
+            citation_registry,
+            label=label,
+            url=ref.get("url") or ref.get("canonical_url"),
+            source_kind=ref.get("source_kind"),
+            published_at=ref.get("published_at"),
+            publisher=ref.get("publisher"),
+            source_id=ref.get("source_id"),
+        )
+    if isinstance(ref, str) and ref.strip():
+        s = ref.strip()
+        is_url = s.startswith(("https://", "http://"))
+        return _register_cite_duck(
+            citation_registry,
+            label=s,
+            url=s if is_url else None,
+            source_kind="official_reference",
+        )
+    return None
+
+
+def _ensure_period(text: str) -> str:
+    s = text.strip()
+    if not s:
+        return ""
+    if s[-1] not in "。！？":
+        return s + "。"
+    return s
+
+
+def compose_wiki_lead_paragraph(
+    *,
+    person_name: str,
+    bio_profile: Optional[Any] = None,
+    registration_profile: Optional[Mapping[str, Any]] = None,
+    coach_role_facets: Optional[Any] = None,
+    unified_profile: Optional[Mapping[str, Any]] = None,
+    career_season_stats: Optional[Mapping[str, Any] | Sequence[Mapping[str, Any]]] = None,
+    projected_stories: Optional[Sequence[Mapping[str, Any]]] = None,
+    citation_registry: Optional[Any] = None,
+    min_chars: int = 80,
+    max_chars: int = 180,
+    visibility: str = "public_safe",
+) -> Dict[str, Any]:
+    """Compose an 80-180 char inverted-pyramid Chinese Wikipedia lead paragraph.
+
+    Duck-types `citation_registry` (via `.register(...)`) to avoid circular imports.
+    Never emits `0`, `unassigned`, `UNKNOWN`, or `pid_...` in lead text.
+    """
+    resolved_visibility = validate_card_visibility(visibility)
+    if not isinstance(max_chars, int) or max_chars <= 0:
+        raise ValueError(f"INVALID_MAX_CHARS:{max_chars!r}")
+    if not isinstance(min_chars, int) or min_chars < 0:
+        raise ValueError(f"INVALID_MIN_CHARS:{min_chars!r}")
+
+    name = _clean_wiki_field(person_name) or str(person_name or "").strip()
+    if not name:
+        raise ValueError("PERSON_NAME_REQUIRED")
+
+    bio: Dict[str, Any] = {}
+    if hasattr(bio_profile, "to_dict") and callable(bio_profile.to_dict):
+        bio = dict(bio_profile.to_dict())
+    elif isinstance(bio_profile, Mapping):
+        bio = dict(bio_profile)
+
+    reg: Dict[str, Any] = dict(registration_profile) if isinstance(registration_profile, Mapping) else {}
+    dom_cur = reg.get("domestic_current") if isinstance(reg.get("domestic_current"), Mapping) else {}
+    for_reg = reg.get("foreign_registration") if isinstance(reg.get("foreign_registration"), Mapping) else {}
+
+    facets_list: List[Dict[str, Any]] = []
+    if coach_role_facets is not None:
+        raw_seq = list(coach_role_facets) if isinstance(coach_role_facets, (list, tuple)) else [coach_role_facets]
+        for item in raw_seq:
+            if hasattr(item, "to_dict") and callable(item.to_dict):
+                facets_list.append(dict(item.to_dict()))
+            elif isinstance(item, Mapping):
+                facets_list.append(dict(item))
+
+    unified = dict(unified_profile) if isinstance(unified_profile, Mapping) else {}
+
+    # Extract key non-empty fields
+    birth_zh = _format_birth_date_zh(bio.get("birth_date"))
+    nationality = _clean_wiki_field(bio.get("nationality") or for_reg.get("nationality"))
+    birth_place = _clean_wiki_field(bio.get("birth_place"))
+    height_cm = bio.get("height_cm")
+    weight_kg = bio.get("weight_kg")
+    valid_height = (
+        height_cm
+        if isinstance(height_cm, int) and not isinstance(height_cm, bool) and height_cm > 0
+        else None
+    )
+    valid_weight = (
+        weight_kg
+        if isinstance(weight_kg, int) and not isinstance(weight_kg, bool) and weight_kg > 0
+        else None
+    )
+    position = _clean_wiki_field(bio.get("position") or reg.get("position") or for_reg.get("position"))
+    jersey = _clean_wiki_field(bio.get("jersey_number") or reg.get("jersey_number") or for_reg.get("jersey_number"))
+    club = _clean_wiki_field(
+        bio.get("current_club")
+        or dom_cur.get("club_official")
+        or for_reg.get("club")
+        or reg.get("current_club")
+    )
+    current_role_raw = _clean_wiki_field(bio.get("current_role"))
+    youth_origin = _clean_wiki_field(bio.get("draft_or_youth_origin"))
+    honors = [
+        h for h in (_clean_wiki_field(x) for x in (bio.get("honors") or ())) if h
+    ]
+    season_label = _clean_wiki_field(dom_cur.get("season"))
+    contract_cat = _clean_wiki_field(dom_cur.get("contract_category"))
+
+    # Infer coaching role if coach_role_facets present
+    coach_role_zh: Optional[str] = None
+    if facets_list:
+        f0 = facets_list[0]
+        raw_c_role = _clean_wiki_field(f0.get("club_appointed_role") or f0.get("league_listed_role"))
+        if raw_c_role:
+            coach_role_zh = _WIKI_ROLE_ZH.get(raw_c_role.upper(), raw_c_role)
+    if not coach_role_zh and current_role_raw:
+        coach_role_zh = _WIKI_ROLE_ZH.get(current_role_raw.upper(), current_role_raw)
+
+    # Clauses: list of (plain_sentence, cite_indices_for_sentence)
+    clauses: List[tuple[str, List[int]]] = []
+
+    # Clause 1: Identity + Bio + Current Club/Role
+    bio_cites: List[int] = []
+    for ref in bio.get("evidence_refs") or ():
+        idx = _register_evidence_ref_item(citation_registry, ref)
+        if idx is not None and idx not in bio_cites:
+            bio_cites.append(idx)
+    if not bio_cites and facets_list:
+        for ref in facets_list[0].get("evidence_refs") or ():
+            idx = _register_evidence_ref_item(citation_registry, ref)
+            if idx is not None and idx not in bio_cites:
+                bio_cites.append(idx)
+
+    paren_parts: List[str] = []
+    if birth_zh:
+        paren_parts.append(f"{birth_zh}出生")
+    if nationality and birth_place:
+        paren_parts.append(f"{nationality}{birth_place}人")
+    elif nationality:
+        paren_parts.append(f"{nationality}籍")
+    elif birth_place:
+        paren_parts.append(f"{birth_place}人")
+
+    c1_parts: List[str] = [f"{name}（{'，'.join(paren_parts)}）" if paren_parts else name]
+    if coach_role_zh and (facets_list or any(k in coach_role_zh for k in ("教练", "主帅"))):
+        if club:
+            c1_parts.append(f"现担任{club}{coach_role_zh}")
+        else:
+            c1_parts.append(f"现担任{coach_role_zh}")
+    else:
+        if position:
+            c1_parts.append(f"司职{position}")
+        if valid_height and valid_weight:
+            c1_parts.append(f"身高{valid_height}厘米、体重{valid_weight}公斤")
+        elif valid_height:
+            c1_parts.append(f"身高{valid_height}厘米")
+        elif valid_weight:
+            c1_parts.append(f"体重{valid_weight}公斤")
+        if youth_origin:
+            c1_parts.append(f"出自{youth_origin}")
+        if club:
+            season_prefix = f"{season_label}赛季" if season_label else ""
+            jersey_part = f"身披{jersey}号球衣" if jersey else ""
+            c1_parts.append(f"{season_prefix}{jersey_part}效力于{club}")
+        elif contract_cat and season_label:
+            c1_parts.append(f"{season_label}赛季以{contract_cat}合同完成联赛注册")
+
+    # For coaches with valid height/youth_origin, include transition note if applicable
+    if coach_role_zh and (facets_list or any(k in coach_role_zh for k in ("教练", "主帅"))):
+        if unified.get("is_player_to_coach_transition"):
+            c1_parts.append("球员时期曾征战CBA联赛，退役后转型执教")
+        elif youth_origin:
+            c1_parts.append(f"出自{youth_origin}")
+
+    clause1 = _ensure_period("，".join(c1_parts))
+    clauses.append((clause1, bio_cites))
+
+    # Clause 2: Career Season Stats summary
+    stats_cites: List[int] = []
+    reg_summary: Optional[Mapping[str, Any]] = None
+    seasons_count: Optional[int] = None
+    if isinstance(career_season_stats, Mapping):
+        if isinstance(career_season_stats.get("regular_career_summary"), Mapping):
+            reg_summary = career_season_stats["regular_career_summary"]
+        if isinstance(career_season_stats.get("seasons_count"), int):
+            seasons_count = career_season_stats["seasons_count"]
+        for row in career_season_stats.get("regular_season_rows") or ():
+            if isinstance(row, Mapping):
+                loc = _clean_wiki_field(row.get("locator"))
+                if loc and loc.startswith(("https://", "http://")):
+                    idx = _register_cite_duck(
+                        citation_registry,
+                        label="CBA官方技术统计",
+                        url=loc,
+                        source_kind="official_stats",
+                    )
+                    if idx is not None and idx not in stats_cites:
+                        stats_cites.append(idx)
+                        break
+
+    if isinstance(reg_summary, Mapping):
+        gp = reg_summary.get("games_played")
+        ppg = reg_summary.get("points_per_game")
+        rpg = reg_summary.get("rebounds_per_game")
+        apg = reg_summary.get("assists_per_game")
+        if isinstance(gp, (int, float)) and gp > 0:
+            stat_bits: List[str] = []
+            if isinstance(ppg, (int, float)):
+                stat_bits.append(f"{float(ppg):.1f}分")
+            if isinstance(rpg, (int, float)):
+                stat_bits.append(f"{float(rpg):.1f}个篮板")
+            if isinstance(apg, (int, float)):
+                stat_bits.append(f"{float(apg):.1f}次助攻")
+            season_txt = f"（{seasons_count}个赛季）" if seasons_count and seasons_count > 1 else ""
+            if stat_bits:
+                stat_sent = f"CBA常规赛累计出战{int(gp)}场{season_txt}，场均贡献{'、'.join(stat_bits)}。"
+                clauses.append((stat_sent, stats_cites))
+
+    # Clause 3: Honors
+    if honors:
+        honor_sent = _ensure_period(f"曾入选{'、'.join(honors[:2])}")
+        clauses.append((honor_sent, []))
+
+    # Clause 4: Key Story
+    if isinstance(projected_stories, Sequence) and not isinstance(projected_stories, (str, bytes)):
+        for st in projected_stories:
+            if not isinstance(st, Mapping):
+                continue
+            raw_sum = _clean_wiki_field(st.get("summary") or st.get("public_perspective_summary"))
+            if not raw_sum:
+                continue
+            story_cites: List[int] = []
+            src = st.get("canonical_source")
+            if isinstance(src, Mapping):
+                s_label = str(src.get("title") or src.get("label") or st.get("title") or "").strip()
+                idx = _register_cite_duck(
+                    citation_registry,
+                    label=s_label,
+                    url=src.get("url"),
+                    source_kind=src.get("source_kind"),
+                    published_at=src.get("published_at") or st.get("published_at"),
+                    publisher=src.get("publisher"),
+                    source_id=src.get("source_id"),
+                )
+                if idx is not None:
+                    story_cites.append(idx)
+            clauses.append((_ensure_period(raw_sum), story_cites))
+            break
+
+    # Assemble within max_chars (plain text budget)
+    plain_parts: List[str] = []
+    md_parts: List[str] = []
+    used_indices: List[int] = []
+    current_plain_len = 0
+
+    for plain_sent, cites in clauses:
+        cite_suffix = "".join(f"[{i}]" for i in cites)
+        if current_plain_len + len(plain_sent) <= max_chars:
+            plain_parts.append(plain_sent)
+            md_parts.append(f"{plain_sent}{cite_suffix}")
+            current_plain_len += len(plain_sent)
+            for i in cites:
+                if i not in used_indices:
+                    used_indices.append(i)
+        elif not plain_parts:
+            trimmed = (plain_sent[: max_chars - 1] + "。") if max_chars >= 2 else plain_sent[:max_chars]
+            plain_parts.append(trimmed)
+            md_parts.append(f"{trimmed}{cite_suffix}")
+            current_plain_len = len(trimmed)
+            for i in cites:
+                if i not in used_indices:
+                    used_indices.append(i)
+            break
+
+    lead_plain_text = "".join(plain_parts)
+    lead_markdown = "".join(md_parts)
+    # Strip any stray [n] from plain text defensively
+    lead_plain_text = _WIKI_INLINE_CITE_RE.sub("", lead_plain_text)
+
+    if resolved_visibility == "public_safe":
+        _verify_public_safe_strict(lead_plain_text)
+        _verify_public_safe_strict(lead_markdown)
+
+    return {
+        "lead_markdown": lead_markdown,
+        "lead_plain_text": lead_plain_text,
+        "char_count": len(lead_plain_text),
+        "citation_indices": used_indices,
+        "visibility": resolved_visibility,
     }

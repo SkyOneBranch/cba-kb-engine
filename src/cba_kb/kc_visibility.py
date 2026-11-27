@@ -157,6 +157,8 @@ _PUBLIC_SAFE_DOC_ID_RE = re.compile(
     r"\b(?:prior_doc_id|new_doc_id|prior_record_id|new_record_id)\b)",
     re.IGNORECASE,
 )
+_PUBLIC_SAFE_DOC_HEX_RE = re.compile(r"\bdoc_[0-9a-f]{16,64}\b", re.IGNORECASE)
+_PUBLIC_SAFE_UNASSIGNED_RE = re.compile(r"\(unassigned\)", re.IGNORECASE)
 _PUBLIC_SAFE_HTTP_URL_RE = re.compile(r"https?://[^\s)\]<>\"']+", re.IGNORECASE)
 _PUBLIC_SAFE_DRIVE_CANDIDATE_RE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{25,}(?![A-Za-z0-9_-])")
 _HISTORICAL_ARCHIVE_BANNER_PREFIX = "> [HISTORICAL_SEASON_ARCHIVE] "
@@ -215,6 +217,12 @@ def verify_public_safe_card_text(markdown: str) -> None:
 
     if _PUBLIC_SAFE_DOC_ID_RE.search(markdown):
         violations.append("internal_doc_id")
+
+    if _PUBLIC_SAFE_DOC_HEX_RE.search(markdown):
+        violations.append("internal_doc_hex_id")
+
+    if _PUBLIC_SAFE_UNASSIGNED_RE.search(markdown):
+        violations.append("unassigned_placeholder")
 
     if "```" in markdown or "~~~" in markdown:
         violations.append("fenced_code_block")
