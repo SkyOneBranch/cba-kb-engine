@@ -451,6 +451,26 @@ class Drive:
         return self.api.files().update(fileId=file_id,addParents=destination,removeParents=previous,
             fields=FIELDS,supportsAllDrives=True).execute(num_retries=0)
 
+    def rename(self, file_id, name):
+        """Rename a Drive file in place (single-attempt main-thread write)."""
+        _assert_main_thread_writer(self, 'rename')
+        if not isinstance(file_id, str) or not file_id.strip():
+            raise ValueError('INVALID_DRIVE_FILE_ID')
+        if (
+            not isinstance(name, str)
+            or not name.strip()
+            or '/' in name
+            or '\\' in name
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in name)
+        ):
+            raise ValueError('INVALID_DRIVE_FILENAME')
+        return self.api.files().update(
+            fileId=file_id,
+            body={'name': name},
+            fields=FIELDS,
+            supportsAllDrives=True,
+        ).execute(num_retries=0)
+
     def trash(self, file_id):
         """Move a Drive file or folder to Trash (trashed=True, never delete)."""
         _assert_main_thread_writer(self, 'trash')
