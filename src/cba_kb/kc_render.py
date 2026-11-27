@@ -713,8 +713,10 @@ def _render_wiki_career_table_lines(
             team_disp = raw_tname
         elif raw_tid is not None and str(raw_tid).strip():
             team_disp = _resolve_team_name_zh(raw_tid, fallback_name=raw_tname or None)
+        elif raw_tname:
+            team_disp = _resolve_team_name_zh(raw_tname, fallback_name=raw_tname)
         else:
-            team_disp = raw_tname or "-"
+            team_disp = "-"
         cells = [
             s_val,
             team_disp,
@@ -1152,15 +1154,17 @@ def _render_wiki_v241_card(
     has_obs_horizon = isinstance(obs_horizon, dict) and bool(obs_horizon)
     domain_horizons = payload.get("domain_horizons")
     has_domain_horizons = isinstance(domain_horizons, dict) and bool(domain_horizons)
-    overall_status = str(
-        payload.get("overall_verification_status")
-        or _compute_overall_verification_status(
-            domain_horizons,
-            has_career_stats=has_career_stats,
-            has_coach_facets=bool(facet_dicts),
-            has_bio=bool(bio_profile),
-        )
+    computed_status = _compute_overall_verification_status(
+        domain_horizons,
+        has_career_stats=has_career_stats,
+        has_coach_facets=bool(facet_dicts),
+        has_bio=bool(bio_profile),
     )
+    caller_status = str(payload.get("overall_verification_status") or "").strip().upper()
+    if computed_status != "UNKNOWN" and (not caller_status or caller_status == "UNKNOWN"):
+        overall_status = computed_status
+    else:
+        overall_status = caller_status or computed_status
     audit_lines: List[str] = [
         "",
         '<details class="audit-drawer">',

@@ -169,7 +169,7 @@ def extract_wiki_candidates(
 
     bio_candidates: List[Dict[str, Any]] = []
     story_candidates: List[Dict[str, Any]] = []
-    seen_bio_keys: set[Tuple[str, str]] = set()
+    bio_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
     seen_story_keys: set[Tuple[str, str, str]] = set()
 
     for rel_path, title, body in docs:
@@ -185,20 +185,29 @@ def extract_wiki_candidates(
 
             bio_fields = _extract_bio_fields_from_text(sent)
             if bio_fields:
-                # Attach bio fields to the first person mentioned in that sentence
+                # Merge bio fields across all sentences for the same (person_uid, source_file)
                 primary = mentioned[0]
                 bkey = (primary["person_uid"], rel_path)
-                if bkey not in seen_bio_keys:
-                    seen_bio_keys.add(bkey)
-                    bio_candidates.append({
+                existing_bio = bio_by_key.get(bkey)
+                if existing_bio is None:
+                    entry = {
                         "person_uid": primary["person_uid"],
                         "canonical_name": primary["canonical_name"],
-                        "extracted_fields": bio_fields,
+                        "extracted_fields": dict(bio_fields),
                         "source_file": rel_path,
                         "source_title": title,
                         "evidence_snippet": sent[:200],
                         "review_status": DRAFT_REVIEW_STATUS,
-                    })
+                    }
+                    bio_by_key[bkey] = entry
+                    bio_candidates.append(entry)
+                else:
+                    for fk, fv in bio_fields.items():
+                        existing_bio["extracted_fields"].setdefault(fk, fv)
+                    snippet_chunk = sent[:200]
+                    if snippet_chunk not in existing_bio["evidence_snippet"]:
+                        combined = f"{existing_bio['evidence_snippet']} {snippet_chunk}".strip()
+                        existing_bio["evidence_snippet"] = combined[:400]
 
             season_match = _SEASON_RE.search(sent)
             if season_match or len(mentioned) >= 2:

@@ -658,6 +658,23 @@ def _is_displayable_infobox_value(val: Any) -> bool:
     return True
 
 
+def _verify_mapping_values_public_safe(
+    data: Any, *, label: str
+) -> None:
+    """Recursively verify every string value inside a bio/registration mapping."""
+    if isinstance(data, str):
+        if data:
+            _verify_public_text_strict(data, label=label)
+    elif isinstance(data, Mapping):
+        for k, v in data.items():
+            if k in ("evidence_refs",):
+                continue
+            _verify_mapping_values_public_safe(v, label=f"{label}.{k}")
+    elif isinstance(data, Sequence) and not isinstance(data, (bytes, bytearray)):
+        for idx, item in enumerate(data):
+            _verify_mapping_values_public_safe(item, label=f"{label}[{idx}]")
+
+
 def _render_wiki_infobox(person: Mapping[str, Any]) -> str:
     bio = person.get("bio_profile")
     if hasattr(bio, "to_dict") and callable(bio.to_dict):
@@ -831,7 +848,7 @@ def compute_related_persons(
             score += 50 * len(shared_stories)
             relation_label = "共同故事"
         if t_meta["is_coach"] != o_meta["is_coach"] and (
-            not t_meta["club"] or not o_meta["club"] or t_meta["club"] == o_meta["club"]
+            t_meta["club"] and o_meta["club"] and t_meta["club"] == o_meta["club"]
         ):
             score += 30
             if not relation_label:
@@ -845,8 +862,7 @@ def compute_related_persons(
             if not relation_label:
                 relation_label = "同队队友"
         if score == 0:
-            score = 1
-            relation_label = "关联成员"
+            continue
 
         scored.append(
             {
@@ -1064,6 +1080,19 @@ def build_public_site(
             lead_plain = str(pcard["lead_paragraph"].get("lead_plain_text") or "").strip()
         if lead_plain:
             _verify_public_text_strict(lead_plain, label=f"person_cards[{idx}].lead_plain_text")
+        if bio_map is not None:
+            _verify_mapping_values_public_safe(
+                bio_map, label=f"person_cards[{idx}].bio_profile"
+            )
+        reg_map = (
+            dict(pcard["registration_profile"])
+            if isinstance(pcard.get("registration_profile"), Mapping)
+            else None
+        )
+        if reg_map is not None:
+            _verify_mapping_values_public_safe(
+                reg_map, label=f"person_cards[{idx}].registration_profile"
+            )
         validated_persons.append(
             {
                 "person_uid": person_uid,
@@ -1074,11 +1103,7 @@ def build_public_site(
                 "observed_until": str(pcard.get("observed_until") or "").strip(),
                 "card_style": str(pcard.get("card_style") or "").strip(),
                 "bio_profile": bio_map,
-                "registration_profile": (
-                    dict(pcard["registration_profile"])
-                    if isinstance(pcard.get("registration_profile"), Mapping)
-                    else None
-                ),
+                "registration_profile": reg_map,
                 "entity_role": str(pcard.get("entity_role") or "").strip(),
                 "lead_plain_text": lead_plain,
                 "projected_stories": list(pcard.get("projected_stories") or ()),
@@ -1328,6 +1353,9 @@ def build_public_site(
         validated_persons=validated_persons,
         base_url=clean_base_url,
     )
+    _verify_public_text_strict(index_html, label="index.html")
+    for person, person_html in rendered_persons:
+        _verify_public_text_strict(person_html, label=f"persons/{person['slug']}.html")
     _verify_public_text_strict(sitemap_xml, label="sitemap.xml")
     _verify_public_text_strict(llms_txt, label="llms.txt")
 

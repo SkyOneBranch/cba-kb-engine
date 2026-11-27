@@ -1058,8 +1058,6 @@ def build_career_season_stats_tables(
 
     for rec in sorted(matched, key=_career_sort_key):
         s_str = str(rec.get("season") or "").strip()
-        if s_str:
-            seasons_seen.add(s_str)
         rec_metrics = rec.get("metrics") if isinstance(rec.get("metrics"), Mapping) else {}
         prov = rec.get("provenance") if isinstance(rec.get("provenance"), Mapping) else {}
         core_metrics = {col: rec_metrics.get(col) for col in CORE_SEASON_STATS_COLUMNS}
@@ -1069,12 +1067,26 @@ def build_career_season_stats_tables(
             resolved_team_name = raw_tname
         elif raw_tid is not None and str(raw_tid).strip():
             resolved_team_name = _resolve_team_name_zh(raw_tid, fallback_name=raw_tname or None)
+        elif raw_tname:
+            resolved_team_name = _resolve_team_name_zh(raw_tname, fallback_name=raw_tname)
         else:
-            resolved_team_name = raw_tname or "-"
+            resolved_team_name = "-"
+
+        mt_raw = str(rec.get("match_type") or "").strip()
+        mt_norm = mt_raw.upper()
+        if mt_norm in ("PLAYOFFS", "PLAYOFF", "2", "季后赛"):
+            bucket = playoffs_rows
+        elif mt_norm in ("REGULAR", "REGULAR_SEASON", "1", "常规赛"):
+            bucket = regular_rows
+        else:
+            continue
+
+        if s_str:
+            seasons_seen.add(s_str)
 
         row_obj: Dict[str, Any] = {
             "season": s_str,
-            "match_type": str(rec.get("match_type") or "").strip() or "UNKNOWN",
+            "match_type": mt_raw,
             "scope": str(rec.get("scope") or "").strip() or "UNKNOWN",
             "team_id": raw_tid,
             "team_name": resolved_team_name,
@@ -1083,11 +1095,7 @@ def build_career_season_stats_tables(
             "locator": prov.get("locator") or rec.get("record_id"),
             "metrics": core_metrics,
         }
-        mt_norm = row_obj["match_type"].upper()
-        if mt_norm in ("PLAYOFFS", "2", "季后赛"):
-            playoffs_rows.append(row_obj)
-        else:
-            regular_rows.append(row_obj)
+        bucket.append(row_obj)
 
     return {
         "regular_season_rows": regular_rows,
