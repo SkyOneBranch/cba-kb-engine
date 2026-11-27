@@ -87,7 +87,6 @@ reproject_targets = _base.reproject_targets
 validate_manifest_coverage = _base.validate_manifest_coverage
 validate_reservation = _base.validate_reservation
 validate_policy_reconciliation = _base.validate_policy_reconciliation
-validate_release_state = _base.validate_release_state
 _reservation_key = _base._reservation_key
 _managed_candidate = _base._managed_candidate
 _managed_body = _base._managed_body
@@ -182,7 +181,84 @@ V215_RELEASE_SPECS: dict[str, dict] = {
         "incremental_delta_only": True,
         "archive_format": "bundle_v1",
     },
+    "v2.4.0-2": {
+        "product_baseline_sha": V240_1_BASELINE_SHA,
+        "enable_consumer_surface_v215": True,
+        "enable_operational_kb_v220": True,
+        "enable_curated_compact_surface_v222": True,
+        "enable_observation_horizon_v230": True,
+        "enable_on_demand_cards_v230": True,
+        "enable_v231_surface_enhancements": True,
+        "enable_v232_card_pipeline": True,
+        "enable_v240_shenzhen_narrative_pilot": True,
+        "active_league_season": "2026-2027",
+        "incremental_delta_only": True,
+        "archive_format": "bundle_v1",
+    },
 }
+
+_POST_ROLLBACK_RECOVERY_ALLOWLIST = frozenset({
+    ("v1.6.1-1", "v1.6.1-1"),
+    ("v1.8.1-3", "v1.8.1-2"),
+    ("v1.9.0-1", "v1.8.1-2"),
+    ("v2.4.0-2", "v2.4.0-1"),
+})
+
+
+def validate_release_state(drive, instance, projection, allocation):
+    """Validate Stage 4 release state against frozen projection, allocation & policy.
+
+    Extends ``scripts.prepare_production.validate_release_state`` without editing
+    the frozen script, allowing declared post-rollback recovery pairs (including
+    ``v2.4.0-2`` after ``v2.4.0-1`` rollback) only after full hash, fingerprint,
+    active target set, and policy reconciliation checks succeed.
+    """
+    try:
+        validate_reservation(projection, allocation)
+        status_raw, status_meta = snapshot(
+            drive, allocation["status_id"],
+        )
+        status = json.loads(status_raw)
+    except Exception as exc:
+        raise ProjectionError("STAGE4_RELEASE_STATE_DRIFT") from exc
+    if digest(status_raw) != allocation.get("status_before_hash"):
+        raise ProjectionError("STAGE4_RELEASE_STATE_DRIFT")
+    if fingerprint(status_meta) != allocation.get("status_before_meta"):
+        raise ProjectionError("STAGE4_RELEASE_STATE_DRIFT")
+    active_ids = {
+        item["id"] for item in projection["existing_targets"]
+    }
+    status_ids = {
+        item.get("id") for item in (status.get("artifacts") or [])
+    }
+    state = status.get("state")
+    readable_state = state == "COMPLETE"
+    if state == "ROLLED_BACK":
+        readable_state = (
+            projection.get("release_id"),
+            status.get("rolled_back_release_id"),
+        ) in _POST_ROLLBACK_RECOVERY_ALLOWLIST
+    if (
+        not readable_state
+        or status.get("current_release_id") != allocation.get("active_release_id")
+        or status_ids != active_ids
+    ):
+        raise ProjectionError("STAGE4_RELEASE_STATE_DRIFT")
+    policy = instance.read_json("production.json")
+    reconciliation = validate_policy_reconciliation(
+        projection, allocation, policy,
+    )
+    return {
+        "result": "PASS",
+        "state": state,
+        "rolled_back_release_id": status.get("rolled_back_release_id"),
+        "status_sha256": digest(status_raw),
+        "status_meta": fingerprint(status_meta),
+        "active_production_target_count": len(active_ids),
+        "reserved_staging_target_count": len(allocation["reservations"]),
+        "status": status,
+        **reconciliation,
+    }
 
 _CLOSURE_BASE_RELEASES = frozenset({
     "v1.6.1-1", "v1.8.1-1", "v1.8.1-2", "v1.8.1-3",
