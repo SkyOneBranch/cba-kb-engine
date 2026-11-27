@@ -47,6 +47,7 @@ DEFAULT_MAX_BUNDLE_MEMBERS = 5000
 _BUNDLE_EXCLUDED_DIR_NAMES = frozenset({
     "evidence",
     "inbox",
+    "raw",
     ".credentials",
     ".git",
     "__pycache__",
@@ -364,6 +365,10 @@ def _bundle_allowlisted_exact_names() -> frozenset[str]:
         "snowball_receipts.jsonl",
         "on_demand_cards_manifest.json",
         "curation_profile.yaml",
+        "team_staff_snapshots.jsonl",
+        "person_registry.json",
+        "story_records.jsonl",
+        "organization_profiles.json",
     })
 
 
@@ -456,7 +461,7 @@ def _is_bundle_member_allowed(rel_posix: str, allowlisted_exact_names: frozenset
         name.endswith(".json") or name.endswith(".jsonl")
     ):
         return True
-    if len(parts) >= 2 and parts[-2] in ("cards", "on_demand_cards") and name.endswith(".md"):
+    if len(parts) >= 2 and parts[-2] in ("cards", "on_demand_cards", "clubs") and name.endswith(".md"):
         return True
     return False
 

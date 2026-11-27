@@ -482,6 +482,31 @@ def main():
     ref_grp=q.add_mutually_exclusive_group()
     ref_grp.add_argument('--plan-only',action='store_true',default=False,help='Build cards locally without Drive upsert (default)')
     ref_grp.add_argument('--execute',action='store_true',default=False,help='Build cards and upsert to Drive snowball folder (retiring legacy _unassigned_ cards)')
+    q=sub.add_parser('build-club-card')
+    q.add_argument('--club',required=True)
+    q.add_argument('--seasons',default='2025-2026,2026-2027')
+    q.add_argument('--visibility',choices=('internal_full','public_safe'),default='internal_full')
+    q.add_argument('--organization-profiles',type=Path,default=None)
+    q.add_argument('--master-csv',type=Path,default=None)
+    q.add_argument('--foreign-csv',type=Path,default=None)
+    q.add_argument('--staff-snapshots',type=Path,default=None)
+    q.add_argument('--coach-role-facets',type=Path,default=None)
+    q.add_argument('--story-records',type=Path,default=None)
+    q.add_argument('--output-dir',type=Path,default=None)
+    q.add_argument('--observed-until',default=None)
+    q.add_argument('--format',choices=('json','markdown'),default='json')
+    q=sub.add_parser('build-public-site')
+    q.add_argument('--club-card',type=Path,required=True)
+    q.add_argument('--person-cards-dir',type=Path,required=True)
+    q.add_argument('--output-dir',type=Path,required=True)
+    q.add_argument('--site-title',default=None)
+    q.add_argument('--observed-until',default=None)
+    q=sub.add_parser('compose-verified-brief')
+    q.add_argument('--entity',required=True)
+    q.add_argument('--facts',type=Path,required=True)
+    q.add_argument('--max-chars',type=int,default=120)
+    q.add_argument('--visibility',choices=('internal_full','public_safe'),default='public_safe')
+    q.add_argument('--output',type=Path,default=None)
     q=sub.add_parser('mcp-serve')
     q.add_argument('--season',default='2026-2027')
     q=sub.add_parser('plan'); q.add_argument('--entries',type=Path,required=True); q.add_argument('--release-id',required=True)
@@ -2204,6 +2229,107 @@ def main():
                 'upserted_count': upserted_count,
                 'processed': processed,
             }
+        elif a.command == 'build-club-card':
+            from .club_card_builder import build_club_panorama_card
+            from .person_card_builder import _read_csv_rows, _read_json_or_jsonl
+            seasons = tuple(s.strip() for s in a.seasons.split(',') if s.strip())
+            org_profile = None
+            if a.organization_profiles is not None:
+                raw_orgs = json.loads(a.organization_profiles.read_text(encoding='utf-8'))
+                if isinstance(raw_orgs, dict):
+                    if isinstance(raw_orgs.get('organizations'), list):
+                        org_list = raw_orgs['organizations']
+                    else:
+                        org_list = [raw_orgs]
+                elif isinstance(raw_orgs, list):
+                    org_list = raw_orgs
+                else:
+                    raise ValueError('ORGANIZATION_PROFILES_INVALID')
+                query_cf = a.club.strip().casefold()
+                for cand in org_list:
+                    if not isinstance(cand, dict):
+                        continue
+                    names = [
+                        cand.get('organization_id'),
+                        cand.get('canonical_name'),
+                        cand.get('short_name'),
+                        *(cand.get('aliases') or ()),
+                    ]
+                    if any(isinstance(n, str) and n.strip().casefold() == query_cf for n in names):
+                        org_profile = cand
+                        break
+            master_rows = _read_csv_rows(a.master_csv) if a.master_csv is not None else None
+            foreign_rows = _read_csv_rows(a.foreign_csv) if a.foreign_csv is not None else None
+            staff_snaps = _read_json_or_jsonl(a.staff_snapshots) if a.staff_snapshots is not None else None
+            coach_facets = _read_json_or_jsonl(a.coach_role_facets) if a.coach_role_facets is not None else None
+            story_recs = _read_json_or_jsonl(a.story_records) if a.story_records is not None else None
+            result = build_club_panorama_card(
+                a.club,
+                seasons=seasons,
+                organization_profile=org_profile,
+                master_rows=master_rows,
+                foreign_rows=foreign_rows,
+                staff_snapshots=staff_snaps,
+                coach_role_facets=coach_facets,
+                story_records=story_recs,
+                visibility=a.visibility,
+                output_dir=a.output_dir,
+                observed_until=a.observed_until,
+            )
+            if a.format == 'markdown':
+                stage(a.command, 'done')
+                if result.get('markdown'):
+                    print(result['markdown'], end='')
+                else:
+                    print(json.dumps(result, ensure_ascii=False, indent=2))
+                return
+        elif a.command == 'build-public-site':
+            from .static_site_builder import build_public_site
+            if not a.club_card.is_file():
+                raise ValueError(f'CLUB_CARD_NOT_FOUND:{a.club_card}')
+            if not a.person_cards_dir.is_dir():
+                raise ValueError(f'PERSON_CARDS_DIR_NOT_FOUND:{a.person_cards_dir}')
+            club_card = json.loads(a.club_card.read_text(encoding='utf-8'))
+            person_cards = []
+            for p_file in sorted(a.person_cards_dir.glob('*.json')):
+                loaded = json.loads(p_file.read_text(encoding='utf-8'))
+                if isinstance(loaded, dict):
+                    person_cards.append(loaded)
+                elif isinstance(loaded, list):
+                    person_cards.extend(item for item in loaded if isinstance(item, dict))
+            result = build_public_site(
+                club_card=club_card,
+                person_cards=person_cards,
+                output_dir=a.output_dir,
+                site_title=a.site_title,
+                observed_until=a.observed_until,
+            )
+        elif a.command == 'compose-verified-brief':
+            from .editorial_brief import compose_verified_brief
+            from .person_card_builder import _read_json_or_jsonl
+            if not a.facts.is_file():
+                raise ValueError(f'FACTS_FILE_NOT_FOUND:{a.facts}')
+            raw_text = a.facts.read_text(encoding='utf-8').strip()
+            try:
+                parsed_facts = json.loads(raw_text)
+                if isinstance(parsed_facts, dict) and isinstance(parsed_facts.get('facts'), list):
+                    facts = parsed_facts['facts']
+                elif isinstance(parsed_facts, list):
+                    facts = parsed_facts
+                elif isinstance(parsed_facts, dict):
+                    facts = [parsed_facts]
+                else:
+                    raise ValueError('FACTS_INPUT_INVALID')
+            except json.JSONDecodeError:
+                facts = _read_json_or_jsonl(a.facts)
+            result = compose_verified_brief(
+                facts,
+                entity_name=a.entity,
+                max_chars=a.max_chars,
+                visibility=a.visibility,
+            )
+            if a.output is not None:
+                save(a.output, result)
         elif a.command == 'mcp-serve':
             from .cloud_state import R2CloudStateStore, R2Config
             from .mcp_server import SnowballMCPServer

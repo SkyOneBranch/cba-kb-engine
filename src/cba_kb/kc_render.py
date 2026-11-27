@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from .aliases import format_club_team_display
 from .kc_projection import KcError
@@ -151,11 +151,278 @@ def _render_season_stats_table_lines(
 
 _TEN_SOURCES_RE = re.compile(r"10[\s_-]+sources", re.IGNORECASE)
 _FENCED_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
+_TILDE_FENCED_BLOCK_RE = re.compile(r"~~~.*?~~~", re.DOTALL)
+_INTERNAL_CLUE_MARKER_RE = re.compile(r"\[INTERNAL_CLUE_ONLY[^\]]*\]", re.IGNORECASE)
 _INTERNAL_ID_TOKEN_RE = re.compile(
     r"(?:\bdoc:[A-Za-z0-9_.:-]+|\b(?:prior_doc_id|new_doc_id|prior_record_id|new_record_id|doc_id)\s*[:=]\s*[^\s,;)\]]+|\b(?:prior_doc_id|new_doc_id|prior_record_id|new_record_id)\b)",
     re.IGNORECASE,
 )
 _PRIVATE_URI_TOKEN_RE = re.compile(r"(?:r2|s3|file)://[^\s)\]<>\"']+", re.IGNORECASE)
+
+CARD_STYLES = ("classic", "wiki_v240")
+COACH_ENTITY_ROLES = frozenset({
+    "COACH",
+    "HEAD_COACH",
+    "ASSISTANT_COACH",
+    "ACTING_HEAD_COACH",
+    "STAFF",
+    "EXECUTIVE",
+})
+OFFICIAL_AUTHORITY_SCOPES = frozenset({
+    "LEAGUE_OFFICIAL",
+    "CLUB_OFFICIAL",
+    "FEDERATION_OFFICIAL",
+})
+_REJECTED_CAUSE_STATUSES = frozenset({
+    "UNSUBSTANTIATED",
+    "RUMOR",
+    "INFERRED_FROM_ABSENCE",
+})
+
+
+def validate_card_style(card_style: str) -> str:
+    """Validate research card rendering style; fail closed on any unknown value."""
+    if not isinstance(card_style, str) or card_style not in CARD_STYLES:
+        raise ValueError(f"INVALID_CARD_STYLE:{card_style!r}")
+    return card_style
+
+
+def enforce_authority_scope(
+    records: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Editorial Iron Rule 1: bind every claim/fact/timeline record to its declared
+    authority_scope and prevent non-official scopes from asserting official slots."""
+    accepted_official: List[Dict[str, Any]] = []
+    accepted_non_official: List[Dict[str, Any]] = []
+    downgraded_or_rejected: List[Dict[str, Any]] = []
+
+    for rec in records or ():
+        if not isinstance(rec, Mapping):
+            continue
+        item = dict(rec)
+        scope = str(item.get("authority_scope") or "").strip().upper()
+        slot = str(item.get("target_slot") or "").strip().lower()
+
+        if not scope:
+            item["rejection_reason"] = "MISSING_AUTHORITY_SCOPE"
+            downgraded_or_rejected.append(item)
+            continue
+
+        if slot in (
+            "official_registration",
+            "league_registration",
+            "league_listed_role",
+            "league_official_stats",
+        ) or slot.startswith("league_"):
+            if scope in ("LEAGUE_OFFICIAL", "FEDERATION_OFFICIAL"):
+                accepted_official.append(item)
+            else:
+                item["rejection_reason"] = (
+                    f"INSUFFICIENT_AUTHORITY_SCOPE:{scope}:slot={slot}"
+                )
+                downgraded_or_rejected.append(item)
+        elif slot.startswith("club_"):
+            if scope in ("CLUB_OFFICIAL", "LEAGUE_OFFICIAL"):
+                accepted_official.append(item)
+            else:
+                item["rejection_reason"] = (
+                    f"INSUFFICIENT_AUTHORITY_SCOPE:{scope}:slot={slot}"
+                )
+                downgraded_or_rejected.append(item)
+        elif slot.startswith("official_"):
+            if scope in OFFICIAL_AUTHORITY_SCOPES:
+                accepted_official.append(item)
+            else:
+                item["rejection_reason"] = (
+                    f"INSUFFICIENT_AUTHORITY_SCOPE:{scope}:slot={slot}"
+                )
+                downgraded_or_rejected.append(item)
+        else:
+            if scope in OFFICIAL_AUTHORITY_SCOPES:
+                accepted_official.append(item)
+            else:
+                accepted_non_official.append(item)
+
+    return {
+        "accepted_official": accepted_official,
+        "accepted_non_official": accepted_non_official,
+        "downgraded_or_rejected": downgraded_or_rejected,
+    }
+
+
+def filter_timeline_events_silence_not_cause(
+    events: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Editorial Iron Rule 2 (Silence != Cause): reject unsubstantiated rumor/injury/
+    absence causes from the main timeline while preserving multi-source factual
+    discrepancies."""
+    main_timeline: List[Dict[str, Any]] = []
+    rejected_rumor_causes: List[Dict[str, Any]] = []
+
+    for ev in events or ():
+        if not isinstance(ev, Mapping):
+            continue
+        item = dict(ev)
+        cause_status = str(item.get("cause_status") or "").strip().upper()
+        event_kind = str(item.get("event_kind") or "").strip().upper()
+        unverified_cause = item.get("unverified_cause") is True
+
+        if (
+            cause_status in _REJECTED_CAUSE_STATUSES
+            or event_kind == "RUMOR_CAUSE"
+            or unverified_cause
+        ):
+            item.setdefault("rejection_reason", "SILENCE_NOT_CAUSE_UNSUBSTANTIATED")
+            rejected_rumor_causes.append(item)
+        else:
+            main_timeline.append(item)
+
+    return {
+        "main_timeline": main_timeline,
+        "rejected_rumor_causes": rejected_rumor_causes,
+    }
+
+
+def _normalize_dedup_content(item: Mapping[str, Any]) -> str:
+    parts = [
+        str(item.get(k) or "").strip()
+        for k in ("title", "claim", "summary", "public_perspective_summary")
+        if str(item.get(k) or "").strip()
+    ]
+    if not parts:
+        return ""
+    return re.sub(r"\s+", " ", " | ".join(parts)).casefold()
+
+
+def dedup_reprints_and_preserve_discrepancies(
+    items: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Editorial Iron Rule 3: deduplicate same-source reprints into a single canonical
+    entry with deduped_reprints while preserving distinct stories/events and
+    independent conflicting sources side-by-side."""
+    groups: List[Dict[str, Any]] = []
+
+    for idx, raw in enumerate(items or ()):
+        if not isinstance(raw, Mapping):
+            continue
+        item = dict(raw)
+        reprint_of = str(item.get("reprint_of") or "").strip()
+        src_id = str(item.get("canonical_source_id") or "").strip()
+        item_identity = str(
+            item.get("story_id") or item.get("item_id") or item.get("event_id") or ""
+        ).strip()
+        content_fp = _normalize_dedup_content(item)
+
+        target_group: Optional[Dict[str, Any]] = None
+        if reprint_of:
+            # Explicit reprint link: attach to matching source/item group (prefer content match).
+            for g in groups:
+                if (
+                    g["source_id"] == reprint_of or reprint_of in g["item_ids"]
+                ) and (not content_fp or not g["content_fp"] or g["content_fp"] == content_fp):
+                    target_group = g
+                    break
+            if target_group is None:
+                for g in groups:
+                    if g["source_id"] == reprint_of or reprint_of in g["item_ids"]:
+                        target_group = g
+                        break
+        elif src_id:
+            # Same canonical_source_id without reprint_of: merge ONLY if content matches,
+            # or an existing group for src_id contains only out-of-order reprints, or
+            # both lack content and share the same item/story identity.
+            for g in groups:
+                if g["source_id"] != src_id:
+                    continue
+                if content_fp and g["content_fp"]:
+                    if g["content_fp"] == content_fp:
+                        target_group = g
+                        break
+                elif g["reprint_only"]:
+                    target_group = g
+                    break
+                elif not content_fp and not g["content_fp"] and (
+                    not item_identity or item_identity in g["item_ids"]
+                ):
+                    target_group = g
+                    break
+        elif item_identity:
+            for g in groups:
+                if not g["source_id"] and item_identity in g["item_ids"]:
+                    target_group = g
+                    break
+
+        if target_group is None:
+            resolved_src = reprint_of or src_id or item_identity or f"anon-{idx}"
+            target_group = {
+                "source_id": resolved_src,
+                "content_fp": content_fp,
+                "item_ids": {item_identity} if item_identity else set(),
+                "reprint_only": bool(reprint_of),
+                "members": [item],
+            }
+            groups.append(target_group)
+        else:
+            target_group["members"].append(item)
+            if item_identity:
+                target_group["item_ids"].add(item_identity)
+            if not reprint_of:
+                target_group["reprint_only"] = False
+            if content_fp and not target_group["content_fp"]:
+                target_group["content_fp"] = content_fp
+
+    canonical_items: List[Dict[str, Any]] = []
+    for g in groups:
+        members = g["members"]
+        primary_idx = next(
+            (i for i, m in enumerate(members) if not m.get("reprint_of")),
+            0,
+        )
+        primary = dict(members[primary_idx])
+        primary["canonical_source_id"] = g["source_id"]
+        existing_reprints = list(primary.get("deduped_reprints") or [])
+        for i, m in enumerate(members):
+            if i == primary_idx:
+                continue
+            existing_reprints.append(dict(m))
+        primary["deduped_reprints"] = existing_reprints
+        canonical_items.append(primary)
+
+    distinct_claims = {
+        str(x.get("claim") or x.get("summary") or "").strip()
+        for x in canonical_items
+        if str(x.get("claim") or x.get("summary") or "").strip()
+    }
+    has_discrepancy = len(canonical_items) >= 2 and len(distinct_claims) >= 2
+
+    return {
+        "canonical_items": canonical_items,
+        "has_multi_source_discrepancy": has_discrepancy,
+    }
+
+
+def quarantine_unreferenced_encyclopedia_clues(
+    clues: Sequence[Mapping[str, Any]],
+    *,
+    visibility: str = "internal_full",
+) -> List[str]:
+    """Editorial Iron Rule 4: quarantine unreferenced encyclopedia entries as
+    [INTERNAL_CLUE_ONLY: ...] in internal_full and strip 100% in public_safe."""
+    vis = validate_card_visibility(visibility)
+    if vis == "public_safe":
+        return []
+    lines: List[str] = []
+    for clue in clues or ():
+        if not isinstance(clue, Mapping):
+            continue
+        title = str(clue.get("title") or "无来源百科线索").strip()
+        summary = str(clue.get("summary") or clue.get("text") or "").strip()
+        url = str(clue.get("url") or "").strip()
+        body = f"{title} — {summary}" if summary else title
+        if url:
+            body = f"{body} ({url})"
+        lines.append(f"- [INTERNAL_CLUE_ONLY: {body}]")
+    return lines
 
 
 def _is_public_safe_citation(cite: Dict[str, Any]) -> bool:
@@ -202,11 +469,17 @@ def _public_locator(value: Any) -> Optional[str]:
 
 def _sanitize_public_free_text(value: Any, *, fallback: str = "-") -> str:
     """Strip verbatim blockquotes (including lazy continuations & inline `>`),
-    fenced code blocks, private URIs, and internal IDs for public_safe."""
+    fenced code blocks (``` and ~~~, fail-closed on unclosed fences), private URIs,
+    internal clues, and internal IDs for public_safe."""
     if not isinstance(value, str) or not value.strip():
         return fallback
     cleaned = _FENCED_BLOCK_RE.sub("", value)
-    cleaned = cleaned.replace("```", "")
+    cleaned = _TILDE_FENCED_BLOCK_RE.sub("", cleaned)
+    unclosed_positions = [
+        pos for marker in ("```", "~~~") if (pos := cleaned.find(marker)) != -1
+    ]
+    if unclosed_positions:
+        cleaned = cleaned[: min(unclosed_positions)]
     kept_lines: List[str] = []
     in_blockquote = False
     for raw_line in cleaned.splitlines():
@@ -225,6 +498,7 @@ def _sanitize_public_free_text(value: Any, *, fallback: str = "-") -> str:
                 continue
         kept_lines.append(s)
     joined = " ".join(kept_lines)
+    joined = _INTERNAL_CLUE_MARKER_RE.sub("", joined)
     joined = _PRIVATE_URI_TOKEN_RE.sub("", joined)
     joined = _INTERNAL_ID_TOKEN_RE.sub("", joined)
     joined = _TEN_SOURCES_RE.sub("", joined)
@@ -239,6 +513,7 @@ def render_research_card(
     evidence_verified: bool = False,
     max_external_citations_per_card: int = 10,
     visibility: str = "internal_full",
+    card_style: str = "classic",
 ) -> str:
     """Render compact exception-aware research card.
 
@@ -246,7 +521,9 @@ def render_research_card(
     Ends strictly with 'end_marker: true'.
     """
     vis = validate_card_visibility(visibility)
+    style = validate_card_style(card_style)
     is_public = vis == "public_safe"
+    is_wiki = style == "wiki_v240"
     if evidence_verified is not True:
         raise KcRenderError("RESEARCH_CARD_NOT_VERIFIED")
 
@@ -322,140 +599,154 @@ def render_research_card(
                 )
         lines.append("")
 
-    # 1. Stats & Scope Section
-    lines.append("## Statistical Evidence")
-    match_type = scope_meta.get("match_type") or stats_layer.get("match_type", "-")
-    scope = scope_meta.get("scope") or stats_layer.get("scope", "-")
-    games_played = scope_meta.get("games_played")
-    captured_at = scope_meta.get("captured_at")
-    locator = scope_meta.get("locator") or (
-        doc_layer.get("locator") if isinstance(doc_layer, dict) else "-"
-    )
-    metric = payload.get("metric") or stats_layer.get("metric", "-")
-    val = transparency.get("adopted_value")
-    if val is None and isinstance(stats_layer, dict) and posture in ("CLEAN_OFFICIAL", "IDENTICAL_DUPLICATE"):
-        val = stats_layer.get("value")
-
-    club_display = format_club_team_display(scope_meta.get("team_id"), scope_meta.get("club_name_zh") or scope_meta.get("team_name"))
-
-    lines.append(f"- Posture: {posture}")
-    if posture != "UNKNOWN" and player_id:
-        if player_name:
-            lines.append(f"- Player: {player_name} ({player_id})")
-        else:
-            lines.append(f"- Player ID: {player_id}")
-    if club_display and posture != "UNKNOWN":
-        lines.append(f"- Club / Team: {club_display}")
-    lines.append(f"- Season: {season}")
-    lines.append(f"- Match Type: {match_type}")
-    lines.append(f"- Scope: {scope}")
-    if games_played is not None:
-        lines.append(f"- Games Played: {games_played}")
-    if captured_at:
-        lines.append(f"- Cutoff / Captured At: {captured_at}")
-    if locator and not (is_public and _is_internal_locator(locator)):
-        lines.append(f"- Locator: {locator}")
-
-    if posture in ("CLEAN_OFFICIAL", "IDENTICAL_DUPLICATE"):
-        lines.append(f"- Metric: {metric} = {val}")
-        lines.append(f"- Authority: {transparency.get('authority_note', 'PRIMARY_OFFICIAL_RECORD')}")
-    elif posture == "SCOPE_OR_CUTOFF_DIFF":
-        if val is not None:
-            lines.append(f"- Metric: {metric} = {val} (latest cutoff)")
-        for cr in transparency.get("cutoff_records", []):
-            if is_public:
-                pub_loc = _public_locator(cr.get("locator"))
-                loc_part = f" [Locator: {pub_loc}]" if pub_loc else ""
-                lines.append(
-                    f"  * Cutoff {cr.get('games_played')} games ({cr.get('captured_at') or '-'}): "
-                    f"{cr.get('value')}{loc_part}"
-                )
-            else:
-                lines.append(
-                    f"  * Cutoff {cr.get('games_played')} games ({cr.get('captured_at') or '-'}): "
-                    f"{cr.get('value')} [Locator: {cr.get('locator')}]"
-                )
-        for sp in transparency.get("scope_splits", []):
-            lines.append(
-                f"  * Team Split {sp.get('team_name') or sp.get('team_id')}: "
-                f"{sp.get('value')} ({sp.get('games_played')} games)"
-            )
-    elif posture == "REVISION_SUPERSEDED":
-        lines.append(f"- Metric: {metric} = {val} (REVISION_SUPERSEDED)")
-        for rev in transparency.get("revision_history", []):
-            prior_val = rev.get("prior_value")
-            new_val = rev.get("new_value")
-            if is_public:
-                safe_reason = _sanitize_public_free_text(rev.get("reason"), fallback="-")
-                lines.append(
-                    f"  * Prior Value: {prior_val} -> New Value: {new_val} "
-                    f"(Reason: {safe_reason})"
-                )
-            else:
-                lines.append(
-                    f"  * Prior Value: {prior_val} -> New Value: {new_val} "
-                    f"(Supersedes: {rev.get('supersedes_record_id')}, Reason: {rev.get('reason')})"
-                )
-    elif posture == "DATA_DISCREPANCY":
-        delta = transparency.get("delta")
-        delta_note = f" (Delta: {delta})" if delta is not None else ""
-        lines.append(f"- Discrepancy Detected for Metric: {metric}{delta_note}")
-        for d in transparency.get("discrepancies", []):
-            if is_public:
-                pub_loc = _public_locator(d.get("locator"))
-                loc_part = f", Locator: {pub_loc}" if pub_loc else ""
-                lines.append(
-                    f"  * Observed Value: {d.get('value')} "
-                    f"(Kind: {d.get('record_kind')}, Games: {d.get('games_played')}{loc_part})"
-                )
-            else:
-                lines.append(
-                    f"  * Record {d.get('record_id')}: {d.get('value')} "
-                    f"(Kind: {d.get('record_kind')}, Games: {d.get('games_played')}, Locator: {d.get('locator')})"
-                )
-    elif posture == "TRUE_CONFLICT":
-        lines.append(f"- Irreconcilable Conflict for Metric: {metric}")
-        for d in transparency.get("discrepancies", []):
-            if is_public:
-                pub_loc = _public_locator(d.get("locator"))
-                loc_part = f" (Locator: {pub_loc})" if pub_loc else ""
-                lines.append(f"  * Observed Value: {d.get('value')}{loc_part}")
-            else:
-                lines.append(f"  * Record {d.get('record_id')}: {d.get('value')} (Locator: {d.get('locator')})")
-    elif posture == "SINGLE_SOURCE_UNCORROBORATED":
-        lines.append(f"- Metric: {metric} = {val}")
-        lines.append("- Note: Single source uncorroborated")
-    elif posture == "UNKNOWN":
-        subkind = transparency.get("unknown_subkind", "NO_RELIABLE_EVIDENCE_IN_KB")
-        lines.append(f"- Unknown: {subkind}")
-
-    # 1b. 12-Metric Season Averages Table (REQ-232 P0-1: optional, 0-byte diff when absent)
+    # 1. Stats & Scope Section (omitted for pure coach in wiki_v240 when no player stats exist)
+    entity_role_norm = str(payload.get("entity_role") or "").strip().upper()
     season_stats_table = payload.get("season_stats_table")
-    if isinstance(season_stats_table, list) and season_stats_table:
-        table_lines = _render_season_stats_table_lines(season_stats_table, is_public=is_public)
-        if table_lines:
-            lines.extend([
-                "",
-                "### Season Averages (Player-Season Grain)",
-                *table_lines,
-            ])
+    recent_games_payload = payload.get("recent_games_summary")
+    has_player_season_stats = isinstance(season_stats_table, list) and bool(season_stats_table)
+    has_player_game_stats = isinstance(recent_games_payload, dict) and bool(
+        recent_games_payload.get("games")
+    )
+    is_pure_coach_wiki = (
+        is_wiki
+        and entity_role_norm in COACH_ENTITY_ROLES
+        and not has_player_season_stats
+        and not has_player_game_stats
+    )
 
-    # 1c. Prior Full-Season Baseline (REQ-232 P0-1: historical reference only, 0-byte diff when absent)
-    prior_baseline = payload.get("prior_season_baseline")
-    if isinstance(prior_baseline, dict) and isinstance(prior_baseline.get("rows"), list) and prior_baseline["rows"]:
-        prior_s = str(prior_baseline.get("season") or "UNKNOWN")
-        target_s = str(prior_baseline.get("target_season") or season)
-        prior_table = _render_season_stats_table_lines(prior_baseline["rows"], is_public=is_public)
-        if prior_table:
-            lines.extend([
-                "",
-                f"### Prior Full-Season Baseline ({prior_s} — Historical Reference Only, Not {target_s})",
-            ])
-            if prior_baseline.get("captured_at"):
-                lines.append(f"- Captured At: {prior_baseline['captured_at']}")
-            if prior_baseline.get("locator") and not is_public:
-                lines.append(f"- Locator: {prior_baseline['locator']}")
-            lines.extend(prior_table)
+    if not is_pure_coach_wiki:
+        lines.append("## Statistical Evidence")
+        match_type = scope_meta.get("match_type") or stats_layer.get("match_type", "-")
+        scope = scope_meta.get("scope") or stats_layer.get("scope", "-")
+        games_played = scope_meta.get("games_played")
+        captured_at = scope_meta.get("captured_at")
+        locator = scope_meta.get("locator") or (
+            doc_layer.get("locator") if isinstance(doc_layer, dict) else "-"
+        )
+        metric = payload.get("metric") or stats_layer.get("metric", "-")
+        val = transparency.get("adopted_value")
+        if val is None and isinstance(stats_layer, dict) and posture in ("CLEAN_OFFICIAL", "IDENTICAL_DUPLICATE"):
+            val = stats_layer.get("value")
+
+        club_display = format_club_team_display(scope_meta.get("team_id"), scope_meta.get("club_name_zh") or scope_meta.get("team_name"))
+
+        lines.append(f"- Posture: {posture}")
+        if posture != "UNKNOWN" and player_id:
+            if player_name:
+                lines.append(f"- Player: {player_name} ({player_id})")
+            else:
+                lines.append(f"- Player ID: {player_id}")
+        if club_display and posture != "UNKNOWN":
+            lines.append(f"- Club / Team: {club_display}")
+        lines.append(f"- Season: {season}")
+        lines.append(f"- Match Type: {match_type}")
+        lines.append(f"- Scope: {scope}")
+        if games_played is not None:
+            lines.append(f"- Games Played: {games_played}")
+        if captured_at:
+            lines.append(f"- Cutoff / Captured At: {captured_at}")
+        if locator and not (is_public and _is_internal_locator(locator)):
+            lines.append(f"- Locator: {locator}")
+
+        if posture in ("CLEAN_OFFICIAL", "IDENTICAL_DUPLICATE"):
+            lines.append(f"- Metric: {metric} = {val}")
+            lines.append(f"- Authority: {transparency.get('authority_note', 'PRIMARY_OFFICIAL_RECORD')}")
+        elif posture == "SCOPE_OR_CUTOFF_DIFF":
+            if val is not None:
+                lines.append(f"- Metric: {metric} = {val} (latest cutoff)")
+            for cr in transparency.get("cutoff_records", []):
+                if is_public:
+                    pub_loc = _public_locator(cr.get("locator"))
+                    loc_part = f" [Locator: {pub_loc}]" if pub_loc else ""
+                    lines.append(
+                        f"  * Cutoff {cr.get('games_played')} games ({cr.get('captured_at') or '-'}): "
+                        f"{cr.get('value')}{loc_part}"
+                    )
+                else:
+                    lines.append(
+                        f"  * Cutoff {cr.get('games_played')} games ({cr.get('captured_at') or '-'}): "
+                        f"{cr.get('value')} [Locator: {cr.get('locator')}]"
+                    )
+            for sp in transparency.get("scope_splits", []):
+                lines.append(
+                    f"  * Team Split {sp.get('team_name') or sp.get('team_id')}: "
+                    f"{sp.get('value')} ({sp.get('games_played')} games)"
+                )
+        elif posture == "REVISION_SUPERSEDED":
+            lines.append(f"- Metric: {metric} = {val} (REVISION_SUPERSEDED)")
+            for rev in transparency.get("revision_history", []):
+                prior_val = rev.get("prior_value")
+                new_val = rev.get("new_value")
+                if is_public:
+                    safe_reason = _sanitize_public_free_text(rev.get("reason"), fallback="-")
+                    lines.append(
+                        f"  * Prior Value: {prior_val} -> New Value: {new_val} "
+                        f"(Reason: {safe_reason})"
+                    )
+                else:
+                    lines.append(
+                        f"  * Prior Value: {prior_val} -> New Value: {new_val} "
+                        f"(Supersedes: {rev.get('supersedes_record_id')}, Reason: {rev.get('reason')})"
+                    )
+        elif posture == "DATA_DISCREPANCY":
+            delta = transparency.get("delta")
+            delta_note = f" (Delta: {delta})" if delta is not None else ""
+            lines.append(f"- Discrepancy Detected for Metric: {metric}{delta_note}")
+            for d in transparency.get("discrepancies", []):
+                if is_public:
+                    pub_loc = _public_locator(d.get("locator"))
+                    loc_part = f", Locator: {pub_loc}" if pub_loc else ""
+                    lines.append(
+                        f"  * Observed Value: {d.get('value')} "
+                        f"(Kind: {d.get('record_kind')}, Games: {d.get('games_played')}{loc_part})"
+                    )
+                else:
+                    lines.append(
+                        f"  * Record {d.get('record_id')}: {d.get('value')} "
+                        f"(Kind: {d.get('record_kind')}, Games: {d.get('games_played')}, Locator: {d.get('locator')})"
+                    )
+        elif posture == "TRUE_CONFLICT":
+            lines.append(f"- Irreconcilable Conflict for Metric: {metric}")
+            for d in transparency.get("discrepancies", []):
+                if is_public:
+                    pub_loc = _public_locator(d.get("locator"))
+                    loc_part = f" (Locator: {pub_loc})" if pub_loc else ""
+                    lines.append(f"  * Observed Value: {d.get('value')}{loc_part}")
+                else:
+                    lines.append(f"  * Record {d.get('record_id')}: {d.get('value')} (Locator: {d.get('locator')})")
+        elif posture == "SINGLE_SOURCE_UNCORROBORATED":
+            lines.append(f"- Metric: {metric} = {val}")
+            lines.append("- Note: Single source uncorroborated")
+        elif posture == "UNKNOWN":
+            subkind = transparency.get("unknown_subkind", "NO_RELIABLE_EVIDENCE_IN_KB")
+            lines.append(f"- Unknown: {subkind}")
+
+        # 1b. 12-Metric Season Averages Table (REQ-232 P0-1: optional, 0-byte diff when absent)
+        if has_player_season_stats:
+            table_lines = _render_season_stats_table_lines(season_stats_table, is_public=is_public)
+            if table_lines:
+                lines.extend([
+                    "",
+                    "### Season Averages (Player-Season Grain)",
+                    *table_lines,
+                ])
+
+        # 1c. Prior Full-Season Baseline (REQ-232 P0-1: historical reference only, 0-byte diff when absent)
+        prior_baseline = payload.get("prior_season_baseline")
+        if isinstance(prior_baseline, dict) and isinstance(prior_baseline.get("rows"), list) and prior_baseline["rows"]:
+            prior_s = str(prior_baseline.get("season") or "UNKNOWN")
+            target_s = str(prior_baseline.get("target_season") or season)
+            prior_table = _render_season_stats_table_lines(prior_baseline["rows"], is_public=is_public)
+            if prior_table:
+                lines.extend([
+                    "",
+                    f"### Prior Full-Season Baseline ({prior_s} — Historical Reference Only, Not {target_s})",
+                ])
+                if prior_baseline.get("captured_at"):
+                    lines.append(f"- Captured At: {prior_baseline['captured_at']}")
+                if prior_baseline.get("locator") and not is_public:
+                    lines.append(f"- Locator: {prior_baseline['locator']}")
+                lines.extend(prior_table)
 
     # 2. Claim Layer Section (when claims exist)
     claim_trans = transparency.get("claim_transparency") or {}
@@ -530,7 +821,7 @@ def render_research_card(
                 if is_public:
                     raw_cite_title = str(cite.get("title") or "").strip()
                     raw_cite_doc_id = str(cite.get("doc_id") or "").strip()
-                    if raw_cite_doc_id and raw_cite_title == raw_cite_doc_id:
+                    if raw_cite_doc_id and raw_cite_title.casefold() == raw_cite_doc_id.casefold():
                         raw_cite_title = ""
                     pub_title = _sanitize_public_free_text(raw_cite_title, fallback="-")
                     lines.append(
@@ -671,9 +962,10 @@ def render_research_card(
                 "- Data Layer: evidence / candidate_observation (Statement != Fact)"
             )
 
-    # 7. Recent Single-Game Log Section (REQ-223 P0-4: PLAYER_GAME_STATS grain, lossless)
+    # 7. Recent Single-Game Log Section (REQ-223 P0-4: PLAYER_GAME_STATS grain, lossless;
+    # omitted for pure coach in wiki_v240 when no player game stats exist)
     recent_games = payload.get("recent_games_summary")
-    if isinstance(recent_games, dict):
+    if isinstance(recent_games, dict) and not is_pure_coach_wiki:
         has_v223_extension = True
 
         def _fmt_num(v: Any) -> str:
@@ -781,7 +1073,8 @@ def render_research_card(
                     )
                 lines.append(f"- [{g_posture}] {g_notice}")
     elif (
-        isinstance(payload.get("single_game_stats_gap"), dict)
+        not is_pure_coach_wiki
+        and isinstance(payload.get("single_game_stats_gap"), dict)
         and payload["single_game_stats_gap"].get("available") is False
     ):
         has_v223_extension = True
@@ -797,6 +1090,196 @@ def render_research_card(
             "## Recent Single-Game Log (Player-Game Grain)",
             gap_line,
         ])
+
+    # 8. Wiki v2.4.0 Elastic Sections (strictly gated on card_style == "wiki_v240")
+    if is_wiki:
+        has_v223_extension = True
+
+        # 8a. Coaching Role Facets (3-facet institutional governance)
+        raw_facets = payload.get("coach_role_facets")
+        if raw_facets is not None:
+            facets_seq = (
+                list(raw_facets)
+                if isinstance(raw_facets, (list, tuple))
+                else [raw_facets]
+            )
+            facet_dicts: List[Dict[str, Any]] = []
+            for f_item in facets_seq:
+                if hasattr(f_item, "to_dict") and callable(f_item.to_dict):
+                    facet_dicts.append(dict(f_item.to_dict()))
+                elif isinstance(f_item, Mapping):
+                    facet_dicts.append(dict(f_item))
+            if facet_dicts:
+                lines.extend([
+                    "",
+                    "## Coaching Role Facets",
+                ])
+                for fd in facet_dicts:
+                    f_season = str(fd.get("season") or season or "-")
+                    f_org = str(fd.get("organization_id") or "").strip()
+                    l_role = str(fd.get("league_listed_role") or "OBSERVED_EMPTY")
+                    c_role = str(fd.get("club_appointed_role") or "OBSERVED_EMPTY")
+                    g_role = str(fd.get("gameday_acting_role") or "OBSERVED_EMPTY")
+                    org_part = f" ({f_org})" if f_org else ""
+                    lines.append(
+                        f"- Season {f_season}{org_part}: "
+                        f"league_listed_role={l_role} | "
+                        f"club_appointed_role={c_role} | "
+                        f"gameday_acting_role={g_role}"
+                    )
+                    if fd.get("has_institutional_discrepancy"):
+                        d_code = str(fd.get("discrepancy_code") or "LEAGUE_VS_CLUB_ROLE_DISCREPANCY")
+                        raw_expl = str(fd.get("discrepancy_explanation") or "").strip()
+                        expl = (
+                            _sanitize_public_free_text(raw_expl, fallback="-")
+                            if is_public
+                            else raw_expl
+                        )
+                        if expl and expl != "-":
+                            lines.append(f"  * Discrepancy [{d_code}]: {expl}")
+                        else:
+                            lines.append(f"  * Discrepancy [{d_code}]")
+
+        # 8b. Career Role Tenures (Player-to-Coach unified PERS-* profile; Editorial Iron Rule 1)
+        unified_prof = payload.get("unified_profile")
+        tenures_raw = payload.get("role_tenures")
+        if tenures_raw is None and isinstance(unified_prof, Mapping):
+            tenures_raw = unified_prof.get("role_tenures")
+        if isinstance(tenures_raw, (list, tuple)) and tenures_raw:
+            tenure_dicts: List[Dict[str, Any]] = []
+            for t in tenures_raw:
+                td = t.to_dict() if hasattr(t, "to_dict") and callable(t.to_dict) else (
+                    dict(t) if isinstance(t, Mapping) else None
+                )
+                if td:
+                    tenure_dicts.append(td)
+            scoped_tenures = enforce_authority_scope(tenure_dicts)
+            accepted_tenures = [
+                *scoped_tenures["accepted_official"],
+                *scoped_tenures["accepted_non_official"],
+            ]
+            if accepted_tenures:
+                lines.extend([
+                    "",
+                    "## Career Role Tenures",
+                ])
+                if isinstance(unified_prof, Mapping):
+                    p_uid = str(unified_prof.get("person_uid") or "").strip()
+                    if p_uid:
+                        lines.append(f"- Person UID: {p_uid}")
+                    linked_uids = unified_prof.get("linked_player_uids") or ()
+                    if linked_uids:
+                        lines.append(
+                            f"- Linked Player UIDs: {', '.join(str(x) for x in linked_uids)}"
+                        )
+                    if unified_prof.get("is_player_to_coach_transition"):
+                        lines.append("- Career Transition: PLAYER -> COACH (unified lifetime profile)")
+                for td in accepted_tenures:
+                    t_role = str(td.get("role") or "-")
+                    t_org = str(td.get("organization_name") or td.get("organization_id") or "-")
+                    t_start = str(td.get("season_start") or td.get("start_date") or "-")
+                    t_end = str(td.get("season_end") or td.get("end_date") or "PRESENT")
+                    t_scope = str(td.get("authority_scope") or "").strip().upper()
+                    lines.append(f"- {t_start}..{t_end} | {t_role} | {t_org} [{t_scope}]")
+
+        # 8c. Narrative & Key Stories (1-to-3 projected StoryRecords; Editorial Iron Rule 3)
+        proj_stories = payload.get("projected_stories")
+        if proj_stories is None:
+            proj_stories = payload.get("story_records")
+        if isinstance(proj_stories, (list, tuple)) and proj_stories:
+            normalized_stories: List[Dict[str, Any]] = []
+            for st_raw in proj_stories:
+                if not isinstance(st_raw, Mapping):
+                    continue
+                st_copy = dict(st_raw)
+                if not st_copy.get("canonical_source_id") and isinstance(st_copy.get("canonical_source"), Mapping):
+                    c_src_id = str(st_copy["canonical_source"].get("source_id") or "").strip()
+                    if c_src_id:
+                        st_copy["canonical_source_id"] = c_src_id
+                normalized_stories.append(st_copy)
+            deduped_stories = dedup_reprints_and_preserve_discrepancies(normalized_stories)
+            story_lines: List[str] = []
+            for st_item in deduped_stories["canonical_items"]:
+                src_kind = str(
+                    st_item.get("source_kind")
+                    or (
+                        st_item.get("canonical_source", {}).get("source_kind")
+                        if isinstance(st_item.get("canonical_source"), Mapping)
+                        else ""
+                    )
+                    or ""
+                ).strip().lower()
+                if is_public and src_kind == "unreferenced_encyclopedia":
+                    continue
+                vis_pol = st_item.get("visibility_policy")
+                if is_public and isinstance(vis_pol, Mapping) and vis_pol.get("public_export_allowed") is False:
+                    continue
+                st_season = str(st_item.get("occurred_season") or "-")
+                st_title = str(st_item.get("title") or "-")
+                st_role = str(st_item.get("participant_role") or "").strip()
+                raw_sum = str(
+                    st_item.get("summary")
+                    or st_item.get("public_perspective_summary")
+                    or st_item.get("claim")
+                    or ""
+                ).strip()
+                if is_public:
+                    st_title = _sanitize_public_free_text(st_title, fallback="-")
+                    st_sum = _sanitize_public_free_text(raw_sum, fallback="-")
+                else:
+                    st_sum = raw_sum or "-"
+                role_part = f" ({st_role})" if st_role else ""
+                story_lines.append(f"- [{st_season}]{role_part} {st_title}: {st_sum}")
+                if not is_public and st_item.get("internal_verbatim_or_note"):
+                    story_lines.append(
+                        f"  * Internal Note: {st_item['internal_verbatim_or_note']}"
+                    )
+            if story_lines:
+                lines.extend([
+                    "",
+                    "## Narrative & Key Stories",
+                    *story_lines,
+                ])
+
+        # 8d. Timeline & Multi-Source Observations (Editorial Iron Rules 2 & 3)
+        raw_timeline = payload.get("timeline_events")
+        if isinstance(raw_timeline, (list, tuple)) and raw_timeline:
+            filtered_tl = filter_timeline_events_silence_not_cause(raw_timeline)
+            deduped_tl = dedup_reprints_and_preserve_discrepancies(
+                filtered_tl["main_timeline"]
+            )
+            tl_lines: List[str] = []
+            for ev in deduped_tl["canonical_items"]:
+                ev_src_kind = str(ev.get("source_kind") or "").strip().lower()
+                if is_public and ev_src_kind == "unreferenced_encyclopedia":
+                    continue
+                ev_kind = str(ev.get("event_kind") or "EVENT")
+                raw_ev_sum = str(ev.get("summary") or ev.get("claim") or "-")
+                ev_sum = (
+                    _sanitize_public_free_text(raw_ev_sum, fallback="-")
+                    if is_public
+                    else raw_ev_sum
+                )
+                tl_lines.append(f"- [{ev_kind}] {ev_sum}")
+            if tl_lines:
+                lines.extend([
+                    "",
+                    "## Timeline & Multi-Source Observations",
+                    *tl_lines,
+                ])
+
+        # 8e. Unreferenced Encyclopedia Quarantine (Editorial Iron Rule 4)
+        raw_clues = payload.get("encyclopedia_clues")
+        if isinstance(raw_clues, (list, tuple)) and raw_clues:
+            clue_lines = quarantine_unreferenced_encyclopedia_clues(
+                raw_clues, visibility=vis
+            )
+            if clue_lines:
+                lines.extend([
+                    "",
+                    "## Internal Clues (Quarantined)",
+                    *clue_lines,
+                ])
 
     if has_v223_extension:
         from .consumer_surface import scrub_raw_drive_ids_for_consumer

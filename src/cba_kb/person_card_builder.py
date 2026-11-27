@@ -18,7 +18,7 @@ import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from .common import atomic
 from .consumer_surface import (
@@ -34,9 +34,11 @@ from .consumer_surface import (
 from .game_stats import summarize_recent_games
 from .instance import Instance
 from .kc_render import (
+    COACH_ENTITY_ROLES,
     render_research_card,
     research_card_consumer_filename,
     research_card_public_consumer_filename,
+    validate_card_style,
 )
 from .kc_visibility import validate_card_visibility, verify_public_safe_card_text
 from .stats import CORE_SEASON_STATS_COLUMNS
@@ -1117,7 +1119,11 @@ def _match_document_bundles(
                 seen_ids.add(doc_id)
             raw_title = str(b.get("title") or "").strip()
             if visibility == "public_safe":
-                safe_title = "-" if (not raw_title or (doc_id and raw_title == doc_id)) else raw_title
+                safe_title = (
+                    "-"
+                    if (not raw_title or (doc_id and raw_title.casefold() == doc_id.casefold()))
+                    else raw_title
+                )
             else:
                 safe_title = raw_title or doc_id or "-"
             matched.append({
@@ -1153,12 +1159,20 @@ def build_person_card(
     game_stats_degraded: bool = False,
     entity_role: Optional[str] = None,
     visibility: str = "internal_full",
+    card_style: str = "classic",
+    coach_role_facets: Optional[Any] = None,
+    person_registry: Optional[Mapping[str, Any]] = None,
+    role_tenures: Optional[Sequence[Any]] = None,
+    story_records: Optional[Sequence[Mapping[str, Any]]] = None,
+    timeline_events: Optional[Sequence[Mapping[str, Any]]] = None,
+    encyclopedia_clues: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Assemble and render an on-demand research card for any player in local KB.
 
     Zero network calls, zero Google Drive API calls.
     """
     vis = validate_card_visibility(visibility)
+    style = validate_card_style(card_style)
     discovered = _discover_instance_inputs(instance) if instance is not None else {}
     obs_horizon: Optional[Dict[str, Any]] = None
     if isinstance(observation_horizon, dict):
@@ -1395,7 +1409,11 @@ def build_person_card(
 
     if recent_summary is not None:
         payload["recent_games_summary"] = recent_summary
-    else:
+    elif not (
+        style == "wiki_v240"
+        and effective_role.strip().upper() in COACH_ENTITY_ROLES
+        and not matched_season
+    ):
         payload["single_game_stats_gap"] = {
             "available": False,
             "degraded": bool(game_stats_degraded),
@@ -1405,7 +1423,56 @@ def build_person_card(
     if obs_horizon is not None:
         payload["observation_horizon"] = obs_horizon
 
-    raw_markdown = render_research_card(payload, evidence_verified=True, visibility=vis)
+    if style == "wiki_v240":
+        payload["entity_role"] = effective_role
+        if coach_role_facets is not None:
+            payload["coach_role_facets"] = coach_role_facets
+        resolved_person_uid: Optional[str] = None
+        if isinstance(person_registry, Mapping):
+            from .person_registry import (
+                resolve_person_identity,
+                unify_player_and_coach_profile,
+            )
+
+            reg_res = resolve_person_identity(
+                player_name,
+                person_registry=person_registry,
+                player_uid=person.get("player_uid"),
+            )
+            if reg_res.get("status") == "RESOLVED" and reg_res.get("person_uid"):
+                resolved_person_uid = str(reg_res["person_uid"])
+                payload["unified_profile"] = unify_player_and_coach_profile(
+                    resolved_person_uid,
+                    person_registry=person_registry,
+                )
+        if role_tenures is not None:
+            payload["role_tenures"] = list(role_tenures)
+        if story_records is not None:
+            entity_id_for_stories = (
+                resolved_person_uid
+                or str(person.get("person_uid") or "").strip()
+                or str(person.get("player_uid") or "").strip()
+            )
+            if entity_id_for_stories:
+                from .story_record import project_stories_for_entity
+
+                payload["projected_stories"] = project_stories_for_entity(
+                    story_records,
+                    entity_id=entity_id_for_stories,
+                    entity_kind="person",
+                    visibility=vis,
+                )
+        if timeline_events is not None:
+            payload["timeline_events"] = list(timeline_events)
+        if encyclopedia_clues is not None:
+            payload["encyclopedia_clues"] = list(encyclopedia_clues)
+
+    raw_markdown = render_research_card(
+        payload,
+        evidence_verified=True,
+        visibility=vis,
+        card_style=style,
+    )
     markdown = scrub_raw_drive_ids_for_consumer(raw_markdown, known_drive_ids=known_drive_ids)
     if not markdown.rstrip().endswith("end_marker: true"):
         markdown = markdown.rstrip() + "\n\nend_marker: true\n"
