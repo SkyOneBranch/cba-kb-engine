@@ -29,6 +29,20 @@ PARTICIPANT_ROLES = frozenset({
 })
 STORY_ID_RE = re.compile(r"story_[0-9a-f]{24}\Z")
 _QUOTE_ANCHOR_SHA256_RE = re.compile(r"^[0-9a-f]{64}\Z")
+_HOLLOW_STORY_PATTERNS = (
+    re.compile(r"某媒体(?:公开)?报道《.+?》记录了.+?相关赛事与赛场动态"),
+    re.compile(r"记录了.+?相关赛事与赛场动态"),
+)
+
+
+def is_hollow_story_template(text: Any) -> bool:
+    """Return True when text matches a zero-information hollow boilerplate template."""
+    if not isinstance(text, str):
+        return False
+    s = re.sub(r"\s+", " ", text).strip()
+    if not s:
+        return False
+    return any(pat.search(s) for pat in _HOLLOW_STORY_PATTERNS)
 
 
 class StoryRecordError(ValueError):
@@ -259,6 +273,19 @@ def validate_story_record(record: Mapping[str, Any]) -> Dict[str, Any]:
         if isinstance(raw_anchors, (str, bytes)) or not isinstance(raw_anchors, Sequence):
             raise StoryRecordError("QUOTE_ANCHORS_LIST_REQUIRED")
         out["quote_anchors"] = [_validate_quote_anchor(a) for a in raw_anchors]
+    event_cluster_key = _optional_str(record.get("event_cluster_key"), "EVENT_CLUSTER_KEY")
+    if event_cluster_key is not None:
+        out["event_cluster_key"] = event_cluster_key
+    review_status = _optional_str(record.get("review_status"), "REVIEW_STATUS")
+    if review_status is not None:
+        out["review_status"] = review_status
+    if "supporting_sources" in record and record.get("supporting_sources") is not None:
+        raw_sup = record.get("supporting_sources")
+        if isinstance(raw_sup, (str, bytes)) or not isinstance(raw_sup, Sequence):
+            raise StoryRecordError("SUPPORTING_SOURCES_LIST_REQUIRED")
+        out["supporting_sources"] = [
+            dict(s) if isinstance(s, Mapping) else s for s in raw_sup
+        ]
     return out
 
 
@@ -275,6 +302,9 @@ def make_story_record(
     deduped_reprints: Sequence[Any] = (),
     visibility_policy: Optional[Mapping[str, Any]] = None,
     quote_anchors: Optional[Sequence[Mapping[str, Any]]] = None,
+    event_cluster_key: Optional[str] = None,
+    supporting_sources: Optional[Sequence[Any]] = None,
+    review_status: Optional[str] = None,
     story_id: Optional[str] = None,
     schema: str = STORY_RECORD_SCHEMA,
 ) -> Dict[str, Any]:
@@ -305,6 +335,12 @@ def make_story_record(
     }
     if quote_anchors is not None:
         payload["quote_anchors"] = list(quote_anchors)
+    if event_cluster_key is not None:
+        payload["event_cluster_key"] = event_cluster_key
+    if supporting_sources is not None:
+        payload["supporting_sources"] = list(supporting_sources)
+    if review_status is not None:
+        payload["review_status"] = review_status
     return validate_story_record(payload)
 
 
@@ -474,3 +510,57 @@ def project_stories_for_entity(
         )
     )
     return projected
+
+
+def cluster_and_merge_stories(
+    stories: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Filter hollow boilerplate stories and merge records sharing `event_cluster_key`."""
+    clusters: Dict[str, Dict[str, Any]] = {}
+    ordered: List[Dict[str, Any]] = []
+
+    for raw in stories or ():
+        if not isinstance(raw, Mapping):
+            continue
+        item = dict(raw)
+        # Check hollow template in title/summary/participant summaries
+        texts_to_check = [
+            item.get("title"),
+            item.get("summary"),
+            item.get("organization_summary"),
+            *(
+                p.get("public_perspective_summary")
+                for p in (item.get("participants") or ())
+                if isinstance(p, Mapping)
+            ),
+        ]
+        if any(is_hollow_story_template(t) for t in texts_to_check):
+            continue
+
+        c_src = item.get("canonical_source")
+        src_list: List[Any] = []
+        if c_src:
+            src_list.append(dict(c_src) if isinstance(c_src, Mapping) else c_src)
+        for sup in item.get("supporting_sources") or ():
+            src_item = dict(sup) if isinstance(sup, Mapping) else sup
+            if src_item not in src_list:
+                src_list.append(src_item)
+
+        cluster_key = str(item.get("event_cluster_key") or "").strip()
+        if not cluster_key:
+            item["supporting_sources"] = src_list
+            ordered.append(item)
+            continue
+
+        if cluster_key not in clusters:
+            item["supporting_sources"] = src_list
+            clusters[cluster_key] = item
+            ordered.append(item)
+        else:
+            existing = clusters[cluster_key]
+            ex_srcs = existing.setdefault("supporting_sources", [])
+            for s in src_list:
+                if s not in ex_srcs:
+                    ex_srcs.append(s)
+
+    return ordered

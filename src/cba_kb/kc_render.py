@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 from .aliases import format_club_team_display
 from .kc_projection import KcError
 from .kc_visibility import validate_card_visibility, verify_public_safe_card_text
+from .person_registry import CHRONICLER_ROLES, format_role_zh
 from .stats import CORE_SEASON_STATS_COLUMNS
 
 READABILITY_STATUS = "NOT_VERIFIED_PENDING_PHASE_2"
@@ -244,6 +245,7 @@ class CitationRegistry:
         url: Optional[str] = None,
         source_kind: Optional[str] = None,
         published_at: Optional[str] = None,
+        captured_at: Optional[str] = None,
         publisher: Optional[str] = None,
         source_id: Optional[str] = None,
     ) -> Optional[int]:
@@ -253,6 +255,7 @@ class CitationRegistry:
         kind_lower = raw_kind.lower()
         raw_pub = str(publisher or "").strip()
         raw_date = str(published_at or "").strip()
+        raw_cap = str(captured_at or "").strip()
         raw_sid = str(source_id or "").strip()
 
         if self._is_public:
@@ -312,6 +315,7 @@ class CitationRegistry:
                 "url": raw_url or None,
                 "source_kind": raw_kind or None,
                 "published_at": raw_date or None,
+                "captured_at": raw_cap or None,
                 "publisher": clean_pub or None,
                 "source_id": None if self._is_public else (raw_sid or None),
             }
@@ -334,13 +338,16 @@ class CitationRegistry:
             label = str(item.get("label") or "").strip()
             publisher = str(item.get("publisher") or "").strip()
             published_at = str(item.get("published_at") or "").strip()
+            captured_at = str(item.get("captured_at") or "").strip()
             url = str(item.get("url") or "").strip()
 
             parts: List[str] = [label] if label else []
             if publisher and publisher not in label:
                 parts.append(publisher)
             if published_at:
-                parts.append(published_at)
+                parts.append(f"发布于 {published_at[:10]}")
+            elif captured_at:
+                parts.append(f"检索于 {captured_at[:10]}")
             text = " · ".join(parts) if parts else (url or f"参考资料 {idx}")
             if url:
                 lines.append(f"{idx}. [{text}]({url})")
@@ -950,13 +957,14 @@ def _render_wiki_v241_card(
     recent_games = payload.get("recent_games_summary")
     has_career_stats = bool(reg_rows or po_rows)
     has_game_stats = isinstance(recent_games, Mapping) and bool(recent_games.get("games"))
+    is_chronicler = entity_role_norm in CHRONICLER_ROLES
     is_pure_coach = (
         entity_role_norm in COACH_ENTITY_ROLES
         and not has_career_stats
         and not has_game_stats
     )
 
-    if has_career_stats and not is_pure_coach:
+    if has_career_stats and not is_pure_coach and not is_chronicler:
         stats_ref_indices: List[int] = []
         for r in [*reg_rows, *po_rows]:
             loc = r.get("locator")
@@ -1007,7 +1015,7 @@ def _render_wiki_v241_card(
                 lines.extend(["", "### 季后赛", *po_tbl])
 
     # 2. Recent Single-Game Log (default-collapsed <details class="gamelog-drawer">)
-    if has_game_stats and not is_pure_coach:
+    if has_game_stats and not is_pure_coach and not is_chronicler:
         games_list = recent_games.get("games") or []
         played_n = recent_games.get("played_games_in_window", len(games_list))
         avgs = recent_games.get("averages") or {}
@@ -1131,7 +1139,8 @@ def _render_wiki_v241_card(
             if unified_prof.get("is_player_to_coach_transition"):
                 lines.append("- 职业轨迹：由球员转型教练（统一生涯档案）")
             for td in accepted_tenures:
-                t_role = str(td.get("role") or "-")
+                t_role_raw = str(td.get("role") or "-")
+                t_role = format_role_zh(t_role_raw) if t_role_raw != "-" else "-"
                 t_org = str(td.get("organization_name") or td.get("organization_id") or "-")
                 t_start = str(td.get("season_start") or td.get("start_date") or "-")
                 t_end = str(td.get("season_end") or td.get("end_date") or "至今")
@@ -1170,11 +1179,14 @@ def _render_wiki_v241_card(
             ref_marks = []
             for ev_ref in ot.get("evidence_refs") or ():
                 if isinstance(ev_ref, Mapping):
+                    pub_d = str(ev_ref.get("published_at") or "").strip()[:10] or None
+                    cap_d = str(ev_ref.get("captured_at") or "").strip()[:10] or None
                     idx = cit_reg.register(
                         label=str(ev_ref.get("source_title") or f"{ov_org}海外经历来源"),
                         url=str(ev_ref.get("source_url") or "") or None,
                         source_kind="overseas_factual_index",
-                        published_at=str(ev_ref.get("captured_at") or "")[:10] or None,
+                        published_at=pub_d,
+                        captured_at=cap_d,
                     )
                 else:
                     idx = _register_citation_obj(cit_reg, ev_ref, default_label=f"{ov_org}海外经历来源")
@@ -1193,7 +1205,11 @@ def _render_wiki_v241_card(
     # 4c. Youth National Tenures (## 国字号及青年赛事经历)
     raw_youth = payload.get("youth_national_tenures")
     if isinstance(raw_youth, (list, tuple)) and raw_youth:
-        from .youth_tenure import YOUTH_STAGE_LABELS_ZH
+        from .youth_tenure import (
+            YOUTH_ORGANIZER_TIER_LABELS_ZH,
+            YOUTH_STAGE_LABELS_ZH,
+            infer_organizer_tier,
+        )
 
         youth_lines: List[str] = []
         for yt in raw_youth:
@@ -1201,7 +1217,14 @@ def _render_wiki_v241_card(
                 continue
             yt_year = str(yt.get("season_or_year") or "-").strip()
             yt_comp = str(yt.get("competition_or_program") or "-").strip()
+            yt_tier_code = str(yt.get("organizer_tier") or "").strip().upper() or infer_organizer_tier(yt_comp)
+            yt_tier_zh = (
+                str(yt.get("organizer_tier_label_zh") or "").strip()
+                or YOUTH_ORGANIZER_TIER_LABELS_ZH.get(yt_tier_code, "全国")
+            )
             yt_team = str(yt.get("team_or_unit") or "-").strip()
+            if yt_team in ("俱乐部青训参赛/集训单位", "青训参赛/集训单位"):
+                yt_team = "待核实代表队"
             yt_stage_code = str(yt.get("participation_stage") or "").strip()
             yt_stage_zh = (
                 YOUTH_STAGE_LABELS_ZH.get(yt_stage_code)
@@ -1216,11 +1239,14 @@ def _render_wiki_v241_card(
             ref_marks = []
             for ev_ref in yt.get("evidence_refs") or ():
                 if isinstance(ev_ref, Mapping):
+                    pub_d = str(ev_ref.get("published_at") or "").strip()[:10] or None
+                    cap_d = str(ev_ref.get("captured_at") or "").strip()[:10] or None
                     idx = cit_reg.register(
                         label=str(ev_ref.get("source_title") or f"{yt_comp}官方来源"),
                         url=str(ev_ref.get("source_url") or "") or None,
                         source_kind="federation_official",
-                        published_at=str(ev_ref.get("captured_at") or "")[:10] or None,
+                        published_at=pub_d,
+                        captured_at=cap_d,
                     )
                 else:
                     idx = _register_citation_obj(cit_reg, ev_ref, default_label=f"{yt_comp}官方来源")
@@ -1230,16 +1256,16 @@ def _render_wiki_v241_card(
                         ref_marks.append(mark)
             stats_part = f"｜{yt_stats}" if yt_stats else ""
             youth_lines.append(
-                f"- {yt_year} {yt_comp}（{yt_team}）：{yt_stage_zh}{stats_part}{''.join(ref_marks)}"
+                f"- {yt_year} {yt_comp}｜主办层级：{yt_tier_zh}｜代表队：{yt_team}｜参赛阶段：{yt_stage_zh}{stats_part}{''.join(ref_marks)}"
             )
         if youth_lines:
             lines.extend(["", "## 国字号及青年赛事经历", *youth_lines])
 
-    # 5. Registration & Contract Information (## 注册与合同信息)
+    # 5. Registration & Contract Information (## 注册与合同信息) — omitted for CHRONICLER
     dom_cur = reg_profile.get("domestic_current") if isinstance(reg_profile.get("domestic_current"), Mapping) else None
     dom_hist = reg_profile.get("domestic_history") if isinstance(reg_profile.get("domestic_history"), list) else []
     for_reg = reg_profile.get("foreign_registration") if isinstance(reg_profile.get("foreign_registration"), Mapping) else None
-    if dom_cur or for_reg or reg_profile.get("current_club"):
+    if not is_chronicler and (dom_cur or for_reg or reg_profile.get("current_club")):
         reg_lines: List[str] = []
         club_disp = str(
             (dom_cur or {}).get("club_official")
@@ -1281,6 +1307,8 @@ def _render_wiki_v241_card(
     if proj_stories is None:
         proj_stories = payload.get("story_records")
     if isinstance(proj_stories, (list, tuple)) and proj_stories:
+        from .story_record import cluster_and_merge_stories
+
         normalized_stories: List[Dict[str, Any]] = []
         for st_raw in proj_stories:
             if not isinstance(st_raw, Mapping):
@@ -1291,7 +1319,8 @@ def _render_wiki_v241_card(
                 if c_src_id:
                     st_copy["canonical_source_id"] = c_src_id
             normalized_stories.append(st_copy)
-        deduped_stories = dedup_reprints_and_preserve_discrepancies(normalized_stories)
+        clustered_stories = cluster_and_merge_stories(normalized_stories)
+        deduped_stories = dedup_reprints_and_preserve_discrepancies(clustered_stories)
         story_lines: List[str] = []
         for st_item in deduped_stories["canonical_items"]:
             c_src = st_item.get("canonical_source")
@@ -1318,13 +1347,66 @@ def _render_wiki_v241_card(
                 st_sum = _sanitize_public_free_text(raw_sum, fallback="-")
             else:
                 st_sum = raw_sum or "-"
-            ref_idx = _register_citation_obj(cit_reg, c_src, default_label=st_title)
-            ref_s = cit_reg.format_ref(ref_idx) if ref_idx is not None else ""
+            ref_marks: List[str] = []
+            sup_srcs = st_item.get("supporting_sources") or ([c_src] if c_src else [])
+            for src_obj in sup_srcs:
+                ref_idx = _register_citation_obj(cit_reg, src_obj, default_label=st_title)
+                if ref_idx is not None:
+                    mark = cit_reg.format_ref(ref_idx)
+                    if mark not in ref_marks:
+                        ref_marks.append(mark)
+            ref_s = "".join(ref_marks)
             story_lines.append(f"- [{st_season}] {st_title}：{st_sum}{ref_s}")
             if not is_public and st_item.get("internal_verbatim_or_note"):
                 story_lines.append(f"  * 内部摘录：{st_item['internal_verbatim_or_note']}")
         if story_lines:
             lines.extend(["", "## 人物故事与关键事件", *story_lines])
+
+    # 6b. Social Media & Daily Updates (## 社交媒体与日常动态)
+    social_sec = payload.get("social_section")
+    if isinstance(social_sec, Mapping):
+        s_accounts = social_sec.get("accounts") or []
+        s_posts = social_sec.get("posts") or []
+        if s_accounts or s_posts:
+            social_lines: List[str] = []
+            if s_accounts:
+                social_lines.append("### 已核验社媒账号名片")
+                for acc in s_accounts:
+                    if not isinstance(acc, Mapping):
+                        continue
+                    plat = "抖音" if str(acc.get("platform") or "").upper() == "DOUYIN" else "小红书"
+                    handle = str(acc.get("account_handle_or_id") or "-").strip()
+                    badge = str(acc.get("verification_badge") or "人工核验").strip()
+                    url = str(acc.get("clean_profile_url") or "").strip()
+                    focus = str(acc.get("content_focus_summary") or "").strip()
+                    link_part = f"[{handle}]({url})" if url else handle
+                    focus_part = f"｜内容看点：{focus}" if focus else ""
+                    social_lines.append(f"- {plat}：{link_part}（{badge}）{focus_part}")
+            if s_posts:
+                social_lines.append("### 精选职业动态时间线")
+                for sp in s_posts:
+                    if not isinstance(sp, Mapping):
+                        continue
+                    p_date = str(sp.get("published_at") or "-")[:10]
+                    cat_zh = str(sp.get("topic_category_zh") or sp.get("topic_category") or "动态")
+                    tag = str(sp.get("epistemic_tag") or "[本人社媒动态 · SELF_STATEMENT]")
+                    quote = str(sp.get("summary_or_quote") or "").strip()
+                    p_url = str(sp.get("clean_post_url") or "").strip()
+                    if is_public:
+                        quote = _sanitize_public_free_text(quote, fallback="-")
+                    ref_s = ""
+                    if p_url:
+                        idx = cit_reg.register(
+                            label=f"社媒动态（{cat_zh}）",
+                            url=p_url,
+                            source_kind="social_post",
+                            published_at=p_date if p_date != "-" else None,
+                        )
+                        if idx is not None:
+                            ref_s = cit_reg.format_ref(idx)
+                    social_lines.append(f"- [{p_date}] {tag}（{cat_zh}）：{quote}{ref_s}")
+            if social_lines:
+                lines.extend(["", "## 社交媒体与日常动态", *social_lines])
 
     # 7. Timeline & Multi-Source Observations (## 动态时间线)
     raw_timeline = payload.get("timeline_events")

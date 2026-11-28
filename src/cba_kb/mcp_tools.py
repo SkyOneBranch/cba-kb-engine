@@ -64,6 +64,7 @@ _ALL_DOSSIER_SECTIONS: Tuple[str, ...] = (
     "youth_national",
     "overseas",
     "stories",
+    "social",
     "references",
 )
 
@@ -112,7 +113,7 @@ TIERED_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "name": "get_person_dossier",
         "description": (
             "按 person_uid 或姓名获取人物结构化档案，并支持按需切片返回指定板块"
-            "（summary、bio、career_stats、recent_games、youth_national、overseas、stories、references）。"
+            "（summary、bio、career_stats、recent_games、youth_national、overseas、stories、social、references）。"
             "严格执行三级可见性物理隔离。"
         ),
         "inputSchema": {
@@ -153,8 +154,7 @@ TIERED_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "properties": {
                 "club": {
                     "type": "string",
-                    "default": "深圳",
-                    "description": "俱乐部名称、简称或 organization_id（默认：深圳）。",
+                    "description": "俱乐部名称、简称或 organization_id（多俱乐部数据集下必填）。",
                 },
                 "season": {
                     "type": "string",
@@ -242,9 +242,9 @@ TIERED_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "name": "verify_statement",
         "description": (
-            "对输入陈述按句拆分并与权威注册名单、赛季统计、教练三面视图、公开故事与国字号经历逐句核验，"
-            "输出四态核验结论（VERIFIED_MATCH / MULTI_SOURCE_DISCREPANCY / CONTRADICTS_CANONICAL_DATA / "
-            "UNVERIFIED_NO_BASIS）及溯源链接。仅 club_media 及以上档位返回受控原文引文锚点。"
+            "对输入陈述按句拆分并与权威注册名单、赛季统计、教练三面视图、公开故事、国字号经历与核验社媒动态逐句核验，"
+            "输出核验结论（VERIFIED_MATCH / MULTI_SOURCE_DISCREPANCY / CONTRADICTS_CANONICAL_DATA / "
+            "SELF_CLAIM_MATCH / UNVERIFIED_NO_BASIS）及溯源链接。仅 club_media 及以上档位返回受控原文引文锚点。"
         ),
         "inputSchema": {
             "type": "object",
@@ -386,8 +386,8 @@ def _sanitize_value_for_tier(value: Any, tier: str) -> Any:
                 continue
 
             cleaned_v = _sanitize_value_for_tier(v, tier)
-            if cleaned_v is None and isinstance(v, str):
-                # Stripped internal/filename string
+            if cleaned_v is None and isinstance(v, (str, dict)):
+                # Stripped internal/filename string or NEEDS_SOURCE/INTERNAL_CLUE nested dict
                 continue
             cleaned_dict[k] = cleaned_v
         return cleaned_dict
@@ -437,8 +437,37 @@ class KnowledgeDataset:
         coverage_ledger: Dict[str, Any],
         operational_checkpoint: Dict[str, Any],
         shenzhen_pilot_context: Dict[str, Any],
+        club_contexts: Optional[Dict[str, Dict[str, Any]]] = None,
+        social_profiles: Optional[List[Dict[str, Any]]] = None,
+        social_posts: Optional[List[Dict[str, Any]]] = None,
+        demand_ledger_path: Optional[Path | str] = None,
     ) -> None:
-        self.persons = persons
+        # Deduplicate persons by person_uid so cross-club shards never split lifetime PERS-*
+        dedup_persons: List[Dict[str, Any]] = []
+        person_by_uid: Dict[str, Dict[str, Any]] = {}
+        for p in persons:
+            if not isinstance(p, Mapping):
+                continue
+            uid = str(p.get("person_uid") or "").strip()
+            if not uid:
+                dedup_persons.append(dict(p))
+                continue
+            if uid not in person_by_uid:
+                p_copy = copy.deepcopy(dict(p))
+                person_by_uid[uid] = p_copy
+                dedup_persons.append(p_copy)
+            else:
+                existing = person_by_uid[uid]
+                ex_tenures = existing.setdefault("role_tenures", [])
+                for t in p.get("role_tenures") or ():
+                    if t not in ex_tenures:
+                        ex_tenures.append(copy.deepcopy(t))
+                ex_aliases = existing.setdefault("aliases", [])
+                for a in p.get("aliases") or ():
+                    if a not in ex_aliases:
+                        ex_aliases.append(a)
+
+        self.persons = dedup_persons
         self.bio_profiles = bio_profiles
         self.organizations = organizations
         self.master_rows = master_rows
@@ -453,12 +482,14 @@ class KnowledgeDataset:
         self.coverage_ledger = coverage_ledger
         self.operational_checkpoint = operational_checkpoint
         self.shenzhen_pilot_context = shenzhen_pilot_context
+        self.club_contexts = club_contexts if club_contexts is not None else (
+            {"ORG-CBA-SHENZHEN": dict(shenzhen_pilot_context)} if shenzhen_pilot_context else {}
+        )
+        self.social_profiles = list(social_profiles or [])
+        self.social_posts = list(social_posts or [])
+        self.demand_ledger_path = Path(demand_ledger_path) if demand_ledger_path is not None else None
 
-        self._person_by_uid: Dict[str, Dict[str, Any]] = {
-            str(p["person_uid"]): p
-            for p in self.persons
-            if isinstance(p, Mapping) and p.get("person_uid")
-        }
+        self._person_by_uid = person_by_uid
 
     @property
     def release_id(self) -> str:
@@ -481,7 +512,12 @@ class KnowledgeDataset:
         return len(self.persons) + len(self.organizations)
 
     @classmethod
-    def _from_file_map(cls, files: Mapping[str, bytes]) -> "KnowledgeDataset":
+    def _from_file_map(
+        cls,
+        files: Mapping[str, bytes],
+        *,
+        demand_ledger_path: Optional[Path | str] = None,
+    ) -> "KnowledgeDataset":
         persons: List[Dict[str, Any]] = []
         bio_profiles: Dict[str, Dict[str, Any]] = {}
         organizations: List[Dict[str, Any]] = []
@@ -497,6 +533,9 @@ class KnowledgeDataset:
         coverage_ledger: Dict[str, Any] = {}
         operational_checkpoint: Dict[str, Any] = {}
         shenzhen_pilot_context: Dict[str, Any] = {}
+        club_contexts: Dict[str, Dict[str, Any]] = {}
+        social_profiles: List[Dict[str, Any]] = []
+        social_posts: List[Dict[str, Any]] = []
 
         for rel_path in sorted(files.keys()):
             data = files[rel_path]
@@ -560,6 +599,24 @@ class KnowledgeDataset:
                 parsed = _parse_json_bytes(data)
                 if isinstance(parsed, dict):
                     shenzhen_pilot_context = parsed
+                    oid = str(parsed.get("organization_id") or "ORG-CBA-SHENZHEN")
+                    club_contexts.setdefault(oid, {}).update(parsed)
+            elif fname_low in ("club_context.json", "club_pack.json"):
+                parsed = _parse_json_bytes(data)
+                if isinstance(parsed, dict):
+                    oid = str(parsed.get("organization_id") or "").strip()
+                    if not oid and len(posix.parts) >= 2:
+                        oid = posix.parts[-2]
+                    if oid:
+                        club_contexts.setdefault(oid, {}).update(parsed)
+            elif fname_low == "social_profiles.json":
+                parsed = _parse_json_bytes(data)
+                if isinstance(parsed, dict) and isinstance(parsed.get("profiles"), list):
+                    social_profiles.extend(p for p in parsed["profiles"] if isinstance(p, dict))
+                elif isinstance(parsed, list):
+                    social_profiles.extend(p for p in parsed if isinstance(p, dict))
+            elif fname_low in ("social_posts.jsonl", "social_posts.json"):
+                social_posts.extend(_parse_json_or_jsonl_bytes(data))
 
         return cls(
             persons=persons,
@@ -577,10 +634,19 @@ class KnowledgeDataset:
             coverage_ledger=coverage_ledger,
             operational_checkpoint=operational_checkpoint,
             shenzhen_pilot_context=shenzhen_pilot_context,
+            club_contexts=club_contexts,
+            social_profiles=social_profiles,
+            social_posts=social_posts,
+            demand_ledger_path=demand_ledger_path,
         )
 
     @classmethod
-    def from_data_dir(cls, data_dir: Path | str) -> "KnowledgeDataset":
+    def from_data_dir(
+        cls,
+        data_dir: Path | str,
+        *,
+        demand_ledger_path: Optional[Path | str] = None,
+    ) -> "KnowledgeDataset":
         root = Path(data_dir)
         if not root.is_dir():
             raise ValueError(f"DATA_DIR_NOT_FOUND: {root}")
@@ -592,7 +658,20 @@ class KnowledgeDataset:
             if _is_forbidden_bundle_path(rel):
                 continue
             files[rel] = path.read_bytes()
-        return cls._from_file_map(files)
+        return cls._from_file_map(files, demand_ledger_path=demand_ledger_path)
+
+    @classmethod
+    def from_sharded_dir(
+        cls,
+        shard_dir: Path | str,
+        *,
+        clubs: Optional[Sequence[str]] = None,
+        demand_ledger_path: Optional[Path | str] = None,
+    ) -> "KnowledgeDataset":
+        from .club_sharding import load_sharded_file_map
+
+        files = load_sharded_file_map(shard_dir, clubs=clubs)
+        return cls._from_file_map(files, demand_ledger_path=demand_ledger_path)
 
     @classmethod
     def from_bundle_tarball(
@@ -756,7 +835,7 @@ class KnowledgeDataset:
                 "visibility": tier_visibility(tier),
                 "quote_spans_allowed": tier_allows_quote_spans(tier),
                 "internal_clues_allowed": tier_allows_internal(tier),
-                "full_game_logs_filter": tier_allows_internal(tier),
+                "full_game_logs_filter": tier != "public",
             },
         }
 
@@ -847,6 +926,15 @@ class KnowledgeDataset:
                 matches = narrowed
 
         if not matches:
+            if self.demand_ledger_path is not None:
+                from .demand_ledger import record_demand_miss
+
+                record_demand_miss(
+                    self.demand_ledger_path,
+                    query_key=query,
+                    miss_reason="ENTITY_NOT_FOUND",
+                    club_hint=club_hint or None,
+                )
             return {
                 "status": "NOT_FOUND",
                 "matches": [],
@@ -1004,6 +1092,17 @@ class KnowledgeDataset:
         if "stories" in sections:
             result["stories"] = person_stories
 
+        if "social" in sections:
+            from .social_workbench import project_social_for_person
+
+            social_vis = "public_safe" if tier == "public" else "internal_full"
+            result["social"] = project_social_for_person(
+                uid,
+                profiles=self.social_profiles,
+                posts=self.social_posts,
+                visibility=social_vis,
+            )
+
         if "references" in sections:
             ref_sources = [person, bio, stats_rows, overseas_rows, youth_rows, person_stories]
             result["references"] = _extract_https_urls(ref_sources)
@@ -1019,8 +1118,32 @@ class KnowledgeDataset:
         auth_context: AuthContext,
     ) -> Dict[str, Any]:
         tier = auth_context.effective_tier
-        club_query = str(arguments.get("club") or "深圳").strip()
+        club_query = str(arguments.get("club") or "").strip()
         season = str(arguments.get("season") or "").strip()
+
+        if not club_query:
+            if len(self.organizations) == 1:
+                only_org = self.organizations[0]
+                club_query = str(
+                    only_org.get("short_name")
+                    or only_org.get("canonical_name")
+                    or only_org.get("organization_id")
+                    or ""
+                ).strip()
+            else:
+                return {
+                    "status": "CLUB_PARAMETER_REQUIRED",
+                    "message": "多俱乐部数据集下请指定 club 参数（如 深圳、广东 或 organization_id）。",
+                    "available_clubs": [
+                        {
+                            "organization_id": o.get("organization_id"),
+                            "canonical_name": o.get("canonical_name"),
+                            "short_name": o.get("short_name"),
+                        }
+                        for o in self.organizations
+                    ],
+                    "effective_tier": tier,
+                }
 
         club_display, org_id, _ = self._resolve_club_info(club_query)
 
@@ -1454,6 +1577,44 @@ class KnowledgeDataset:
                             claim_out["quote_anchors"] = copy.deepcopy(s["quote_anchors"])
                         return claim_out
 
+            # 2e) Social post self-claim check (SELF_CLAIM_MATCH)
+            for sp in self.social_posts:
+                if str(sp.get("person_uid") or "") != uid:
+                    continue
+                if str(sp.get("status") or "ACTIVE").upper() == "WITHDRAWN":
+                    continue
+                ep_kind = str(sp.get("epistemic_source_kind") or "").upper()
+                if ep_kind == "DERIVED_TRANSCRIPT" and not sp.get("transcript_human_confirmed"):
+                    if tier == "public":
+                        continue
+                sp_text = str(sp.get("summary_or_quote") or "")
+                sent_clean = re.sub(r"\s+", "", sentence)
+                sp_clean = re.sub(r"\s+", "", sp_text)
+                if len(sent_clean) >= 4 and len(sp_clean) >= 4:
+                    sent_grams = {sent_clean[i : i + 2] for i in range(len(sent_clean) - 1)}
+                    sp_grams = {sp_clean[i : i + 2] for i in range(len(sp_clean) - 1)}
+                    overlap = len(sent_grams & sp_grams) / max(1, len(sent_grams))
+                    if overlap >= 0.35:
+                        cat = str(sp.get("topic_category") or "").upper()
+                        if self.demand_ledger_path is not None and cat in (
+                            "INJURY_RECOVERY",
+                            "SIGNING_DEPARTURE_NOTE",
+                        ):
+                            from .demand_ledger import record_demand_miss
+
+                            record_demand_miss(
+                                self.demand_ledger_path,
+                                query_key=f"{person.get('canonical_name', '')}:{cat}",
+                                miss_reason="SOCIAL_EARLY_SIGNAL_UNCONFIRMED_OFFICIALLY",
+                                signal_kind=cat,
+                            )
+                        return {
+                            "sentence": sentence,
+                            "verdict": "SELF_CLAIM_MATCH",
+                            "reason": "该说法与当事人在核验社媒发布的个人动态一致（SELF_STATEMENT），但尚无 CBA 官方或俱乐部公告确认，引用时须注明系本人社媒表态。",
+                            "citations": [str(sp.get("clean_post_url") or "")],
+                        }
+
         # 3) Fallback: no canonical basis
         return {
             "sentence": sentence,
@@ -1498,6 +1659,8 @@ class KnowledgeDataset:
             overall = "MULTI_SOURCE_DISCREPANCY"
         elif all(v == "VERIFIED_MATCH" for v in verdicts):
             overall = "VERIFIED_MATCH"
+        elif "SELF_CLAIM_MATCH" in verdicts:
+            overall = "SELF_CLAIM_MATCH"
         else:
             overall = "UNVERIFIED_NO_BASIS"
 

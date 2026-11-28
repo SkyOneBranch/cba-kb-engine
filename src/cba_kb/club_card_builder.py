@@ -353,8 +353,12 @@ def build_club_panorama_card(
             all_members_set.add(c_nm)
 
     if isinstance(person_registry, Mapping):
+        from .person_registry import classify_person_category
+
         for p_entry in person_registry.get("persons") or ():
             if not isinstance(p_entry, Mapping):
+                continue
+            if classify_person_category(p_entry) == "CHRONICLER":
                 continue
             cname = str(p_entry.get("canonical_name") or "").strip()
             if not cname:
@@ -745,6 +749,7 @@ def build_club_panorama_card(
         "club_query": club_query.strip(),
         "organization_id": organization_id,
         "club_name": club_name,
+        "short_name": short_name,
         "seasons": season_list,
         "visibility": vis,
         "card_style": style,

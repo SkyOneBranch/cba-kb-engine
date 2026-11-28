@@ -376,6 +376,12 @@ def _bundle_allowlisted_exact_names() -> frozenset[str]:
         "youth_national_tenures.jsonl",
         "shenzhen_pilot_context.json",
         "coach_role_facets.json",
+        "club_context.json",
+        "club_pack.json",
+        "shard_manifest.json",
+        "social_profiles.json",
+        "social_posts.jsonl",
+        "demand_ledger.jsonl",
     })
 
 
@@ -453,6 +459,11 @@ def _is_bundle_member_allowed(rel_posix: str, allowlisted_exact_names: frozenset
 
     # Explicit exclusions (fail-closed)
     name_lower = name.lower()
+    if any(
+        name_lower.endswith(ext)
+        for ext in (".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".mp3", ".wav", ".m4a", ".aac")
+    ):
+        return False
     if name_lower == "production.json":
         return False
     if name_lower == "mcp_acl.json" or name_lower.startswith("mcp_acl"):
@@ -1340,4 +1351,83 @@ class R2CloudStateStore:
             "size_bytes": len(raw),
             "extracted_count": len(staged),
             "files": [rel for rel, _, _ in staged],
+        }
+
+    def push_sharded_bundle(
+        self,
+        source_dir: Union[str, Path],
+        *,
+        prefix: str = "cloud_instance/sharded/",
+    ) -> Dict[str, Any]:
+        """Build deterministic shard_manifest + shared_core + per-club shards and upload."""
+        from .club_sharding import build_sharded_bundle
+
+        norm_prefix = _normalize_prefix(prefix)
+        with tempfile.TemporaryDirectory() as tmp_d:
+            tmp_root = Path(tmp_d)
+            manifest = build_sharded_bundle(source_dir, tmp_root)
+            uploaded: List[str] = []
+            for path in sorted(tmp_root.rglob("*")):
+                if not path.is_file():
+                    continue
+                rel = path.relative_to(tmp_root).as_posix()
+                key = f"{norm_prefix}{rel}"
+                ctype = "application/json; charset=utf-8" if rel.endswith(".json") else "application/gzip"
+                self.put_bytes(key, path.read_bytes(), content_type=ctype)
+                uploaded.append(key)
+        return {
+            "prefix": norm_prefix,
+            "manifest": manifest,
+            "uploaded_keys": uploaded,
+        }
+
+    def pull_sharded_bundle(
+        self,
+        local_dir: Union[str, Path],
+        *,
+        prefix: str = "cloud_instance/sharded/",
+        clubs: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        """Pull shard_manifest, shared_core, and selected club shards with SHA-256 check."""
+        norm_prefix = _normalize_prefix(prefix)
+        manifest = self.get_json(f"{norm_prefix}shard_manifest.json")
+        if not isinstance(manifest, dict) or manifest.get("schema") != "cba-kb.shard-manifest.v1":
+            raise CloudStateIntegrityError("R2_SHARD_MANIFEST_INVALID")
+
+        out_root = Path(local_dir)
+        out_root.mkdir(parents=True, exist_ok=True)
+        atomic(
+            out_root / "shard_manifest.json",
+            (json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+        )
+
+        core_meta = manifest["shared_core"]
+        core_bytes = self.get_bytes(
+            f"{norm_prefix}{core_meta['path']}",
+            expected_sha256=core_meta.get("sha256"),
+        )
+        if core_bytes is None:
+            raise FileNotFoundError("R2_SHARD_CORE_NOT_FOUND")
+        atomic(out_root / core_meta["path"], core_bytes)
+
+        shards_meta = manifest.get("shards") or {}
+        target_clubs = list(clubs) if clubs else sorted(shards_meta.keys())
+        pulled_clubs: List[str] = []
+        for cid in target_clubs:
+            if cid not in shards_meta:
+                raise FileNotFoundError(f"R2_CLUB_SHARD_NOT_FOUND:{cid}")
+            s_meta = shards_meta[cid]
+            s_bytes = self.get_bytes(
+                f"{norm_prefix}{s_meta['path']}",
+                expected_sha256=s_meta.get("sha256"),
+            )
+            if s_bytes is None:
+                raise FileNotFoundError(f"R2_CLUB_SHARD_NOT_FOUND:{cid}")
+            atomic(out_root / s_meta["path"], s_bytes)
+            pulled_clubs.append(cid)
+
+        return {
+            "local_dir": str(out_root),
+            "clubs": pulled_clubs,
+            "prefix": norm_prefix,
         }

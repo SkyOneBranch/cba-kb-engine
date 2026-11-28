@@ -464,6 +464,10 @@ _WIKI_ROLE_ZH: Dict[str, str] = {
     "PLAYER": "球员",
     "STAFF": "教练组成员",
     "EXECUTIVE": "俱乐部管理层",
+    "CHRONICLER": "媒体记录者",
+    "JOURNALIST": "媒体记录者",
+    "REPORTER": "媒体记录者",
+    "MEDIA_CHRONICLER": "媒体记录者",
 }
 _WIKI_PLACEHOLDER_VALUES = frozenset({"", "0", "-", "none", "null", "unknown", "unassigned", "observed_empty"})
 _WIKI_PID_RE = re.compile(r"\bpid_[0-9a-f]{16,64}\b", re.IGNORECASE)
@@ -596,6 +600,7 @@ def compose_wiki_lead_paragraph(
     career_season_stats: Optional[Mapping[str, Any] | Sequence[Mapping[str, Any]]] = None,
     projected_stories: Optional[Sequence[Mapping[str, Any]]] = None,
     citation_registry: Optional[Any] = None,
+    entity_role: Optional[str] = None,
     min_chars: int = 80,
     max_chars: int = 180,
     visibility: str = "public_safe",
@@ -707,19 +712,25 @@ def compose_wiki_lead_paragraph(
     reg_gp = reg_summary.get("games_played") if isinstance(reg_summary, Mapping) else None
     has_played_games = isinstance(reg_gp, (int, float)) and reg_gp > 0
 
-    # Classify into one of 4 canonical lead templates (REQ-242 P0-E4)
+    # Classify into one of 5 canonical lead templates (REQ-242 P0-E4 + REQ-251 MEDIA_CHRONICLER)
+    eff_role_up = str(entity_role or current_role_raw or "").strip().upper()
+    is_chronicler = eff_role_up in {"CHRONICLER", "JOURNALIST", "REPORTER", "MEDIA_CHRONICLER"}
     is_coach_template = bool(
-        coach_role_zh and (facets_list or any(k in coach_role_zh for k in ("教练", "主帅")))
+        not is_chronicler
+        and coach_role_zh
+        and (facets_list or any(k in coach_role_zh for k in ("教练", "主帅")))
     )
     is_departed_or_staged = bool(
-        not is_coach_template
+        not is_chronicler
+        and not is_coach_template
         and (
             is_departed_club_token
             or roster_status in _DEPARTED_ROSTER_STATUSES
         )
     )
     is_rookie_or_unplayed = bool(
-        not is_coach_template
+        not is_chronicler
+        and not is_coach_template
         and not is_departed_or_staged
         and not has_played_games
         and (
@@ -728,7 +739,9 @@ def compose_wiki_lead_paragraph(
         )
     )
 
-    if is_coach_template:
+    if is_chronicler:
+        lead_template = "MEDIA_CHRONICLER"
+    elif is_coach_template:
         lead_template = "COACH_OR_TRANSITIONED_HEAD_COACH"
     elif is_departed_or_staged:
         lead_template = "DEPARTED_OR_STAGED_PLAYER"
@@ -763,7 +776,13 @@ def compose_wiki_lead_paragraph(
         paren_parts.append(f"{birth_place}人")
 
     c1_parts: List[str] = [f"{name}（{'，'.join(paren_parts)}）" if paren_parts else name]
-    if lead_template == "COACH_OR_TRANSITIONED_HEAD_COACH":
+    if lead_template == "MEDIA_CHRONICLER":
+        outlet = _clean_wiki_field(bio.get("media_outlet") or bio.get("organization_name") or club)
+        if outlet:
+            c1_parts.append(f"体育媒体记者/专栏作者（供职于{outlet}），长期跟踪报道CBA及俱乐部赛事动态")
+        else:
+            c1_parts.append("体育媒体记者/专栏作者，长期跟踪报道CBA及俱乐部赛事动态")
+    elif lead_template == "COACH_OR_TRANSITIONED_HEAD_COACH":
         if club:
             c1_parts.append(f"现担任{club}{coach_role_zh}")
         else:

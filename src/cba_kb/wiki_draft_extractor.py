@@ -27,6 +27,7 @@ from .overseas_tenure import (
     validate_overseas_tenure,
 )
 from .person_registry import validate_person_registry
+from .story_record import is_hollow_story_template
 from .youth_tenure import (
     YOUTH_NATIONAL_TENURE_SCHEMA,
     YouthTenureError,
@@ -200,8 +201,12 @@ def verify_quote_anchor(
 
     norm_evidence = _normalize_whitespace(evidence_text)
     norm_span = _normalize_whitespace(quote_span)
-    if not norm_span or norm_span not in norm_evidence:
+    if not norm_span:
         return False, "QUOTE_SPAN_NOT_FOUND_IN_EVIDENCE"
+    if norm_span not in norm_evidence:
+        cjk_ws_re = re.compile(r"(?<=[\u4e00-\u9fff，。！？；：、（）])\s+(?=[\u4e00-\u9fff，。！？；：、（）])")
+        if cjk_ws_re.sub("", norm_span) not in cjk_ws_re.sub("", norm_evidence):
+            return False, "QUOTE_SPAN_NOT_FOUND_IN_EVIDENCE"
     return True, None
 
 
@@ -347,6 +352,44 @@ def verify_candidate_anchors(
         "anchor_verification_errors": all_errors,
         "verified_count": len(approvable),
         "failed_count": len(rejected),
+    }
+
+
+def adjudicate_sourced_candidates(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    evidence_index: Mapping[str, bytes],
+) -> Dict[str, Any]:
+    """Engine-side adjudication: promote `SOURCED_CANDIDATE` -> `VERIFIED` only when
+    anchors verify and content is non-hollow."""
+    anchor_report = verify_candidate_anchors(candidates, evidence_index=evidence_index)
+    verified: List[Dict[str, Any]] = []
+    rejected: List[Dict[str, Any]] = list(anchor_report["rejected_candidates"])
+
+    for cand in anchor_report["approvable_candidates"]:
+        item = dict(cand)
+        texts = [
+            item.get("title"),
+            item.get("summary"),
+            item.get("organization_summary"),
+            *(
+                p.get("public_perspective_summary")
+                for p in (item.get("participants") or ())
+                if isinstance(p, Mapping)
+            ),
+        ]
+        if any(is_hollow_story_template(t) for t in texts):
+            item["review_status"] = "REJECTED_HOLLOW_TEMPLATE"
+            rejected.append(item)
+            continue
+        item["review_status"] = "VERIFIED"
+        verified.append(item)
+
+    return {
+        "verified_records": verified,
+        "rejected_records": rejected,
+        "verified_count": len(verified),
+        "rejected_count": len(rejected),
     }
 
 
