@@ -28,6 +28,7 @@ PARTICIPANT_ROLES = frozenset({
     "CO_PARTICIPANT",
 })
 STORY_ID_RE = re.compile(r"story_[0-9a-f]{24}\Z")
+_QUOTE_ANCHOR_SHA256_RE = re.compile(r"^[0-9a-f]{64}\Z")
 
 
 class StoryRecordError(ValueError):
@@ -162,6 +163,26 @@ def _validate_participant(participant: Any) -> Dict[str, Any]:
     }
 
 
+def _validate_quote_anchor(anchor: Any) -> Dict[str, str]:
+    if not isinstance(anchor, Mapping):
+        raise StoryRecordError("QUOTE_ANCHOR_OBJECT_REQUIRED")
+    quote_span = _required_str(anchor.get("quote_span"), "QUOTE_SPAN")
+    author_or_outlet = _required_str(anchor.get("author_or_outlet"), "AUTHOR_OR_OUTLET")
+    canonical_url = _required_str(anchor.get("canonical_url"), "CANONICAL_URL")
+    parsed = urlsplit(canonical_url)
+    if parsed.scheme.lower() != "https" or not parsed.netloc:
+        raise StoryRecordError("QUOTE_ANCHOR_CANONICAL_URL_HTTPS_REQUIRED")
+    raw_sha = _required_str(anchor.get("raw_sha256"), "QUOTE_ANCHOR_RAW_SHA256").lower()
+    if not _QUOTE_ANCHOR_SHA256_RE.fullmatch(raw_sha):
+        raise StoryRecordError("QUOTE_ANCHOR_RAW_SHA256_INVALID")
+    return {
+        "quote_span": quote_span,
+        "author_or_outlet": author_or_outlet,
+        "canonical_url": canonical_url,
+        "raw_sha256": raw_sha,
+    }
+
+
 def validate_story_record(record: Mapping[str, Any]) -> Dict[str, Any]:
     """Validate and normalize a `cba-kb.story-record.v1` record."""
     if not isinstance(record, Mapping):
@@ -219,7 +240,7 @@ def validate_story_record(record: Mapping[str, Any]) -> Dict[str, Any]:
         record.get("organization_summary"), "ORGANIZATION_SUMMARY"
     )
 
-    return {
+    out: Dict[str, Any] = {
         "schema": STORY_RECORD_SCHEMA,
         "story_id": story_id,
         "title": title,
@@ -233,6 +254,12 @@ def validate_story_record(record: Mapping[str, Any]) -> Dict[str, Any]:
         "organization_summary": organization_summary,
         "visibility_policy": visibility_policy,
     }
+    if "quote_anchors" in record and record.get("quote_anchors") is not None:
+        raw_anchors = record.get("quote_anchors")
+        if isinstance(raw_anchors, (str, bytes)) or not isinstance(raw_anchors, Sequence):
+            raise StoryRecordError("QUOTE_ANCHORS_LIST_REQUIRED")
+        out["quote_anchors"] = [_validate_quote_anchor(a) for a in raw_anchors]
+    return out
 
 
 def make_story_record(
@@ -247,6 +274,7 @@ def make_story_record(
     occurred_date: Optional[str] = None,
     deduped_reprints: Sequence[Any] = (),
     visibility_policy: Optional[Mapping[str, Any]] = None,
+    quote_anchors: Optional[Sequence[Mapping[str, Any]]] = None,
     story_id: Optional[str] = None,
     schema: str = STORY_RECORD_SCHEMA,
 ) -> Dict[str, Any]:
@@ -261,7 +289,7 @@ def make_story_record(
         if visibility_policy is not None
         else {"public_export_allowed": False}
     )
-    return validate_story_record({
+    payload: Dict[str, Any] = {
         "schema": schema,
         "story_id": resolved_story_id,
         "title": title,
@@ -274,7 +302,10 @@ def make_story_record(
         "organization_ids": list(organization_ids),
         "organization_summary": organization_summary,
         "visibility_policy": policy,
-    })
+    }
+    if quote_anchors is not None:
+        payload["quote_anchors"] = list(quote_anchors)
+    return validate_story_record(payload)
 
 
 def _is_public_export_allowed(story: Mapping[str, Any]) -> bool:
@@ -380,6 +411,8 @@ def project_stories_for_entity(
                 }
                 if visibility == "internal_full":
                     entry["internal_verbatim_or_note"] = participant["internal_verbatim_or_note"]
+                    if "quote_anchors" in story:
+                        entry["quote_anchors"] = [dict(a) for a in story["quote_anchors"]]
                 projected.append(entry)
         else:
             if clean_entity_id not in story["organization_ids"]:
@@ -412,7 +445,7 @@ def project_stories_for_entity(
                 primary_summary or initiator_summary or interviewee_summary or first_summary
             )
 
-            projected.append({
+            org_entry: Dict[str, Any] = {
                 "story_id": story["story_id"],
                 "title": story["title"],
                 "occurred_season": story["occurred_season"],
@@ -427,7 +460,10 @@ def project_stories_for_entity(
                 "canonical_source": source_payload,
                 "deduped_reprints_count": len(story["deduped_reprints"]),
                 "visibility": visibility,
-            })
+            }
+            if visibility == "internal_full" and "quote_anchors" in story:
+                org_entry["quote_anchors"] = [dict(a) for a in story["quote_anchors"]]
+            projected.append(org_entry)
 
     projected.sort(
         key=lambda item: (

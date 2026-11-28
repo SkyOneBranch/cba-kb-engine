@@ -305,6 +305,26 @@ def _discover_instance_inputs(instance: Instance) -> Dict[str, Any]:
         except (OSError, ValueError):
             pass
 
+    # 9. Overseas tenures (D-01 factual index, REQ-250)
+    overseas_tenures: List[Dict[str, Any]] = []
+    for ov_candidate in (
+        instance.data_root / "person_overseas_tenures.jsonl",
+        instance.data_root / "person_overseas_tenures.json",
+    ):
+        if ov_candidate.is_file():
+            overseas_tenures = _read_json_or_jsonl(ov_candidate)
+            break
+
+    # 10. Youth national tenures (4-state enum, REQ-250)
+    youth_national_tenures: List[Dict[str, Any]] = []
+    for yt_candidate in (
+        instance.data_root / "youth_national_tenures.jsonl",
+        instance.data_root / "youth_national_tenures.json",
+    ):
+        if yt_candidate.is_file():
+            youth_national_tenures = _read_json_or_jsonl(yt_candidate)
+            break
+
     return {
         "master_rows": master_rows,
         "foreign_rows": foreign_rows,
@@ -315,6 +335,8 @@ def _discover_instance_inputs(instance: Instance) -> Dict[str, Any]:
         "negative_receipts": negative_receipts,
         "data_cutoff": data_cutoff,
         "coverage_ledger": coverage_ledger,
+        "overseas_tenures": overseas_tenures,
+        "youth_national_tenures": youth_national_tenures,
     }
 
 
@@ -1525,6 +1547,8 @@ def build_person_card(
     encyclopedia_clues: Optional[Sequence[Mapping[str, Any]]] = None,
     bio_profile: Optional[Any] = None,
     person_bio_profiles: Optional[Mapping[str, Any]] = None,
+    overseas_tenures: Optional[Sequence[Mapping[str, Any]]] = None,
+    youth_national_tenures: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Assemble and render an on-demand research card for any player in local KB.
 
@@ -1887,6 +1911,37 @@ def build_person_card(
         if encyclopedia_clues is not None:
             payload["encyclopedia_clues"] = list(encyclopedia_clues)
 
+        raw_overseas = (
+            list(overseas_tenures)
+            if overseas_tenures is not None
+            else list(discovered.get("overseas_tenures") or [])
+        )
+        raw_youth = (
+            list(youth_national_tenures)
+            if youth_national_tenures is not None
+            else list(discovered.get("youth_national_tenures") or [])
+        )
+        entity_uid_for_tenures = (
+            resolved_person_uid
+            or str(person.get("person_uid") or "").strip()
+        )
+        if entity_uid_for_tenures and raw_overseas:
+            from .overseas_tenure import project_overseas_tenures_for_person
+
+            payload["overseas_tenures"] = project_overseas_tenures_for_person(
+                raw_overseas,
+                entity_uid_for_tenures,
+                visibility=vis,
+            )
+        if entity_uid_for_tenures and raw_youth:
+            from .youth_tenure import project_youth_tenures_for_person
+
+            payload["youth_national_tenures"] = project_youth_tenures_for_person(
+                raw_youth,
+                entity_uid_for_tenures,
+                visibility=vis,
+            )
+
     if style == "wiki_v241":
         # Resolve bio_profile (enforce P0-E6 v2 provenance gate fail-closed)
         if bio_profile is not None:
@@ -2076,6 +2131,8 @@ def build_person_card(
         result["overall_verification_status"] = overall_verification_status
         result["projected_stories"] = list(payload.get("projected_stories") or [])
         result["registration_profile"] = reg_profile
+        result["overseas_tenures"] = list(payload.get("overseas_tenures") or [])
+        result["youth_national_tenures"] = list(payload.get("youth_national_tenures") or [])
     if obs_horizon is not None:
         result["observation_horizon"] = obs_horizon
     return result

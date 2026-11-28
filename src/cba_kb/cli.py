@@ -523,8 +523,21 @@ def main():
     q.add_argument('--sources-dir',type=Path,required=True)
     q.add_argument('--person-registry',type=Path,required=True)
     q.add_argument('--output',type=Path,required=True)
+    q.add_argument('--verify-anchors',action='store_true',default=True)
+    q.add_argument('--no-verify-anchors',action='store_false',dest='verify_anchors')
+    q.add_argument('--evidence-dir',type=Path,default=None)
+    q.add_argument('--candidates-file',type=Path,default=None)
     q=sub.add_parser('mcp-serve')
     q.add_argument('--season',default='2026-2027')
+    q.add_argument('--legacy-snowball',action='store_true',default=False)
+    q.add_argument('--transport',choices=('stdio','streamable-http'),default='stdio')
+    q.add_argument('--data-dir',type=Path,default=None)
+    q.add_argument('--bundle-tarball',type=Path,default=None)
+    q.add_argument('--host',default='127.0.0.1')
+    q.add_argument('--port',type=int,default=8765)
+    q.add_argument('--path',default='/mcp')
+    q.add_argument('--acl',type=Path,default=None)
+    q.add_argument('--audit-log',type=Path,default=None)
     q=sub.add_parser('plan'); q.add_argument('--entries',type=Path,required=True); q.add_argument('--release-id',required=True)
     q.add_argument('--status-id',required=True); q.add_argument('--archive-id',required=True)
     q.add_argument('--dependencies',type=Path);q.add_argument('--environment',choices=['sandbox','production'],default='sandbox')
@@ -2402,18 +2415,44 @@ def main():
                 save(a.output, result)
         elif a.command == 'draft-wiki-candidates':
             from .wiki_draft_extractor import extract_wiki_candidates
+            candidate_records = None
+            if getattr(a, 'candidates_file', None) is not None:
+                candidate_records = json.loads(a.candidates_file.read_text(encoding='utf-8'))
             result = extract_wiki_candidates(
                 sources_dir=a.sources_dir,
                 person_registry=a.person_registry,
                 output_path=a.output,
+                verify_anchors=bool(getattr(a, 'verify_anchors', True)),
+                evidence_dir=getattr(a, 'evidence_dir', None),
+                candidate_records=candidate_records,
             )
         elif a.command == 'mcp-serve':
-            from .cloud_state import R2CloudStateStore, R2Config
-            from .mcp_server import SnowballMCPServer
-            from .snowball_orchestrator import SnowballOrchestrator
-            store = R2CloudStateStore(R2Config.from_env())
-            orch = SnowballOrchestrator(state_store=store)
-            SnowballMCPServer(orch).serve_stdio()
+            if a.legacy_snowball or (a.data_dir is None and a.bundle_tarball is None):
+                from .cloud_state import R2CloudStateStore, R2Config
+                from .mcp_server import SnowballMCPServer
+                from .snowball_orchestrator import SnowballOrchestrator
+                store = R2CloudStateStore(R2Config.from_env())
+                orch = SnowballOrchestrator(state_store=store)
+                SnowballMCPServer(orch).serve_stdio()
+                stage(a.command, 'done')
+                return
+            if a.data_dir is not None and a.bundle_tarball is not None:
+                raise ValueError('Specify either --data-dir or --bundle-tarball, not both')
+            from .mcp_auth import MCPAuditLogger, load_mcp_acl
+            from .mcp_http import serve_streamable_http
+            from .mcp_server import TieredKnowledgeMCPServer
+            from .mcp_tools import KnowledgeDataset
+            if a.bundle_tarball is not None:
+                dataset = KnowledgeDataset.from_bundle_tarball(a.bundle_tarball)
+            else:
+                dataset = KnowledgeDataset.from_data_dir(a.data_dir)
+            acl = load_mcp_acl(acl_path=a.acl)
+            audit_logger = MCPAuditLogger(audit_log_path=a.audit_log) if a.audit_log is not None else None
+            server = TieredKnowledgeMCPServer(dataset, acl=acl, audit_logger=audit_logger)
+            if a.transport == 'streamable-http':
+                serve_streamable_http(server, acl, host=a.host, port=a.port, path=a.path)
+            else:
+                server.serve_stdio()
             stage(a.command, 'done')
             return
         elif a.command=='plan':
