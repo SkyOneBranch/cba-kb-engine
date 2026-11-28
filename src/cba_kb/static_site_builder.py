@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .kc_visibility import validate_card_visibility, verify_public_safe_card_text
+from .person_registry import CHRONICLER_ROLES, format_role_zh
 
 _SLUG_SAFE_RE = re.compile(r"[^a-z0-9_-]+")
 _URL_RE = re.compile(r"https?://[^\s<>\"')，。；：！？（）【】、]+")
@@ -105,10 +106,12 @@ def _extract_and_validate_citations(
                 c_url = str(item.get("url") or item.get("canonical_url") or "").strip()
                 c_pub = str(item.get("publisher") or "").strip()
                 c_date = str(item.get("published_at") or "").strip()
+                c_cap = str(item.get("captured_at") or "").strip()
                 c_kind = str(item.get("source_kind") or "").strip()
             elif isinstance(item, str):
                 c_label = item.strip()
                 c_url = item.strip() if item.strip().startswith(("http://", "https://")) else ""
+                c_cap = ""
             else:
                 continue
 
@@ -127,6 +130,8 @@ def _extract_and_validate_citations(
                 entry["publisher"] = c_pub
             if c_date:
                 entry["published_at"] = c_date
+            if c_cap:
+                entry["captured_at"] = c_cap
             if c_kind:
                 entry["source_kind"] = c_kind
             result.append(entry)
@@ -422,11 +427,14 @@ def _render_footnotes_section(
         raw_label = str(cite.get("label") or cite.get("url") or f"Source {idx}").strip()
         publisher = str(cite.get("publisher") or "").strip()
         published_at = str(cite.get("published_at") or "").strip()
+        captured_at = str(cite.get("captured_at") or "").strip()
         parts = [raw_label] if raw_label else []
         if publisher and publisher not in raw_label:
             parts.append(publisher)
         if published_at:
-            parts.append(published_at)
+            parts.append(f"发布于 {published_at[:10]}")
+        elif captured_at:
+            parts.append(f"检索于 {captured_at[:10]}")
         label = html.escape(" · ".join(parts) if parts else f"Source {idx}")
         url = str(cite.get("url") or "").strip()
         inline_refs.append(
@@ -681,6 +689,19 @@ def _verify_mapping_values_public_safe(
             _verify_mapping_values_public_safe(item, label=f"{label}[{idx}]")
 
 
+def _is_chronicler_person(person: Mapping[str, Any]) -> bool:
+    bio = person.get("bio_profile")
+    if hasattr(bio, "to_dict") and callable(bio.to_dict):
+        bio = bio.to_dict()
+    bio_map = bio if isinstance(bio, Mapping) else {}
+    role = str(
+        person.get("entity_role")
+        or bio_map.get("current_role")
+        or ""
+    ).strip().upper()
+    return role in CHRONICLER_ROLES
+
+
 def _render_wiki_infobox(person: Mapping[str, Any]) -> str:
     bio = person.get("bio_profile")
     if hasattr(bio, "to_dict") and callable(bio.to_dict):
@@ -699,26 +720,32 @@ def _render_wiki_infobox(person: Mapping[str, Any]) -> str:
             return
         rows.append((label, disp))
 
-    _add("英文名", bio_map.get("english_name") or reg_map.get("player_name_en"))
-    _add("出生日期", bio_map.get("birth_date"))
-    _add("出生地", bio_map.get("birth_place"))
-    _add("国籍", bio_map.get("nationality"))
-    h_cm = bio_map.get("height_cm")
-    if isinstance(h_cm, int) and not isinstance(h_cm, bool) and h_cm > 0:
-        rows.append(("身高", f"{h_cm} cm"))
-    w_kg = bio_map.get("weight_kg")
-    if isinstance(w_kg, int) and not isinstance(w_kg, bool) and w_kg > 0:
-        rows.append(("体重", f"{w_kg} kg"))
-    _add("位置", bio_map.get("position") or reg_map.get("position"))
-    _add("球衣号码", bio_map.get("jersey_number") or reg_map.get("jersey_number"))
-    _add("现效力球队", bio_map.get("current_club") or reg_map.get("current_club"))
-    _add("角色", bio_map.get("current_role"))
-    _add("青训/选秀来源", bio_map.get("draft_or_youth_origin"))
-    honors = bio_map.get("honors")
-    if isinstance(honors, Sequence) and not isinstance(honors, (str, bytes)):
-        clean_honors = [str(h).strip() for h in honors if _is_displayable_infobox_value(h)]
-        if clean_honors:
-            rows.append(("主要荣誉", "、".join(clean_honors)))
+    if _is_chronicler_person(person):
+        _add("英文名", bio_map.get("english_name"))
+        _add("所属机构/媒体", bio_map.get("media_outlet") or bio_map.get("organization_name") or bio_map.get("current_club"))
+        rows.append(("身份", "媒体记录者"))
+    else:
+        _add("英文名", bio_map.get("english_name") or reg_map.get("player_name_en"))
+        _add("出生日期", bio_map.get("birth_date"))
+        _add("出生地", bio_map.get("birth_place"))
+        _add("国籍", bio_map.get("nationality"))
+        h_cm = bio_map.get("height_cm")
+        if isinstance(h_cm, int) and not isinstance(h_cm, bool) and h_cm > 0:
+            rows.append(("身高", f"{h_cm} cm"))
+        w_kg = bio_map.get("weight_kg")
+        if isinstance(w_kg, int) and not isinstance(w_kg, bool) and w_kg > 0:
+            rows.append(("体重", f"{w_kg} kg"))
+        _add("位置", bio_map.get("position") or reg_map.get("position"))
+        _add("球衣号码", bio_map.get("jersey_number") or reg_map.get("jersey_number"))
+        _add("现效力球队", bio_map.get("current_club") or reg_map.get("current_club"))
+        raw_role = bio_map.get("current_role") or person.get("entity_role")
+        _add("角色", format_role_zh(raw_role) if raw_role else None)
+        _add("青训/选秀来源", bio_map.get("draft_or_youth_origin"))
+        honors = bio_map.get("honors")
+        if isinstance(honors, Sequence) and not isinstance(honors, (str, bytes)):
+            clean_honors = [str(h).strip() for h in honors if _is_displayable_infobox_value(h)]
+            if clean_honors:
+                rows.append(("主要荣誉", "、".join(clean_honors)))
 
     if not rows:
         return ""
@@ -1146,6 +1173,7 @@ def build_public_site(
     club_name = str(
         club_card.get("club_name") or club_card.get("canonical_name") or club_card.get("organization_id") or "Club Panorama"
     ).strip()
+    navbox_club_name = str(club_card.get("short_name") or club_name).strip()
     org_id = str(club_card.get("organization_id") or "").strip()
     resolved_site_title = (site_title or f"{club_name} | PUBLIC_SAFE").strip()
     resolved_observed_until = str(
@@ -1176,10 +1204,11 @@ def build_public_site(
         "</article>"
     )
 
+    roster_persons = [p for p in validated_persons if not _is_chronicler_person(p)]
     person_directory_items = "\n".join(
         f'    <li><a href="persons/{html.escape(p["slug"], quote=True)}.html">'
         f'{html.escape(p["person_name"])}</a></li>'
-        for p in validated_persons
+        for p in roster_persons
     )
     person_directory_html = (
         '<section class="entity-index">\n'
@@ -1188,7 +1217,7 @@ def build_public_site(
         f"{person_directory_items}\n"
         "  </ul>\n"
         "</section>"
-        if validated_persons
+        if roster_persons
         else ""
     )
 
@@ -1278,23 +1307,24 @@ def build_public_site(
             else ""
         )
 
+        is_chron = _is_chronicler_person(person)
         navbox_items = "\n".join(
             f'      <li><a href="{html.escape(other["slug"], quote=True)}.html">'
             f'{html.escape(other["person_name"])}</a></li>'
-            for other in validated_persons
+            for other in roster_persons
             if other["slug"] != person["slug"]
         )
         navbox_html = (
             '<nav class="squad-navbox">\n'
             "  <details>\n"
-            f"    <summary>{html.escape(club_name)} 完整阵容导航（{len(validated_persons)}人）</summary>\n"
+            f"    <summary>{html.escape(navbox_club_name)} 完整阵容导航（{len(roster_persons)}人）</summary>\n"
             '    <ul class="entity-list">\n'
             f'      <li><a href="../index.html">{html.escape(club_name)}</a></li>\n'
             f"{navbox_items}\n"
             "    </ul>\n"
             "  </details>\n"
             "</nav>"
-        )
+        ) if (not is_chron and roster_persons) else ""
 
         breadcrumb_html = (
             '<nav class="breadcrumb">'
@@ -1304,23 +1334,32 @@ def build_public_site(
 
         bio_map = person.get("bio_profile") or {}
         meta_desc = person["lead_plain_text"] or f"{person['person_name']} — {club_name}"
+        affiliation_obj: Dict[str, Any] = (
+            {
+                "@type": "Organization",
+                "name": str(bio_map.get("media_outlet") or bio_map.get("organization_name") or "媒体机构"),
+            }
+            if is_chron
+            else {
+                "@type": "SportsTeam",
+                "name": club_name,
+            }
+        )
         person_json_ld: Dict[str, Any] = {
             "@context": "https://schema.org",
             "@type": "Person",
             "name": person["person_name"],
             "identifier": person["person_uid"],
-            "affiliation": {
-                "@type": "SportsTeam",
-                "name": club_name,
-            },
+            "affiliation": affiliation_obj,
             "description": meta_desc,
         }
-        job_title = str(
+        raw_job_title = str(
             bio_map.get("current_role")
             or bio_map.get("position")
             or person.get("entity_role")
             or ""
         ).strip()
+        job_title = format_role_zh(raw_job_title) if raw_job_title else ""
         if _is_displayable_infobox_value(job_title):
             person_json_ld["jobTitle"] = job_title
         birth_date = str(bio_map.get("birth_date") or "").strip()

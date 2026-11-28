@@ -32,6 +32,54 @@ COACH_ROLES = frozenset({
     "ACTING_HEAD_COACH",
     "COACH",
 })
+CHRONICLER_ROLES = frozenset({
+    "CHRONICLER",
+    "JOURNALIST",
+    "REPORTER",
+    "MEDIA_CHRONICLER",
+})
+ROLE_LABELS_ZH: Dict[str, str] = {
+    "PLAYER": "球员",
+    "ACTIVE_ROSTER_PLAYER": "在册球员",
+    "FORMER_ROSTER_MEMBER": "历史离队成员",
+    "HEAD_COACH": "主教练",
+    "ACTING_HEAD_COACH": "代理主教练",
+    "ASSISTANT_COACH": "助理教练",
+    "COACH": "教练组成员",
+    "COACHING_STAFF": "教练组成员",
+    "STAFF": "教练组成员",
+    "EXECUTIVE": "俱乐部管理层",
+    "CHRONICLER": "媒体记录者",
+    "JOURNALIST": "媒体记录者",
+    "REPORTER": "媒体记录者",
+    "MEDIA_CHRONICLER": "媒体记录者",
+}
+
+
+def format_role_zh(role: Any) -> str:
+    """Map internal role enums to canonical Chinese display names (zero raw English fallback)."""
+    raw = str(role or "").strip()
+    if not raw:
+        return ""
+    return ROLE_LABELS_ZH.get(raw.upper(), raw)
+
+
+def classify_person_category(person: Mapping[str, Any]) -> str:
+    """Classify a person into ACTIVE_ROSTER_PLAYER / COACHING_STAFF / FORMER_ROSTER_MEMBER / CHRONICLER."""
+    if not isinstance(person, Mapping):
+        return "ACTIVE_ROSTER_PLAYER"
+    primary = str(person.get("primary_role") or person.get("current_role") or "").strip().upper()
+    roles_upper = {str(r).strip().upper() for r in (person.get("roles") or ()) if str(r).strip()}
+    if primary:
+        roles_upper.add(primary)
+    if primary in CHRONICLER_ROLES or (roles_upper and roles_upper <= CHRONICLER_ROLES):
+        return "CHRONICLER"
+    if primary in COACH_ROLES or (roles_upper & COACH_ROLES and primary not in PLAYER_ROLES):
+        return "COACHING_STAFF"
+    status = str(person.get("status") or person.get("roster_status") or "").strip().upper()
+    if status in {"DEPARTED", "FORMER", "INACTIVE", "RETIRED", "TRANSFERRED"}:
+        return "FORMER_ROSTER_MEMBER"
+    return "ACTIVE_ROSTER_PLAYER"
 
 
 class PersonRegistryError(ValueError):

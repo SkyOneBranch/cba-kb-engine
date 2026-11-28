@@ -533,11 +533,35 @@ def main():
     q.add_argument('--transport',choices=('stdio','streamable-http'),default='stdio')
     q.add_argument('--data-dir',type=Path,default=None)
     q.add_argument('--bundle-tarball',type=Path,default=None)
+    q.add_argument('--shard-dir',type=Path,default=None)
+    q.add_argument('--clubs',default='')
+    q.add_argument('--demand-ledger',type=Path,default=None)
     q.add_argument('--host',default='127.0.0.1')
     q.add_argument('--port',type=int,default=8765)
     q.add_argument('--path',default='/mcp')
     q.add_argument('--acl',type=Path,default=None)
     q.add_argument('--audit-log',type=Path,default=None)
+    q=sub.add_parser('social-workbench')
+    q.add_argument('action',choices=('export','apply'))
+    q.add_argument('--person-registry',type=Path,default=None)
+    q.add_argument('--csv',type=Path,default=None)
+    q.add_argument('--output',type=Path,required=True)
+    q.add_argument('--reference-year',type=int,default=2026)
+    q=sub.add_parser('social-bind')
+    q.add_argument('--person-uid',required=True)
+    q.add_argument('--canonical-name',required=True)
+    q.add_argument('--platform',required=True,choices=('DOUYIN','XIAOHONGSHU'))
+    q.add_argument('--handle',required=True)
+    q.add_argument('--raw-input',required=True)
+    q.add_argument('--operator-type',default='ATHLETE_SELF')
+    q.add_argument('--account-status',default='HUMAN_VERIFIED')
+    q.add_argument('--club',default='')
+    q.add_argument('--focus',default='')
+    q=sub.add_parser('b5-eval')
+    q.add_argument('--questions',type=Path,required=True)
+    q.add_argument('--responses',type=Path,required=True)
+    q.add_argument('--mode',choices=('split','shared'),default='split')
+    q.add_argument('--output',type=Path,default=None)
     q=sub.add_parser('plan'); q.add_argument('--entries',type=Path,required=True); q.add_argument('--release-id',required=True)
     q.add_argument('--status-id',required=True); q.add_argument('--archive-id',required=True)
     q.add_argument('--dependencies',type=Path);q.add_argument('--environment',choices=['sandbox','production'],default='sandbox')
@@ -2426,8 +2450,38 @@ def main():
                 evidence_dir=getattr(a, 'evidence_dir', None),
                 candidate_records=candidate_records,
             )
+        elif a.command == 'social-workbench':
+            from .social_workbench import apply_social_workbench_csv, export_social_workbench_csv
+            if a.action == 'export':
+                if a.person_registry is None:
+                    raise ValueError('--person-registry is required for export')
+                reg = json.loads(a.person_registry.read_text(encoding='utf-8'))
+                result = export_social_workbench_csv(reg, a.output, reference_year=a.reference_year)
+            else:
+                if a.csv is None:
+                    raise ValueError('--csv is required for apply')
+                result = apply_social_workbench_csv(a.csv, output_path=a.output)
+        elif a.command == 'social-bind':
+            from .social_workbench import bind_social_account
+            result = bind_social_account(
+                person_uid=a.person_uid,
+                canonical_name=a.canonical_name,
+                platform=a.platform,
+                account_handle_or_id=a.handle,
+                raw_input_or_share_text=a.raw_input,
+                operator_type=a.operator_type,
+                account_status=a.account_status,
+                club=a.club,
+                content_focus_summary=a.focus,
+            )
+        elif a.command == 'b5-eval':
+            from .b5_blind_eval import run_b5_eval_from_files
+            result = run_b5_eval_from_files(a.questions, a.responses, mode=a.mode)
+            if a.output is not None:
+                a.output.parent.mkdir(parents=True, exist_ok=True)
+                a.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
         elif a.command == 'mcp-serve':
-            if a.legacy_snowball or (a.data_dir is None and a.bundle_tarball is None):
+            if a.legacy_snowball or (a.data_dir is None and a.bundle_tarball is None and a.shard_dir is None):
                 from .cloud_state import R2CloudStateStore, R2Config
                 from .mcp_server import SnowballMCPServer
                 from .snowball_orchestrator import SnowballOrchestrator
@@ -2436,16 +2490,23 @@ def main():
                 SnowballMCPServer(orch).serve_stdio()
                 stage(a.command, 'done')
                 return
-            if a.data_dir is not None and a.bundle_tarball is not None:
-                raise ValueError('Specify either --data-dir or --bundle-tarball, not both')
             from .mcp_auth import MCPAuditLogger, load_mcp_acl
             from .mcp_http import serve_streamable_http
             from .mcp_server import TieredKnowledgeMCPServer
             from .mcp_tools import KnowledgeDataset
-            if a.bundle_tarball is not None:
-                dataset = KnowledgeDataset.from_bundle_tarball(a.bundle_tarball)
+            if a.shard_dir is not None:
+                clubs_list = [c.strip() for c in str(a.clubs or '').split(',') if c.strip()] or None
+                dataset = KnowledgeDataset.from_sharded_dir(
+                    a.shard_dir, clubs=clubs_list, demand_ledger_path=a.demand_ledger
+                )
+            elif a.bundle_tarball is not None:
+                dataset = KnowledgeDataset.from_bundle_tarball(
+                    a.bundle_tarball, demand_ledger_path=a.demand_ledger
+                )
             else:
-                dataset = KnowledgeDataset.from_data_dir(a.data_dir)
+                dataset = KnowledgeDataset.from_data_dir(
+                    a.data_dir, demand_ledger_path=a.demand_ledger
+                )
             acl = load_mcp_acl(acl_path=a.acl)
             audit_logger = MCPAuditLogger(audit_log_path=a.audit_log) if a.audit_log is not None else None
             server = TieredKnowledgeMCPServer(dataset, acl=acl, audit_logger=audit_logger)

@@ -187,7 +187,10 @@ def _decode_event_body(event: Mapping[str, Any]) -> bytes:
     else:
         body_bytes = str(raw_body).encode("utf-8")
     if event.get("isBase64Encoded"):
-        return base64.b64decode(body_bytes)
+        try:
+            return base64.b64decode(body_bytes, validate=True)
+        except Exception as exc:
+            raise ValueError("INVALID_BASE64_BODY") from exc
     return body_bytes
 
 
@@ -234,7 +237,15 @@ def make_aliyun_fc3_handler(
         method = str(http_ctx.get("method") or event.get("httpMethod") or "GET")
         path = str(event.get("rawPath") or http_ctx.get("path") or event.get("path") or "/")
         headers = event.get("headers") or {}
-        body = _decode_event_body(event)
+        try:
+            body = _decode_event_body(event)
+        except ValueError:
+            return {
+                "statusCode": 400,
+                "headers": {"Content-Type": "application/json; charset=utf-8", **_CORS_HEADERS},
+                "body": json.dumps({"error": "INVALID_BASE64_BODY"}, ensure_ascii=False),
+                "isBase64Encoded": False,
+            }
 
         status, resp_headers, resp_body = handle_mcp_http_request(
             method, path, headers, body, server=server, acl=acl, mcp_path=mcp_path
@@ -265,7 +276,15 @@ def make_tencent_scf_handler(
         method = str(ev.get("httpMethod") or http_ctx.get("method") or "GET")
         path = str(ev.get("path") or ev.get("rawPath") or http_ctx.get("path") or "/")
         headers = ev.get("headers") or {}
-        body = _decode_event_body(ev)
+        try:
+            body = _decode_event_body(ev)
+        except ValueError:
+            return {
+                "statusCode": 400,
+                "headers": {"Content-Type": "application/json; charset=utf-8", **_CORS_HEADERS},
+                "body": json.dumps({"error": "INVALID_BASE64_BODY"}, ensure_ascii=False),
+                "isBase64Encoded": False,
+            }
 
         status, resp_headers, resp_body = handle_mcp_http_request(
             method, path, headers, body, server=server, acl=acl, mcp_path=mcp_path

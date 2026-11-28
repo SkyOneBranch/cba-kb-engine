@@ -31,8 +31,50 @@ YOUTH_STAGE_LABELS_ZH: Dict[str, str] = {
     "FINAL_TOURNAMENT_ROSTER": "正赛最终名单",
     "OFFICIAL_TOURNAMENT_STATS": "正赛技术统计",
 }
+YOUTH_ORGANIZER_TIERS = frozenset({
+    "FIBA_INTERNATIONAL",
+    "NATIONAL",
+    "REGIONAL_LOCAL",
+})
+YOUTH_ORGANIZER_TIER_LABELS_ZH: Dict[str, str] = {
+    "FIBA_INTERNATIONAL": "FIBA国际",
+    "NATIONAL": "全国",
+    "REGIONAL_LOCAL": "地方",
+}
+_YOUTH_PLACEHOLDER_STRINGS = frozenset({
+    "俱乐部青训参赛/集训单位",
+    "青训参赛/集训单位",
+    "待核实单位",
+    "未填实单位",
+})
+_FIBA_INTL_KEYWORDS = (
+    "fiba",
+    "世青",
+    "亚青",
+    "世界杯",
+    "亚洲杯",
+    "亚锦赛",
+    "世锦赛",
+    "曼海姆",
+    "国际邀请赛",
+    "奥运会",
+)
+_REGIONAL_KEYWORDS = ("省", "市", "区", "大区", "华南", "华东", "地方")
 
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}\Z")
+
+
+def infer_organizer_tier(competition_or_program: str) -> str:
+    """Deterministically infer organizer_tier from competition name when omitted."""
+    text = str(competition_or_program or "").strip()
+    low = text.lower()
+    if any(kw in low for kw in _FIBA_INTL_KEYWORDS):
+        return "FIBA_INTERNATIONAL"
+    if "全国" in text or "全运" in text or "三大球" in text or "cba" in low:
+        return "NATIONAL"
+    if any(kw in text for kw in _REGIONAL_KEYWORDS):
+        return "REGIONAL_LOCAL"
+    return "NATIONAL"
 
 
 class YouthTenureError(ValueError):
@@ -83,12 +125,16 @@ def _validate_evidence_ref(ref: Any) -> Dict[str, str]:
     if not _HEX64_RE.fullmatch(raw_sha):
         raise YouthTenureError("EVIDENCE_RAW_SHA256_INVALID")
     captured_at = _required_str(ref.get("captured_at"), "EVIDENCE_CAPTURED_AT")
-    return {
+    out: Dict[str, str] = {
         "source_title": source_title,
         "source_url": source_url,
         "raw_sha256": raw_sha,
         "captured_at": captured_at,
     }
+    published_at = _optional_str(ref.get("published_at"), "EVIDENCE_PUBLISHED_AT")
+    if published_at:
+        out["published_at"] = published_at
+    return out
 
 
 def validate_youth_national_tenure(record: Mapping[str, Any]) -> Dict[str, Any]:
@@ -108,6 +154,8 @@ def validate_youth_national_tenure(record: Mapping[str, Any]) -> Dict[str, Any]:
     competition_or_program = _required_str(
         record.get("competition_or_program"), "COMPETITION_OR_PROGRAM"
     )
+    if competition_or_program in _YOUTH_PLACEHOLDER_STRINGS:
+        raise YouthTenureError("YOUTH_PLACEHOLDER_VALUE_REJECTED")
 
     raw_season_or_year = record.get("season_or_year")
     if isinstance(raw_season_or_year, int) and not isinstance(raw_season_or_year, bool):
@@ -122,6 +170,17 @@ def validate_youth_national_tenure(record: Mapping[str, Any]) -> Dict[str, Any]:
         raise YouthTenureError(f"INVALID_PARTICIPATION_STAGE:{participation_stage}")
 
     team_or_unit = _required_str(record.get("team_or_unit"), "TEAM_OR_UNIT")
+    if team_or_unit in _YOUTH_PLACEHOLDER_STRINGS:
+        raise YouthTenureError("YOUTH_PLACEHOLDER_VALUE_REJECTED")
+
+    raw_tier = _optional_str(record.get("organizer_tier"), "ORGANIZER_TIER")
+    if raw_tier is None:
+        organizer_tier = infer_organizer_tier(competition_or_program)
+    else:
+        organizer_tier = raw_tier.upper()
+        if organizer_tier not in YOUTH_ORGANIZER_TIERS:
+            raise YouthTenureError(f"INVALID_ORGANIZER_TIER:{raw_tier}")
+
     stats_summary = _optional_str(record.get("stats_summary"), "STATS_SUMMARY")
 
     raw_refs = record.get("evidence_refs")
@@ -137,6 +196,7 @@ def validate_youth_national_tenure(record: Mapping[str, Any]) -> Dict[str, Any]:
         "schema": YOUTH_NATIONAL_TENURE_SCHEMA,
         "person_uid": person_uid,
         "competition_or_program": competition_or_program,
+        "organizer_tier": organizer_tier,
         "season_or_year": season_or_year,
         "participation_stage": participation_stage,
         "team_or_unit": team_or_unit,
@@ -207,20 +267,27 @@ def project_youth_tenures_for_person(
         if rec["person_uid"] != clean_uid:
             continue
         stage_zh = YOUTH_STAGE_LABELS_ZH[rec["participation_stage"]]
+        tier_code = rec["organizer_tier"]
+        tier_zh = YOUTH_ORGANIZER_TIER_LABELS_ZH[tier_code]
         if visibility == "public_safe":
-            pub_refs = [
-                {
+            pub_refs = []
+            for ref in rec["evidence_refs"]:
+                if not _is_public_https_url(ref["source_url"]):
+                    continue
+                pub_ref: Dict[str, str] = {
                     "source_title": ref["source_title"],
                     "source_url": ref["source_url"],
                     "captured_at": ref["captured_at"],
                 }
-                for ref in rec["evidence_refs"]
-                if _is_public_https_url(ref["source_url"])
-            ]
+                if ref.get("published_at"):
+                    pub_ref["published_at"] = ref["published_at"]
+                pub_refs.append(pub_ref)
             projected.append({
                 "schema": rec["schema"],
                 "person_uid": rec["person_uid"],
                 "competition_or_program": rec["competition_or_program"],
+                "organizer_tier": tier_code,
+                "organizer_tier_label_zh": tier_zh,
                 "season_or_year": rec["season_or_year"],
                 "participation_stage": rec["participation_stage"],
                 "participation_stage_label_zh": stage_zh,
@@ -231,6 +298,7 @@ def project_youth_tenures_for_person(
         else:
             projected.append({
                 **rec,
+                "organizer_tier_label_zh": tier_zh,
                 "participation_stage_label_zh": stage_zh,
             })
 

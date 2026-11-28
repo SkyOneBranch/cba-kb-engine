@@ -325,6 +325,24 @@ def _discover_instance_inputs(instance: Instance) -> Dict[str, Any]:
             youth_national_tenures = _read_json_or_jsonl(yt_candidate)
             break
 
+    # 11. Social profiles & posts (REQ-251)
+    social_profiles: List[Dict[str, Any]] = []
+    sp_candidate = instance.data_root / "social_profiles.json"
+    if sp_candidate.is_file():
+        try:
+            loaded_sp = json.loads(sp_candidate.read_text(encoding="utf-8"))
+            if isinstance(loaded_sp, dict) and isinstance(loaded_sp.get("profiles"), list):
+                social_profiles = [x for x in loaded_sp["profiles"] if isinstance(x, dict)]
+            elif isinstance(loaded_sp, list):
+                social_profiles = [x for x in loaded_sp if isinstance(x, dict)]
+        except (OSError, ValueError):
+            pass
+
+    social_posts: List[Dict[str, Any]] = []
+    posts_candidate = instance.data_root / "social_posts.jsonl"
+    if posts_candidate.is_file():
+        social_posts = _read_json_or_jsonl(posts_candidate)
+
     return {
         "master_rows": master_rows,
         "foreign_rows": foreign_rows,
@@ -337,6 +355,8 @@ def _discover_instance_inputs(instance: Instance) -> Dict[str, Any]:
         "coverage_ledger": coverage_ledger,
         "overseas_tenures": overseas_tenures,
         "youth_national_tenures": youth_national_tenures,
+        "social_profiles": social_profiles,
+        "social_posts": social_posts,
     }
 
 
@@ -1549,6 +1569,8 @@ def build_person_card(
     person_bio_profiles: Optional[Mapping[str, Any]] = None,
     overseas_tenures: Optional[Sequence[Mapping[str, Any]]] = None,
     youth_national_tenures: Optional[Sequence[Mapping[str, Any]]] = None,
+    social_profiles: Optional[Mapping[str, Any] | Sequence[Mapping[str, Any]]] = None,
+    social_posts: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Assemble and render an on-demand research card for any player in local KB.
 
@@ -2017,9 +2039,35 @@ def build_person_card(
             career_season_stats=career_season_stats,
             projected_stories=payload.get("projected_stories"),
             citation_registry=cit_reg,
+            entity_role=effective_role,
             visibility=vis,
         )
         payload["lead_paragraph"] = lead_paragraph_dict
+
+        raw_sp = (
+            social_profiles.get("profiles")
+            if isinstance(social_profiles, Mapping) and isinstance(social_profiles.get("profiles"), Sequence)
+            else (
+                list(social_profiles)
+                if isinstance(social_profiles, Sequence) and not isinstance(social_profiles, (str, bytes))
+                else list(discovered.get("social_profiles") or [])
+            )
+        )
+        raw_posts = (
+            list(social_posts)
+            if social_posts is not None
+            else list(discovered.get("social_posts") or [])
+        )
+        social_uid = resolved_person_uid or str(person.get("person_uid") or "").strip()
+        if social_uid and (raw_sp or raw_posts):
+            from .social_workbench import project_social_for_person
+
+            payload["social_section"] = project_social_for_person(
+                social_uid,
+                profiles=raw_sp or (),
+                posts=raw_posts,
+                visibility=vis,
+            )
 
         overall_verification_status = _compute_overall_verification_status(
             domain_horizons,
