@@ -370,6 +370,12 @@ def _bundle_allowlisted_exact_names() -> frozenset[str]:
         "person_bio_profiles.json",
         "story_records.jsonl",
         "organization_profiles.json",
+        "club_season_roster_ledger.jsonl",
+        "registration_time_slices.jsonl",
+        "person_overseas_tenures.jsonl",
+        "youth_national_tenures.jsonl",
+        "shenzhen_pilot_context.json",
+        "coach_role_facets.json",
     })
 
 
@@ -446,7 +452,12 @@ def _is_bundle_member_allowed(rel_posix: str, allowlisted_exact_names: frozenset
     name = parts[-1]
 
     # Explicit exclusions (fail-closed)
-    if name == "production.json":
+    name_lower = name.lower()
+    if name_lower == "production.json":
+        return False
+    if name_lower == "mcp_acl.json" or name_lower.startswith("mcp_acl"):
+        return False
+    if any("secret" in seg.lower() or "token" in seg.lower() for seg in parts):
         return False
     if any(seg in _BUNDLE_EXCLUDED_DIR_NAMES for seg in parts[:-1]):
         return False

@@ -1144,6 +1144,97 @@ def _render_wiki_v241_card(
                             ref_marks.append(mark)
                 lines.append(f"- {t_start}–{t_end}：{t_org}（{t_role}）{''.join(ref_marks)}")
 
+    # 4b. Overseas & International Tenures (## 海外及旅外经历（D-01 事实索引）)
+    raw_overseas = payload.get("overseas_tenures")
+    if isinstance(raw_overseas, (list, tuple)) and raw_overseas:
+        overseas_lines: List[str] = []
+        for ot in raw_overseas:
+            if not isinstance(ot, Mapping):
+                continue
+            ov_span = str(ot.get("season_span") or "-").strip()
+            ov_org = str(ot.get("organization_name") or "-").strip()
+            ov_league = str(ot.get("league_name") or "-").strip()
+            ov_type = str(ot.get("tenure_type") or "").strip()
+            ov_honors = [
+                str(h).strip()
+                for h in (ot.get("official_honors") or ())
+                if str(h).strip()
+            ]
+            if is_public:
+                ov_span = _sanitize_public_free_text(ov_span, fallback="-")
+                ov_org = _sanitize_public_free_text(ov_org, fallback="-")
+                ov_league = _sanitize_public_free_text(ov_league, fallback="-")
+                ov_honors = [
+                    h for h in (_sanitize_public_free_text(x, fallback="") for x in ov_honors) if h
+                ]
+            ref_marks = []
+            for ev_ref in ot.get("evidence_refs") or ():
+                if isinstance(ev_ref, Mapping):
+                    idx = cit_reg.register(
+                        label=str(ev_ref.get("source_title") or f"{ov_org}海外经历来源"),
+                        url=str(ev_ref.get("source_url") or "") or None,
+                        source_kind="overseas_factual_index",
+                        published_at=str(ev_ref.get("captured_at") or "")[:10] or None,
+                    )
+                else:
+                    idx = _register_citation_obj(cit_reg, ev_ref, default_label=f"{ov_org}海外经历来源")
+                if idx is not None:
+                    mark = cit_reg.format_ref(idx)
+                    if mark not in ref_marks:
+                        ref_marks.append(mark)
+            honors_part = f"；官方荣誉：{'、'.join(ov_honors)}" if ov_honors else ""
+            type_part = f"｜{ov_type}" if ov_type else ""
+            overseas_lines.append(
+                f"- {ov_span}：{ov_org}（{ov_league}{type_part}）{honors_part}{''.join(ref_marks)}"
+            )
+        if overseas_lines:
+            lines.extend(["", "## 海外及旅外经历（D-01 事实索引）", *overseas_lines])
+
+    # 4c. Youth National Tenures (## 国字号及青年赛事经历)
+    raw_youth = payload.get("youth_national_tenures")
+    if isinstance(raw_youth, (list, tuple)) and raw_youth:
+        from .youth_tenure import YOUTH_STAGE_LABELS_ZH
+
+        youth_lines: List[str] = []
+        for yt in raw_youth:
+            if not isinstance(yt, Mapping):
+                continue
+            yt_year = str(yt.get("season_or_year") or "-").strip()
+            yt_comp = str(yt.get("competition_or_program") or "-").strip()
+            yt_team = str(yt.get("team_or_unit") or "-").strip()
+            yt_stage_code = str(yt.get("participation_stage") or "").strip()
+            yt_stage_zh = (
+                YOUTH_STAGE_LABELS_ZH.get(yt_stage_code)
+                or str(yt.get("participation_stage_label_zh") or yt_stage_code or "-").strip()
+            )
+            yt_stats = str(yt.get("stats_summary") or "").strip()
+            if is_public:
+                yt_year = _sanitize_public_free_text(yt_year, fallback="-")
+                yt_comp = _sanitize_public_free_text(yt_comp, fallback="-")
+                yt_team = _sanitize_public_free_text(yt_team, fallback="-")
+                yt_stats = _sanitize_public_free_text(yt_stats, fallback="") if yt_stats else ""
+            ref_marks = []
+            for ev_ref in yt.get("evidence_refs") or ():
+                if isinstance(ev_ref, Mapping):
+                    idx = cit_reg.register(
+                        label=str(ev_ref.get("source_title") or f"{yt_comp}官方来源"),
+                        url=str(ev_ref.get("source_url") or "") or None,
+                        source_kind="federation_official",
+                        published_at=str(ev_ref.get("captured_at") or "")[:10] or None,
+                    )
+                else:
+                    idx = _register_citation_obj(cit_reg, ev_ref, default_label=f"{yt_comp}官方来源")
+                if idx is not None:
+                    mark = cit_reg.format_ref(idx)
+                    if mark not in ref_marks:
+                        ref_marks.append(mark)
+            stats_part = f"｜{yt_stats}" if yt_stats else ""
+            youth_lines.append(
+                f"- {yt_year} {yt_comp}（{yt_team}）：{yt_stage_zh}{stats_part}{''.join(ref_marks)}"
+            )
+        if youth_lines:
+            lines.extend(["", "## 国字号及青年赛事经历", *youth_lines])
+
     # 5. Registration & Contract Information (## 注册与合同信息)
     dom_cur = reg_profile.get("domestic_current") if isinstance(reg_profile.get("domestic_current"), Mapping) else None
     dom_hist = reg_profile.get("domestic_history") if isinstance(reg_profile.get("domestic_history"), list) else []

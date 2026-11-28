@@ -1115,6 +1115,16 @@ def build_public_site(
             _verify_mapping_values_public_safe(
                 reg_map, label=f"person_cards[{idx}].registration_profile"
             )
+        overseas_raw = pcard.get("overseas_tenures")
+        if isinstance(overseas_raw, Sequence) and not isinstance(overseas_raw, (str, bytes)):
+            _verify_mapping_values_public_safe(
+                overseas_raw, label=f"person_cards[{idx}].overseas_tenures"
+            )
+        youth_raw = pcard.get("youth_national_tenures")
+        if isinstance(youth_raw, Sequence) and not isinstance(youth_raw, (str, bytes)):
+            _verify_mapping_values_public_safe(
+                youth_raw, label=f"person_cards[{idx}].youth_national_tenures"
+            )
         validated_persons.append(
             {
                 "person_uid": person_uid,
