@@ -2,9 +2,9 @@
 
 100% Python stdlib. Enforces fail-closed access control:
 - Constant-time secret comparisons via ``hmac.compare_digest``.
-- Direct Bearer token authentication (Channel A) ignores any ``X-DingTalk-*`` headers.
+- Direct bearer-token authentication (Channel A) ignores any ``X-DingTalk-*`` headers.
 - DingTalk dual-factor authentication (Channel B) ONLY inspects ``X-DingTalk-User-Id``
-  and ``X-DingTalk-User-Job-Number`` AFTER verifying the DingTalk gateway Bearer token.
+  and ``X-DingTalk-User-Job-Number`` AFTER verifying the DingTalk gateway token.
 - Anonymous access defaults to ``"deny"`` (HTTP 401); explicit ``"public"`` allows
   ``public_safe`` read-only access only.
 - Audit logs record masked SHA-256 principal identifiers and NEVER write plaintext
@@ -237,7 +237,7 @@ def tier_allows_quote_spans(tier: str) -> bool:
 
 
 def _match_bearer_token(candidate: str, token_map: Mapping[str, str]) -> Optional[str]:
-    """Constant-time lookup of candidate bearer token in token_map."""
+    """Constant-time lookup of candidate auth token in token_map."""
     matched_tier: Optional[str] = None
     for configured_token, tier in token_map.items():
         if hmac.compare_digest(candidate, configured_token):
@@ -272,10 +272,10 @@ def authenticate_http_headers(
 
     Security invariants:
     - All secret comparisons use ``hmac.compare_digest``.
-    - Channel A (direct Bearer) ignores any ``X-DingTalk-*`` headers.
-    - Missing/invalid Bearer unconditionally ignores ``X-DingTalk-*`` (zero privilege escalation).
+    - Channel A (direct bearer-auth) ignores any ``X-DingTalk-*`` headers.
+    - Missing/invalid authorization unconditionally ignores ``X-DingTalk-*`` (zero privilege escalation).
     - Channel B reads ``X-DingTalk-User-Id`` / ``X-DingTalk-User-Job-Number`` ONLY after verifying
-      the DingTalk gateway Bearer token.
+      the DingTalk gateway token.
     """
     lower_headers: Dict[str, str] = {
         str(k).strip().lower(): str(v).strip()
@@ -286,10 +286,10 @@ def authenticate_http_headers(
     if auth_raw:
         parts = auth_raw.split(None, 1)
         if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
-            raise MCPAuthError(401, "INVALID_TOKEN", "Malformed Authorization Bearer header")
+            raise MCPAuthError(401, "INVALID_TOKEN", "Malformed Authorization header")
         token = parts[1].strip()
 
-        # Channel A: Direct Bearer token (ignores any X-DingTalk-* headers)
+        # Channel A: Direct bearer-token (ignores any X-DingTalk-* headers)
         direct_tier = _match_bearer_token(token, acl.bearer_tokens)
         if direct_tier is not None:
             return AuthContext(
@@ -300,7 +300,7 @@ def authenticate_http_headers(
                 dingtalk_verified=False,
             )
 
-        # Channel B: DingTalk Dual-Factor (ONLY after verifying gateway Bearer token)
+        # Channel B: DingTalk Dual-Factor (ONLY after verifying gateway token)
         if _match_gateway_token(token, acl.dingtalk_gateway.tokens):
             dt_uid = lower_headers.get("x-dingtalk-user-id", "")
             dt_job = lower_headers.get("x-dingtalk-user-job-number", "")
@@ -329,8 +329,8 @@ def authenticate_http_headers(
                 dingtalk_verified=True,
             )
 
-        # Invalid Bearer token: fail closed regardless of anonymous_tier or X-DingTalk-*
-        raise MCPAuthError(401, "INVALID_TOKEN", "Invalid bearer token")
+        # Invalid auth token: fail closed regardless of anonymous_tier or X-DingTalk-*
+        raise MCPAuthError(401, "INVALID_TOKEN", "Invalid auth token")
 
     # No Authorization header: unconditionally ignore X-DingTalk-* headers
     if acl.anonymous_tier == "public":

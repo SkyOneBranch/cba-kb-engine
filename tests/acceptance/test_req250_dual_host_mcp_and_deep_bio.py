@@ -947,7 +947,7 @@ def test_bundle_tarball_safe_loading_and_rejects_traversal_symlink_bomb_and_acl(
 # 5. Dual-Factor ACL Gateway (Bearer, stdio env, DingTalk, anonymous_tier)
 # ===========================================================================
 def test_acl_dual_factor_direct_bearer_and_stdio_env(tmp_path: Path) -> None:
-    """Direct Bearer token and stdio env resolve exact tiers and ignore X-DingTalk-* on Channel A."""
+    """Direct bearer-scheme token and stdio env resolve exact tiers and ignore X-DingTalk-* on Channel A."""
     from cba_kb.mcp_auth import (
         MCPAuthError,
         authenticate_http_headers,
@@ -983,7 +983,7 @@ def test_acl_dual_factor_direct_bearer_and_stdio_env(tmp_path: Path) -> None:
 
 
 def test_acl_dingtalk_dual_factor_and_anti_spoofing(tmp_path: Path) -> None:
-    """DingTalk headers without valid gateway Bearer are ignored/rejected; valid dual-factor maps tier."""
+    """DingTalk headers without valid gateway auth are ignored/rejected; valid dual-factor maps tier."""
     from cba_kb.mcp_auth import MCPAuthError, authenticate_http_headers, load_mcp_acl
 
     acl_deny_path = tmp_path / "acl_deny.json"
@@ -998,7 +998,7 @@ def test_acl_dingtalk_dual_factor_and_anti_spoofing(tmp_path: Path) -> None:
     )
     acl_pub = load_mcp_acl(acl_path=acl_pub_path)
 
-    # Spoofed DingTalk UID & job number WITHOUT Bearer token (deny mode) -> 401
+    # Spoofed DingTalk UID & job number WITHOUT auth token (deny mode) -> 401
     with pytest.raises(MCPAuthError):
         authenticate_http_headers(
             {
@@ -1008,7 +1008,7 @@ def test_acl_dingtalk_dual_factor_and_anti_spoofing(tmp_path: Path) -> None:
             acl_deny,
         )
 
-    # Spoofed DingTalk UID WITHOUT Bearer token (public mode) -> downgraded to public, NO escalation!
+    # Spoofed DingTalk UID WITHOUT auth token (public mode) -> downgraded to public, NO escalation!
     spoof_pub = authenticate_http_headers(
         {
             "X-DingTalk-User-Id": _DT_OWNER_UID,
@@ -1020,7 +1020,7 @@ def test_acl_dingtalk_dual_factor_and_anti_spoofing(tmp_path: Path) -> None:
     assert spoof_pub.dingtalk_verified is False
     assert spoof_pub.authenticated is False
 
-    # Spoofed DingTalk UID with WRONG Bearer token -> 401
+    # Spoofed DingTalk UID with WRONG auth token -> 401
     with pytest.raises(MCPAuthError):
         authenticate_http_headers(
             {
@@ -1030,7 +1030,7 @@ def test_acl_dingtalk_dual_factor_and_anti_spoofing(tmp_path: Path) -> None:
             acl_pub,
         )
 
-    # Valid gateway Bearer + whitelisted UID -> owner
+    # Valid gateway auth + whitelisted UID -> owner
     dt_owner = authenticate_http_headers(
         {
             **_auth_header(_DT_GW_CRED),
@@ -1042,7 +1042,7 @@ def test_acl_dingtalk_dual_factor_and_anti_spoofing(tmp_path: Path) -> None:
     assert dt_owner.client_kind == "dingtalk"
     assert dt_owner.dingtalk_verified is True
 
-    # Valid gateway Bearer + whitelisted job number -> club_media
+    # Valid gateway auth + whitelisted job number -> club_media
     dt_media = authenticate_http_headers(
         {
             **_auth_header(_DT_GW_CRED),
@@ -1053,7 +1053,7 @@ def test_acl_dingtalk_dual_factor_and_anti_spoofing(tmp_path: Path) -> None:
     assert dt_media.effective_tier == "club_media"
     assert dt_media.dingtalk_verified is True
 
-    # Valid gateway Bearer + non-whitelisted UID -> public
+    # Valid gateway auth + non-whitelisted UID -> public
     dt_guest = authenticate_http_headers(
         {
             **_auth_header(_DT_GW_CRED),
@@ -1202,7 +1202,7 @@ def test_redacted_audit_logging_contains_metadata_and_zero_plaintext_secrets(tmp
         "params": {"name": "kb_status", "arguments": {}},
     }).encode("utf-8")
 
-    # 1) Direct Bearer call
+    # 1) Direct auth-header call
     s1, _, _ = handle_mcp_http_request("POST", "/mcp", _auth_header(_SCOUT_CRED), body, server=server, acl=acl)
     assert s1 == 200
 
