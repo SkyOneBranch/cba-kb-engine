@@ -201,6 +201,33 @@ def _resolve_team_name_zh(team_id_or_name: Any, fallback_name: Optional[str] = N
         return raw or "-"
 
 
+_INTERNAL_SOURCE_LABEL_MAP: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bteam_staff_snapshots\b", re.IGNORECASE), "CBA官方球队教练组名单"),
+    (re.compile(r"\bclub_announcement:[^\s]*", re.IGNORECASE), "俱乐部官方公告"),
+    (re.compile(r"\bclub_season_roster_ledger(?:\.jsonl)?\b", re.IGNORECASE), "俱乐部跨赛季阵容变动台账"),
+    (re.compile(r"\b(?:player_)?season_stats(?:\.jsonl?)?\b", re.IGNORECASE), "CBA官方赛季技术统计"),
+    (re.compile(r"\bgame_(?:stats|logs)[^\s]*\.(?:jsonl?|csv)\b", re.IGNORECASE), "CBA官方单场技术统计"),
+    (re.compile(r"\bmaster[^\s]*\.csv\b", re.IGNORECASE), "CBA官方国内球员注册名单"),
+    (re.compile(r"\bforeign[^\s]*\.csv\b", re.IGNORECASE), "CBA官方外籍球员注册公示"),
+    (re.compile(r"\bperson_bio_profiles\.json\b", re.IGNORECASE), "球员公开档案资料"),
+    (re.compile(r"\bperson_registry\.json\b", re.IGNORECASE), "CBA人物主索引"),
+    (re.compile(r"[^\s/\\]+\.(?:csv|jsonl)\b", re.IGNORECASE), "CBA官方公开数据记录"),
+)
+
+
+def _map_internal_source_label_to_public_zh(label: str) -> str:
+    """Map internal table/snapshot/file keys to human-readable Chinese public source names."""
+    cleaned = str(label or "").strip()
+    if not cleaned:
+        return ""
+    for pattern, zh_name in _INTERNAL_SOURCE_LABEL_MAP:
+        if pattern.fullmatch(cleaned):
+            return zh_name
+        if pattern.search(cleaned):
+            cleaned = pattern.sub(zh_name, cleaned)
+    return cleaned
+
+
 class CitationRegistry:
     """Unified sentence-level citation registry with URL & URL-less deduplication (REQ-241 P0-3)."""
 
@@ -240,7 +267,9 @@ class CitationRegistry:
                     for bad in ("drive.google.com", "docs.google.com", "r2://", "s3://", "file://")
                 ):
                     return None
-            combined = f"{raw_label}\n{raw_url}\n{raw_pub}"
+            mapped_label = _map_internal_source_label_to_public_zh(raw_label)
+            mapped_pub = _map_internal_source_label_to_public_zh(raw_pub) if raw_pub else ""
+            combined = f"{mapped_label}\n{raw_url}\n{mapped_pub}"
             if (
                 _TEN_SOURCES_RE.search(combined)
                 or _PRIVATE_URI_TOKEN_RE.search(combined)
@@ -251,8 +280,8 @@ class CitationRegistry:
                 or "doc_id:" in combined.lower()
             ):
                 return None
-            clean_label = _sanitize_public_free_text(raw_label, fallback="")
-            clean_pub = _sanitize_public_free_text(raw_pub, fallback="") if raw_pub else ""
+            clean_label = _sanitize_public_free_text(mapped_label, fallback="")
+            clean_pub = _sanitize_public_free_text(mapped_pub, fallback="") if mapped_pub else ""
         else:
             clean_label = raw_label
             clean_pub = raw_pub
@@ -688,9 +717,92 @@ def _fmt_wiki_metric(val: Any) -> str:
     return str(val)
 
 
+def _extract_season_span_years(rows: Sequence[Mapping[str, Any]]) -> Optional[str]:
+    start_years: List[int] = []
+    end_years: List[int] = []
+    for r in rows:
+        if not isinstance(r, Mapping):
+            continue
+        s = str(r.get("season") or "").strip()
+        m = re.match(r"(\d{4})\s*[-–—]\s*(\d{4})", s)
+        if m:
+            start_years.append(int(m.group(1)))
+            end_years.append(int(m.group(2)))
+        else:
+            m1 = re.search(r"(\d{4})", s)
+            if m1:
+                y = int(m1.group(1))
+                start_years.append(y)
+                end_years.append(y)
+    if not start_years:
+        return None
+    return f"{min(start_years)}–{max(end_years)}"
+
+
+def _extract_latest_stats_date(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    explicit_as_of: Optional[str] = None,
+) -> Optional[str]:
+    if isinstance(explicit_as_of, str) and explicit_as_of.strip():
+        m = re.search(r"\d{4}-\d{2}-\d{2}", explicit_as_of.strip())
+        if m:
+            return m.group(0)
+        return explicit_as_of.strip()[:10]
+    dates: List[str] = []
+    for r in rows:
+        if not isinstance(r, Mapping):
+            continue
+        cap = str(r.get("captured_at") or "").strip()
+        if not cap and isinstance(r.get("provenance"), Mapping):
+            cap = str(r["provenance"].get("captured_at") or "").strip()
+        m = re.search(r"\d{4}-\d{2}-\d{2}", cap)
+        if m:
+            dates.append(m.group(0))
+    return max(dates) if dates else None
+
+
+def _format_career_summary_label(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    coverage_mode: Optional[str] = None,
+    as_of_date: Optional[str] = None,
+    seasons_count: Optional[int] = None,
+) -> str:
+    mode = str(coverage_mode or "").strip().upper()
+    cutoff = _extract_latest_stats_date(rows, explicit_as_of=as_of_date)
+    if mode == "FULL_CBA_CAREER":
+        if cutoff:
+            return f"CBA生涯总计 / 场均（截至 {cutoff}）"
+        return "CBA生涯总计 / 场均"
+    distinct_seasons = {
+        str(r.get("season") or "").strip()
+        for r in rows
+        if isinstance(r, Mapping) and str(r.get("season") or "").strip()
+    }
+    n_seasons = len(distinct_seasons) if distinct_seasons else (
+        int(seasons_count) if isinstance(seasons_count, int) and seasons_count > 0 else 0
+    )
+    span = _extract_season_span_years(rows)
+    details: List[str] = []
+    if span:
+        details.append(span)
+    if n_seasons > 0:
+        details.append(f"共 {n_seasons} 季")
+    if cutoff:
+        details.append(f"截至 {cutoff}")
+    if details:
+        return f"已收录赛季合计（{'，'.join(details)}）"
+    return "已收录赛季合计"
+
+
 def _render_wiki_career_table_lines(
     rows: Sequence[Mapping[str, Any]],
     summary: Optional[Mapping[str, Any]] = None,
+    *,
+    coverage_mode: Optional[str] = None,
+    as_of_date: Optional[str] = None,
+    seasons_count: Optional[int] = None,
 ) -> List[str]:
     if not rows:
         return []
@@ -724,8 +836,14 @@ def _render_wiki_career_table_lines(
         ]
         lines.append("| " + " | ".join(cells) + " |")
     if isinstance(summary, Mapping) and summary.get("games_played") is not None:
+        summary_label = _format_career_summary_label(
+            rows,
+            coverage_mode=coverage_mode or summary.get("career_coverage_mode") or summary.get("career_stats_completeness"),
+            as_of_date=as_of_date or summary.get("observed_until") or summary.get("career_stats_as_of"),
+            seasons_count=seasons_count,
+        )
         sum_cells = [
-            "生涯总计/场均",
+            summary_label,
             "-",
             *(_fmt_wiki_metric(summary.get(col)) for col in CORE_SEASON_STATS_COLUMNS),
         ]
@@ -853,12 +971,38 @@ def _render_wiki_v241_card(
                     stats_ref_indices.append(idx)
         stats_ref_suffix = "".join(cit_reg.format_ref(i) for i in stats_ref_indices[:2])
         lines.extend(["", f"## 球员生涯数据{stats_ref_suffix}"])
+        obs_h_map = payload.get("observation_horizon") if isinstance(payload.get("observation_horizon"), Mapping) else {}
+        coverage_mode = (
+            career_stats.get("career_coverage_mode")
+            or career_stats.get("career_stats_completeness")
+            or bio_profile.get("career_coverage_mode")
+            or bio_profile.get("career_stats_completeness")
+        )
+        stats_as_of = (
+            career_stats.get("observed_until")
+            or career_stats.get("career_stats_as_of")
+            or career_stats.get("as_of_date")
+            or obs_h_map.get("observed_until")
+        )
+        seasons_count_val = career_stats.get("seasons_count")
         if reg_rows:
-            reg_tbl = _render_wiki_career_table_lines(reg_rows, summary=reg_summary)
+            reg_tbl = _render_wiki_career_table_lines(
+                reg_rows,
+                summary=reg_summary,
+                coverage_mode=coverage_mode,
+                as_of_date=stats_as_of,
+                seasons_count=seasons_count_val,
+            )
             if reg_tbl:
                 lines.extend(["", "### 常规赛", *reg_tbl])
         if po_rows:
-            po_tbl = _render_wiki_career_table_lines(po_rows, summary=po_summary)
+            po_tbl = _render_wiki_career_table_lines(
+                po_rows,
+                summary=po_summary,
+                coverage_mode=coverage_mode,
+                as_of_date=stats_as_of,
+                seasons_count=seasons_count_val,
+            )
             if po_tbl:
                 lines.extend(["", "### 季后赛", *po_tbl])
 
@@ -875,11 +1019,21 @@ def _render_wiki_v241_card(
                 return f"{v:.1f}"
             return str(v)
 
+        game_dates = [
+            str(g.get("game_date") or "").strip()
+            for g in games_list
+            if isinstance(g, Mapping) and str(g.get("game_date") or "").strip()
+        ]
+        latest_game_date = max(game_dates) if game_dates else str(
+            recent_games.get("latest_game_date") or ""
+        ).strip()
+        date_prefix = f"最新比赛日：{latest_game_date}｜" if latest_game_date else ""
+
         lines.extend([
             "",
             "## 近期单场数据",
             '<details class="gamelog-drawer">',
-            f"<summary>展开查看近 {played_n} 场单场数据（场均 {_fmt_g(avgs.get('points'))} 分 / {_fmt_g(avgs.get('rebounds'))} 篮板 / {_fmt_g(avgs.get('assists'))} 助攻）</summary>",
+            f"<summary>展开查看近 {played_n} 场已记录单场数据（{date_prefix}场均 {_fmt_g(avgs.get('points'))} 分 {_fmt_g(avgs.get('rebounds'))} 篮板 {_fmt_g(avgs.get('assists'))} 助攻）</summary>",
             "",
             "| 日期 | 轮次 | 对手 | 时间 | 得分-篮板-助攻 | 投篮 / 三分 / 罚球 |",
             "| --- | --- | --- | --- | --- | --- |",

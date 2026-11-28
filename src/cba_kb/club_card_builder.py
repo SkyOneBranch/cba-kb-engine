@@ -176,6 +176,34 @@ def _project_org_stories(
         return projected
 
 
+CLUB_SEASON_ROSTER_LEDGER_SCHEMA = "cba-kb.club-season-roster-ledger.v1"
+
+_LEDGER_BUCKET_MAP: Dict[str, str] = {
+    "RETAINED": "retained",
+    "RETAINED_DOMESTIC": "retained",
+    "RETAINED_FOREIGN": "retained",
+    "留队": "retained",
+    "留队球员": "retained",
+    "NEW_SIGNING_OR_YOUTH_PROMOTION": "joined",
+    "JOINED": "joined",
+    "NEW_SIGNING": "joined",
+    "YOUTH_PROMOTION": "joined",
+    "新援": "joined",
+    "青训上调": "joined",
+    "RETIRED_TO_CLUB_COACH": "retired_to_club_coach",
+    "RETIRED_TO_COACH": "retired_to_club_coach",
+    "退役转任本队教练": "retired_to_club_coach",
+    "DEPARTED_OR_TRANSFERRED": "departed",
+    "DEPARTED": "departed",
+    "TRANSFERRED": "departed",
+    "离队": "departed",
+    "转会": "departed",
+    "STAGED_FOREIGN_25_26": "staged_foreign_25_26",
+    "STAGED_FOREIGN": "staged_foreign_25_26",
+    "阶段性外援": "staged_foreign_25_26",
+}
+
+
 def build_club_panorama_card(
     club_query: str,
     *,
@@ -186,6 +214,7 @@ def build_club_panorama_card(
     staff_snapshots: Optional[Sequence[Mapping[str, Any]]] = None,
     coach_role_facets: Optional[Sequence[Any]] = None,
     story_records: Optional[Sequence[Mapping[str, Any]]] = None,
+    roster_ledger: Optional[Sequence[Mapping[str, Any]]] = None,
     visibility: str = "internal_full",
     card_style: str = "classic",
     person_registry: Optional[Mapping[str, Any]] = None,
@@ -346,21 +375,96 @@ def build_club_panorama_card(
     to_season = season_list[-1]
     prev_players = season_player_sets.get(from_season, set())
     curr_players = season_player_sets.get(to_season, set())
-    if len(season_list) >= 2:
-        retained_players = sorted(prev_players & curr_players)
-        joined_players = sorted(curr_players - prev_players)
-        departed_players = sorted(prev_players - curr_players)
-    else:
-        retained_players = sorted(curr_players)
-        joined_players = []
-        departed_players = []
+
+    retired_to_coach_set: set[str] = set()
+    staged_foreign_set: set[str] = set()
+    ledger_used = False
+
+    if roster_ledger:
+        l_retained: set[str] = set()
+        l_joined: set[str] = set()
+        l_retired_coach: set[str] = set()
+        l_departed: set[str] = set()
+        l_staged_foreign: set[str] = set()
+        for row in roster_ledger:
+            if not isinstance(row, Mapping):
+                continue
+            row_schema = str(row.get("schema") or "").strip()
+            if row_schema and row_schema != CLUB_SEASON_ROSTER_LEDGER_SCHEMA:
+                raise ValueError(f"INVALID_ROSTER_LEDGER_SCHEMA:{row_schema}")
+            r_tokens = {
+                _norm_token(row.get("organization_id")),
+                _norm_token(row.get("club_name")),
+                _norm_token(row.get("club_official")),
+                _norm_token(row.get("club")),
+            }
+            r_tokens.discard("")
+            if r_tokens and not (r_tokens & club_tokens):
+                continue
+            pname = str(
+                row.get("person_name") or row.get("player_name") or row.get("player") or ""
+            ).strip()
+            if not pname:
+                continue
+            raw_bucket = str(
+                row.get("movement_bucket") or row.get("bucket") or row.get("movement") or ""
+            ).strip()
+            bucket_key = _LEDGER_BUCKET_MAP.get(raw_bucket.upper()) or _LEDGER_BUCKET_MAP.get(raw_bucket)
+            if not bucket_key:
+                continue
+            ledger_used = True
+            all_members_set.add(pname)
+            if bucket_key == "retained":
+                l_retained.add(pname)
+            elif bucket_key == "joined":
+                l_joined.add(pname)
+            elif bucket_key == "retired_to_club_coach":
+                l_retired_coach.add(pname)
+            elif bucket_key == "departed":
+                l_departed.add(pname)
+            elif bucket_key == "staged_foreign_25_26":
+                l_staged_foreign.add(pname)
+
+        if ledger_used:
+            # Retired player -> club coach and staged foreigns MUST NEVER appear in departed
+            l_departed -= l_retired_coach
+            l_departed -= l_staged_foreign
+            retained_players = sorted(l_retained)
+            joined_players = sorted(l_joined)
+            retired_to_coach_players = sorted(l_retired_coach)
+            departed_players = sorted(l_departed)
+            staged_foreign_players = sorted(l_staged_foreign)
+
+    if not ledger_used:
+        coach_names_to_season = {
+            str(fd.get("person_name") or "").strip()
+            for fd in normalized_facets
+            if str(fd.get("person_name") or "").strip()
+            and (not fd.get("season") or str(fd.get("season")).strip() == to_season)
+        }
+        if len(season_list) >= 2:
+            retained_players = sorted(prev_players & curr_players)
+            joined_players = sorted(curr_players - prev_players)
+            raw_departed = prev_players - curr_players
+            retired_to_coach_set = raw_departed & coach_names_to_season
+            departed_players = sorted(raw_departed - retired_to_coach_set)
+            retired_to_coach_players = sorted(retired_to_coach_set)
+            staged_foreign_players = sorted(staged_foreign_set)
+        else:
+            retained_players = sorted(curr_players)
+            joined_players = []
+            retired_to_coach_players = []
+            departed_players = []
+            staged_foreign_players = []
 
     offseason_roster_changes: Dict[str, Any] = {
         "from_season": from_season,
         "to_season": to_season,
         "retained": retained_players,
         "joined": joined_players,
+        "retired_to_club_coach": retired_to_coach_players,
         "departed": departed_players,
+        "staged_foreign_25_26": staged_foreign_players,
     }
     all_roster_members: List[str] = sorted(all_members_set)
 
@@ -382,9 +486,11 @@ def build_club_panorama_card(
             "",
             "## 休赛期阵容变动",
             f"- 对比周期：{from_season} -> {to_season}",
-            f"- 留队球员（{len(retained_players)}）：{'、'.join(retained_players) if retained_players else '无'}",
-            f"- 新援与上调（{len(joined_players)}）：{'、'.join(joined_players) if joined_players else '无'}",
-            f"- 离队球员（{len(departed_players)}）：{'、'.join(departed_players) if departed_players else '无'}",
+            f"- 留队球员（含留用外援）（{len(retained_players)}）：{'、'.join(retained_players) if retained_players else '无'}",
+            f"- 新援与青训上调（{len(joined_players)}）：{'、'.join(joined_players) if joined_players else '无'}",
+            f"- 退役转任本队教练（{len(retired_to_coach_players)}）：{'、'.join(retired_to_coach_players) if retired_to_coach_players else '无'}",
+            f"- 离队/转会球员（{len(departed_players)}）：{'、'.join(departed_players) if departed_players else '无'}",
+            f"- 25-26 阶段性注册/出场外援（{len(staged_foreign_players)}）：{'、'.join(staged_foreign_players) if staged_foreign_players else '无'}",
         ])
 
         lines.extend([

@@ -159,6 +159,9 @@ _PUBLIC_SAFE_DOC_ID_RE = re.compile(
 )
 _PUBLIC_SAFE_DOC_HEX_RE = re.compile(r"\bdoc_[0-9a-f]{16,64}\b", re.IGNORECASE)
 _PUBLIC_SAFE_UNASSIGNED_RE = re.compile(r"\(unassigned\)", re.IGNORECASE)
+_PUBLIC_SAFE_INTERNAL_FILE_EXT_RE = re.compile(r"\.(?:csv|jsonl)\b", re.IGNORECASE)
+_PUBLIC_SAFE_TEAM_STAFF_SNAPSHOTS_RE = re.compile(r"\bteam_staff_snapshots\b", re.IGNORECASE)
+_PUBLIC_SAFE_CLUB_ANNOUNCEMENT_KEY_RE = re.compile(r"\bclub_announcement:", re.IGNORECASE)
 _PUBLIC_SAFE_HTTP_URL_RE = re.compile(r"https?://[^\s)\]<>\"']+", re.IGNORECASE)
 _PUBLIC_SAFE_DRIVE_CANDIDATE_RE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{25,}(?![A-Za-z0-9_-])")
 _HISTORICAL_ARCHIVE_BANNER_PREFIX = "> [HISTORICAL_SEASON_ARCHIVE] "
@@ -223,6 +226,15 @@ def verify_public_safe_card_text(markdown: str) -> None:
 
     if _PUBLIC_SAFE_UNASSIGNED_RE.search(markdown):
         violations.append("unassigned_placeholder")
+
+    if _PUBLIC_SAFE_INTERNAL_FILE_EXT_RE.search(markdown):
+        violations.append("internal_data_file_extension")
+
+    if _PUBLIC_SAFE_TEAM_STAFF_SNAPSHOTS_RE.search(markdown):
+        violations.append("internal_key:team_staff_snapshots")
+
+    if _PUBLIC_SAFE_CLUB_ANNOUNCEMENT_KEY_RE.search(markdown):
+        violations.append("internal_key:club_announcement")
 
     if "```" in markdown or "~~~" in markdown:
         violations.append("fenced_code_block")

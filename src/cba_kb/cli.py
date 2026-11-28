@@ -501,6 +501,7 @@ def main():
     q.add_argument('--staff-snapshots',type=Path,default=None)
     q.add_argument('--coach-role-facets',type=Path,default=None)
     q.add_argument('--story-records',type=Path,default=None)
+    q.add_argument('--roster-ledger',type=Path,default=None)
     q.add_argument('--output-dir',type=Path,default=None)
     q.add_argument('--observed-until',default=None)
     q.add_argument('--format',choices=('json','markdown'),default='json')
@@ -2315,6 +2316,7 @@ def main():
             staff_snaps = _read_json_or_jsonl(a.staff_snapshots) if a.staff_snapshots is not None else None
             coach_facets = _read_json_or_jsonl(a.coach_role_facets) if a.coach_role_facets is not None else None
             story_recs = _read_json_or_jsonl(a.story_records) if a.story_records is not None else None
+            roster_ledger = _read_json_or_jsonl(a.roster_ledger) if a.roster_ledger is not None else None
             person_reg = (
                 json.loads(a.person_registry.read_text(encoding='utf-8'))
                 if a.person_registry is not None
@@ -2329,6 +2331,7 @@ def main():
                 staff_snapshots=staff_snaps,
                 coach_role_facets=coach_facets,
                 story_records=story_recs,
+                roster_ledger=roster_ledger,
                 visibility=a.visibility,
                 card_style=a.card_style,
                 person_registry=person_reg,
